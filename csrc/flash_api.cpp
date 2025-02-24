@@ -61,7 +61,7 @@ std::vector<at::Tensor>
 mha_fwd_kvcache_mla(
     at::Tensor &q,                               // batch_size x seqlen_q x num_heads x head_size
     const at::Tensor &kcache,                    // num_blocks x page_block_size x num_heads_k x head_size
-    c10::optional<const at::Tensor> &vcache_,    // num_blocks x page_block_size x num_heads_k x head_size_v
+    std::optional<const at::Tensor> &vcache_,    // num_blocks x page_block_size x num_heads_k x head_size_v
     const int head_size_v,
     const at::Tensor &seqlens_k,                 // batch_size
     const at::Tensor &block_table,               // batch_size x max_num_blocks_per_seq
