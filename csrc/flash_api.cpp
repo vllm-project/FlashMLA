@@ -77,7 +77,6 @@ mha_fwd_kvcache_mla(
     at::Tensor vcache = vcache_.has_value() ? vcache_.value() : kcache;
 
     auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kBFloat16 || q_dtype == torch::kFloat16);
     TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
 
     CHECK_DEVICE(q); CHECK_DEVICE(kcache); CHECK_DEVICE(vcache);
@@ -189,8 +188,14 @@ mha_fwd_kvcache_mla(
 
     if (q_dtype == torch::kBFloat16) {
         run_mha_fwd_splitkv_mla<cutlass::bfloat16_t, 576>(params, stream);
-    } else {
+    }
+    #ifndef FLASH_MLA_DISABLE_FP16
+    else if (q_dtype == torch::kHalf) {
         run_mha_fwd_splitkv_mla<cutlass::half_t, 576>(params, stream);
+    }
+    #endif
+    else {
+        TORCH_CHECK(false, "Unsupported tensor dtype for query");
     }
 
     out = out.view({batch_size, seqlen_q_ori, ngroups, num_heads_k, head_size_v}).transpose(2, 3)
