@@ -13,9 +13,11 @@ from torch.utils.cpp_extension import (
 
 DISABLE_FP16 = os.getenv("FLASH_MLA_DISABLE_FP16", "FALSE") == "TRUE"
 
+
 def append_nvcc_threads(nvcc_extra_args):
     nvcc_threads = os.getenv("NVCC_THREADS") or "32"
     return nvcc_extra_args + ["--threads", nvcc_threads]
+
 
 def get_sources():
     sources = [
@@ -29,11 +31,13 @@ def get_sources():
 
     return sources
 
+
 def get_features_args():
     features_args = []
     if DISABLE_FP16:
         features_args.append("-DFLASH_MLA_DISABLE_FP16")
     return features_args
+
 
 subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
 
