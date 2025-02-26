@@ -53,12 +53,12 @@ FlashMLA is inspired by [FlashAttention 2&3](https://github.com/dao-AILab/flash-
 
 ### MetaX 
 
-For the MetaX GPU【https://www.metax-tech.com】, the corresponding FlashMLA version link is as follows:
-GitHub - [MetaX-MACA/FlashMLA](https://github.com/MetaX-MACA/FlashMLA)
+For [MetaX](https://www.metax-tech.com) GPUs, the corresponding FlashMLA version can be found at:
+- [MetaX-MACA/FlashMLA](https://github.com/MetaX-MACA/FlashMLA)
 
 ### Moore Threads (WIP)
-For the Moore Threads GPU【https://www.mthreads.com/】, the corresponding FlashMLA version link is as follows:
-GitHub - [MooreThreads/MT-DeepSeek](https://github.com/MooreThreads/MT-DeepSeek)
+For [Moore Threads](https://www.metax-tech.com) GPUs, the corresponding FlashMLA version can be found at:
+- [MooreThreads/MT-DeepSeek](https://github.com/MooreThreads/MT-DeepSeek)
 
 ## Citation
 
