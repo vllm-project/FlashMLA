@@ -57,7 +57,7 @@ For [MetaX](https://www.metax-tech.com) GPUs, the corresponding FlashMLA version
 - [MetaX-MACA/FlashMLA](https://github.com/MetaX-MACA/FlashMLA)
 
 ### Moore Threads (WIP)
-For [Moore Threads](https://www.metax-tech.com) GPUs, the corresponding FlashMLA version can be found at:
+For [Moore Threads](https://www.mthreads.com) GPUs, the corresponding FlashMLA version can be found at:
 - [MooreThreads/MT-DeepSeek](https://github.com/MooreThreads/MT-DeepSeek)
 
 ## Citation
