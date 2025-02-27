@@ -53,12 +53,41 @@ FlashMLA is inspired by [FlashAttention 2&3](https://github.com/dao-AILab/flash-
 
 ### MetaX 
 
-For [MetaX](https://www.metax-tech.com) GPUs, the corresponding FlashMLA version can be found at:
+For MetaX GPUs, visit the official website: [MetaX](https://www.metax-tech.com).
+
+The corresponding FlashMLA version can be found at:
 - [MetaX-MACA/FlashMLA](https://github.com/MetaX-MACA/FlashMLA)
 
-### Moore Threads (WIP)
-For [Moore Threads](https://www.mthreads.com) GPUs, the corresponding FlashMLA version can be found at:
-- [MooreThreads/MT-DeepSeek](https://github.com/MooreThreads/MT-DeepSeek)
+
+### Moore Threads
+For the Moore Threads GPU, visit the official website: [Moore Threads](https://www.mthreads.com/).
+
+The corresponding FlashMLA version is available on GitHub:  
+[MooreThreads/MT-flashMLA](GitHub - MooreThreads/MT-flashMLA: Fork from https://github.com/deepseek-ai/FlashMLA).
+
+
+### Hygon DCU
+
+For the Hygon DCU, visit the official website: [Hygon Developer](https://developer.sourcefind.cn/).
+
+The corresponding FlashMLA version is available here:  
+[OpenDAS/MLAttention](https://developer.sourcefind.cn/codes/OpenDAS/MLAttention).
+
+
+### Intellifusion
+
+For the Intellifusion NNP, visit the official website: [Intellifusion](https://www.intellif.com).
+
+The corresponding FlashMLA version is available on Gitee:  
+[Intellifusion/tyllm](https://gitee.com/Intellifusion_2025/tyllm/blob/master/python/tylang/flash_mla.py).
+
+
+### Iluvatar Corex
+
+For Iluvatar Corex GPUs, visit the official website: [Iluvatar Corex](https://www.iluvatar.com).
+
+The corresponding FlashMLA version is available on GitHub:  
+[Deep-Spark/FlashMLA](https://github.com/Deep-Spark/FlashMLA/tree/iluvatar_flashmla)
 
 ## Citation
 
