@@ -51,43 +51,34 @@ FlashMLA is inspired by [FlashAttention 2&3](https://github.com/dao-AILab/flash-
 
 ## Community Support
 
-### MetaX 
-
+### MetaX
 For MetaX GPUs, visit the official website: [MetaX](https://www.metax-tech.com).
 
-The corresponding FlashMLA version can be found at:
-[MetaX-MACA/FlashMLA](https://github.com/MetaX-MACA/FlashMLA)
+The corresponding FlashMLA version can be found at: [MetaX-MACA/FlashMLA](https://github.com/MetaX-MACA/FlashMLA)
 
 
 ### Moore Threads
 For the Moore Threads GPU, visit the official website: [Moore Threads](https://www.mthreads.com/).
 
-The corresponding FlashMLA version is available on GitHub:  
-[MooreThreads/MT-flashMLA](https://github.com/MooreThreads/MT-flashMLA).
+The corresponding FlashMLA version is available on GitHub: [MooreThreads/MT-flashMLA](https://github.com/MooreThreads/MT-flashMLA).
 
 
 ### Hygon DCU
-
 For the Hygon DCU, visit the official website: [Hygon Developer](https://developer.sourcefind.cn/).
 
-The corresponding FlashMLA version is available here:  
-[OpenDAS/MLAttention](https://developer.sourcefind.cn/codes/OpenDAS/MLAttention).
+The corresponding FlashMLA version is available here: [OpenDAS/MLAttention](https://developer.sourcefind.cn/codes/OpenDAS/MLAttention).
 
 
 ### Intellifusion
-
 For the Intellifusion NNP, visit the official website: [Intellifusion](https://www.intellif.com).
 
-The corresponding FlashMLA version is available on Gitee:  
-[Intellifusion/tyllm](https://gitee.com/Intellifusion_2025/tyllm/blob/master/python/tylang/flash_mla.py).
+The corresponding FlashMLA version is available on Gitee: [Intellifusion/tyllm](https://gitee.com/Intellifusion_2025/tyllm/blob/master/python/tylang/flash_mla.py).
 
 
 ### Iluvatar Corex
-
 For Iluvatar Corex GPUs, visit the official website: [Iluvatar Corex](https://www.iluvatar.com).
 
-The corresponding FlashMLA version is available on GitHub:  
-[Deep-Spark/FlashMLA](https://github.com/Deep-Spark/FlashMLA/tree/iluvatar_flashmla)
+The corresponding FlashMLA version is available on GitHub: [Deep-Spark/FlashMLA](https://github.com/Deep-Spark/FlashMLA/tree/iluvatar_flashmla)
 
 ## Citation
 
