@@ -56,14 +56,14 @@ FlashMLA is inspired by [FlashAttention 2&3](https://github.com/dao-AILab/flash-
 For MetaX GPUs, visit the official website: [MetaX](https://www.metax-tech.com).
 
 The corresponding FlashMLA version can be found at:
-- [MetaX-MACA/FlashMLA](https://github.com/MetaX-MACA/FlashMLA)
+[MetaX-MACA/FlashMLA](https://github.com/MetaX-MACA/FlashMLA)
 
 
 ### Moore Threads
 For the Moore Threads GPU, visit the official website: [Moore Threads](https://www.mthreads.com/).
 
 The corresponding FlashMLA version is available on GitHub:  
-[MooreThreads/MT-flashMLA](GitHub - MooreThreads/MT-flashMLA: Fork from https://github.com/deepseek-ai/FlashMLA).
+[MooreThreads/MT-flashMLA](https://github.com/MooreThreads/MT-flashMLA).
 
 
 ### Hygon DCU
