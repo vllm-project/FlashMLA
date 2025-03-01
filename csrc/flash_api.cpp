@@ -1,4 +1,7 @@
 // Adapted from https://github.com/Dao-AILab/flash-attention/blob/main/csrc/flash_attn/flash_api.cpp
+/******************************************************************************
+ * Copyright (c) 2024, Tri Dao.
+ ******************************************************************************/
 
 // #include <torch/python.h>
 #include <torch/nn/functional.h>
