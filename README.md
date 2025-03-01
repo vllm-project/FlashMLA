@@ -80,6 +80,12 @@ For Iluvatar Corex GPUs, visit the official website: [Iluvatar Corex](https://ww
 
 The corresponding FlashMLA version is available on GitHub: [Deep-Spark/FlashMLA](https://github.com/Deep-Spark/FlashMLA/tree/iluvatar_flashmla)
 
+
+### AMD Instinct
+For AMD Instinct GPUs, visit the official website: [AMD Instinct](https://www.amd.com/en/products/accelerators/instinct.html).
+
+The corresponding FlashMLA version can be found at: [AITER/MLA](https://github.com/ROCm/aiter/blob/main/aiter/mla.py)
+
 ## Citation
 
 ```bibtex
