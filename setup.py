@@ -11,9 +11,11 @@ from torch.utils.cpp_extension import (
     IS_WINDOWS,
 )
 
+
 def append_nvcc_threads(nvcc_extra_args):
     nvcc_threads = os.getenv("NVCC_THREADS") or "32"
     return nvcc_extra_args + ["--threads", nvcc_threads]
+
 
 def get_features_args():
     features_args = []

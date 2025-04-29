@@ -7,3 +7,4 @@ dist/
 *.png
 /.vscode
 compile_commands.json
+.cache
