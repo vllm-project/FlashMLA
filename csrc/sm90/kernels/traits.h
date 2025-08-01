@@ -102,5 +102,6 @@ enum NamedBarriers : int {
     sScale0Ready = 0,
     sScale1Ready = 1,
     sP0Ready = 2,
-    rO1sP0sV0RIssued = 3
+    rO1sP0sV0RIssued = 3,
+    sMInitialized = 4,
 };
