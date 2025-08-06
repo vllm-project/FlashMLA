@@ -120,7 +120,7 @@ mha_fwd_kvcache_mla(
     TORCH_CHECK(num_heads_q % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
     if (q_dtype == torch::kFloat8_e4m3fn) {
-        TORCH_CHECK(descale_q.has_value() && descale_k_.has_value(), "descale is required when input dtype is fp8");
+        TORCH_CHECK(descale_q.has_value() && descale_k.has_value(), "descale is required when input dtype is fp8");
         auto descale_q_ = descale_q.value();
         auto descale_k_ = descale_k.value();
         CHECK_DEVICE(descale_q_);
