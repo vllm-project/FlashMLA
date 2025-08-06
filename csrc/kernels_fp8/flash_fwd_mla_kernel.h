@@ -182,7 +182,7 @@ struct SharedStorageMLA {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename Kernel_traits, bool Split, typename SharedStorage, typename AccO, typename Softmax>
-__forceinline__ __device__ void store(const Flash_fwd_mla_params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx,
+__forceinline__ __device__ void store(const Flash_fwd_mla_params_fp8 &params, const int bidb, const int bidh, const int m_block, const int n_split_idx,
                                       SharedStorage &shared_storage, AccO tOrO, Softmax softmax, float descale_k, float scale_softmax) {
     constexpr int kBlockM = Kernel_traits::kBlockM;
     constexpr int kHeadDimV = Kernel_traits::kHeadDimV;
@@ -221,9 +221,9 @@ __forceinline__ __device__ void store(const Flash_fwd_mla_params &params, const 
     cute::copy(smem_tiled_copy_Oaccum, taccOrOaccum, taccOsOaccum);
 
     const index_t row_offset_o = bidb * params.o_batch_stride + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
-    const index_t row_offset_oaccum = (((split_offset + n_split_idx) * params.h + bidh) * params.seqlen_q + m_block * kBlockM) * params.d_v;
-    const index_t row_offset_lse = (bidb * params.h + bidh) * params.seqlen_q + m_block * kBlockM;
-    const index_t row_offset_lseaccum = ((split_offset + n_split_idx) * params.h + bidh) * params.seqlen_q + m_block * kBlockM;
+    const index_t row_offset_oaccum = (((split_offset + n_split_idx) * params.h_q + bidh) * params.s_q + m_block * kBlockM) * params.d_v;
+    const index_t row_offset_lse = (bidb * params.h_q + bidh) * params.s_q + m_block * kBlockM;
+    const index_t row_offset_lseaccum = ((split_offset + n_split_idx) * params.h_q + bidh) * params.s_q + m_block * kBlockM;
 
     Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementO *>(Split ? params.oaccum_ptr : params.o_ptr) + (Split ? row_offset_oaccum : row_offset_o)),
                                  Shape<Int<kBlockM>, Int<kHeadDimV>>{},
@@ -252,7 +252,7 @@ __forceinline__ __device__ void store(const Flash_fwd_mla_params &params, const 
 #pragma unroll
         for (int mi = 0; mi < size(lse); ++mi) {
             const int row = get<0>(taccOcO_row(mi));
-            if (row < params.seqlen_q - m_block * kBlockM) { gLSEaccum(row) = lse(mi); }
+            if (row < params.s_q - m_block * kBlockM) { gLSEaccum(row) = lse(mi); }
         }
     }
 
@@ -263,12 +263,12 @@ __forceinline__ __device__ void store(const Flash_fwd_mla_params &params, const 
     Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgOaccum)));
     // Clear_OOB_K must be false since we don't want to write zeros to gmem
     flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/true, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-            gmem_tiled_copy_Oaccum, tOrOaccum, tOgOaccum, tOcO, tOpO, params.seqlen_q - m_block * kBlockM
+            gmem_tiled_copy_Oaccum, tOrOaccum, tOgOaccum, tOcO, tOpO, params.s_q - m_block * kBlockM
     );
 }
 
 template<typename Kernel_traits, bool Is_causal, typename SharedStorage>
-__forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_fwd_mla_params &params,
+__forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_fwd_mla_params_fp8 &params,
                                                                    const int bidb, const int bidh, const int m_block,
                                                                    const int n_split_idx, const int seqlen_k,
                                                                    const int n_block_min, const int n_block_max, const bool NoSplit,
@@ -358,10 +358,10 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
                     if constexpr (!Is_causal) {  // Just masking based on col
                         if (int(get<1>(tScS(i))) >= int(seqlen_k - n_block * kBlockN)) tSrS(i) = -INFINITY;
                     } else {
-                        // Ensure seqlen_k - 1 - (n_block * kBlockN + col) >= (seqlen_q - 1 - (m_block * kBlockM + row)) / ngroups
-                        // col <= seqlen_k - 1 - n_block * kBlockN - (seqlen_q - 1 - (m_block * kBlockM + row)) / ngroups
+                        // Ensure seqlen_k - 1 - (n_block * kBlockN + col) >= (seqlen_q - 1 - (m_block * kBlockM + row)) / q_head_per_hk
+                        // col <= seqlen_k - 1 - n_block * kBlockN - (seqlen_q - 1 - (m_block * kBlockM + row)) / q_head_per_hk
                         int row = int(get<0>(tScS(i)));
-                        int col_limit_right = seqlen_k - 1 - n_block * kBlockN - (params.seqlen_q - 1 - (m_block * kBlockM + row)) / params.ngroups;
+                        int col_limit_right = seqlen_k - 1 - n_block * kBlockN - (params.s_q - 1 - (m_block * kBlockM + row)) / params.q_head_per_hk;
                         if (int(get<1>(tScS(i))) > col_limit_right) tSrS(i) = -INFINITY;
                     }
                 }
@@ -423,7 +423,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
 
         // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
         flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/true>(gmem_tiled_copy_Q, tQgQ, tQsQ, tQcQ, tQpQ,
-                                                              params.seqlen_q - m_block * kBlockM);
+                                                              params.s_q - m_block * kBlockM);
 
         const index_t row_offset_k = (bidh / params.h_h_k_ratio) * params.k_head_stride;
         Tensor gK = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.k_ptr) + row_offset_k),
@@ -539,7 +539,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
 
 template<typename Kernel_traits, bool Is_causal, typename SharedStorage>
 __global__ void __launch_bounds__(Kernel_traits::kNThreads, 1, 1)
-flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params) {
+flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params_fp8 params) {
     constexpr int kBlockN = Kernel_traits::kBlockN;
     const int m_block = blockIdx.x;
     const int bidh = blockIdx.y;
@@ -570,7 +570,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
 #pragma unroll 1
     for (int batch_id = begin_idx; batch_id <= end_idx; ++batch_id) {
         const int n_split_idx = batch_id == begin_idx ? begin_n_split_idx : 0;
-        const int seqlen_k = __ldg(params.cu_seqlens_k + batch_id);
+        const int seqlen_k = __ldg(params.seqlens_k_ptr + batch_id);
         const int n_block_min = batch_id == begin_idx ? begin_seqlen / kBlockN : 0;
         const int n_block_max = batch_id == end_idx ? cute::ceil_div(end_seqlen, kBlockN) : cute::ceil_div(seqlen_k, kBlockN);
         const bool NoSplit = n_block_min == 0 && n_block_max == cute::ceil_div(seqlen_k, kBlockN);
@@ -585,12 +585,12 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
 
 template<typename Element, typename ElementAccum, typename index_t, int kHeadDimV, int kMaxSplits>
 __global__ void __launch_bounds__(256, 1, 1)
-flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const Flash_fwd_mla_params params) {
+flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const Flash_fwd_mla_params_fp8 params) {
     constexpr int kNThreads = 128;
 
     const int tidx = threadIdx.x;
     const int bidx = blockIdx.x;
-    const int hs = params.h * params.seqlen_q;
+    const int hs = params.h_q * params.s_q;
     const int batch_idx = bidx / hs;
     const int hs_idx = bidx % hs;
 
@@ -663,8 +663,8 @@ flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const Flash_fwd_mla_param
     }
 
     Tensor rO = flash::convert_type<Element>(tOrO);
-    const int head_idx = (bidx - batch_idx * hs) / params.seqlen_q;
-    const int row = bidx - batch_idx * hs - head_idx * params.seqlen_q;
+    const int head_idx = (bidx - batch_idx * hs) / params.s_q;
+    const int row = bidx - batch_idx * hs - head_idx * params.s_q;
     auto o_ptr = reinterpret_cast<Element *>(params.o_ptr) + batch_idx * params.o_batch_stride + head_idx * params.o_head_stride + row * params.o_row_stride;
     Tensor gO = make_tensor(make_gmem_ptr(o_ptr + tidx * Elements), Shape<Int<decltype(size<0>(rO))::value>>{}, Stride<_1>{});
     cute::copy(rO, gO);
@@ -675,18 +675,18 @@ flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const Flash_fwd_mla_param
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename Kernel_traits, typename SharedStorage>
-void run_flash_splitkv_fwd_mla(Flash_fwd_mla_params &params, cudaStream_t stream) {
+void run_flash_splitkv_fwd_mla(Flash_fwd_mla_params_fp8 &params, cudaStream_t stream) {
     FLASH_ASSERT(params.page_block_size == Kernel_traits::kBlockN);
-    const int num_m_block = cute::ceil_div(params.seqlen_q, Kernel_traits::kBlockM);
+    const int num_m_block = cute::ceil_div(params.s_q, Kernel_traits::kBlockM);
     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
         auto kernel = &flash::flash_fwd_splitkv_mla_kernel<Kernel_traits, Is_causal, SharedStorage>;
         constexpr size_t smem_size = sizeof(SharedStorage);
         CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-        kernel<<<dim3(num_m_block, params.h, params.num_sm_parts), Kernel_traits::kNThreads, smem_size, stream>>>(params);
+        kernel<<<dim3(num_m_block, params.h_q, params.num_sm_parts), Kernel_traits::kNThreads, smem_size, stream>>>(params);
     });
     CHECK_CUDA_KERNEL_LAUNCH();
 
-    dim3 grid_combine(params.b * params.h * params.seqlen_q);
+    dim3 grid_combine(params.b * params.h_q * params.s_q);
     MLA_NUM_SPLITS_SWITCH(params.num_sm_parts, kMaxSplits, [&] {
         auto combine_kernel = &flash::flash_fwd_splitkv_mla_combine_kernel<
                 typename Kernel_traits::ElementO, typename Kernel_traits::ElementAccum, typename Kernel_traits::index_t, Kernel_traits::kHeadDimV, kMaxSplits>;
@@ -696,10 +696,9 @@ void run_flash_splitkv_fwd_mla(Flash_fwd_mla_params &params, cudaStream_t stream
 }
 
 template<typename T, typename To, int Headdim>
-void run_mha_fwd_splitkv_mla(Flash_fwd_mla_params &params, cudaStream_t stream) {
+void run_mha_fwd_splitkv_mla(Flash_fwd_mla_params_fp8 &params, cudaStream_t stream) {
     static_assert(Headdim == 576);
     FLASH_ASSERT(params.d_v == 512);
-    FLASH_ASSERT(params.k_ptr == params.v_ptr);  // Shared_KV
     using Kernel_traits = Flash_fwd_kernel_traits_mla<576, 64, 64, 8, T, To, 512>;
     run_flash_splitkv_fwd_mla<Kernel_traits, flash::SharedStorageMLA<Kernel_traits>>(params, stream);
 }
