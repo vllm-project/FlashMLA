@@ -2,7 +2,7 @@ from typing import Optional, Tuple
 
 import torch
 
-import flash_mla_cuda
+from . import flash_mla_cuda
 
 
 def get_mla_metadata(
@@ -20,7 +20,7 @@ def get_mla_metadata(
         tile_scheduler_metadata: (num_sm_parts, TileSchedulerMetaDataSize), dtype torch.int32.
         num_splits: (batch_size + 1), dtype torch.int32.
     """
-    return flash_mla_cuda.get_mla_metadata(cache_seqlens, num_heads_per_head_k, num_heads_k)
+    return torch.ops._flashmla_C.get_mla_metadata(cache_seqlens, num_heads_per_head_k, num_heads_k)
 
 
 def flash_mla_with_kvcache(
@@ -52,7 +52,7 @@ def flash_mla_with_kvcache(
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
-    out, softmax_lse = flash_mla_cuda.fwd_kvcache_mla(
+    out, softmax_lse = torch.ops._flashmla_C.fwd_kvcache_mla(
         q,
         k_cache,
         head_dim_v,
