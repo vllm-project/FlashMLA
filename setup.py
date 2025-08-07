@@ -20,6 +20,9 @@ def get_features_args():
     DISABLE_FP16 = os.getenv("FLASH_MLA_DISABLE_FP16", "FALSE") in ["TRUE", "1"]
     if DISABLE_FP16:
         features_args.append("-DFLASH_MLA_DISABLE_FP16")
+    DISABLE_FP8 = os.getenv("FLASH_MLA_DISABLE_FP8", "FALSE") in ["TRUE", "1"]
+    if DISABLE_FP8:
+        features_args.append("-DFLASH_MLA_DISABLE_FP8")
     return features_args
 
 
