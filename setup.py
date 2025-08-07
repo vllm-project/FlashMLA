@@ -39,7 +39,7 @@ else:
 ext_modules = []
 ext_modules.append(
     CUDAExtension(
-        name="flash_mla_cuda",
+        name="flash_mla.flash_mla_cuda",
         sources=[
             "csrc/flash_api.cpp",
             "csrc/kernels/get_mla_metadata.cu",
@@ -91,4 +91,8 @@ setup(
     packages=find_packages(include=['flash_mla']),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
+    package_data={
+        'flash_mla': ['*.so'],  # Include any .so files in the flash_mla package
+    },
+    zip_safe=False,  # Important for extensions
 )
