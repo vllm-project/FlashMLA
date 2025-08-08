@@ -151,7 +151,13 @@ mha_fwd_kvcache_mla(
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
 
     auto opts = q.options();
-    at::Tensor out = torch::empty({batch_size, q_seq_per_hk, num_heads, head_size_v}, opts);
+    caffe2::TypeMeta out_type;
+    if (q_dtype == torch::kFloat8_e4m3fn) {
+        out_type = torch::kBFloat16;
+    } else {
+        out_type = q_dtype;
+    }
+    at::Tensor out = torch::empty({batch_size, q_seq_per_hk, num_heads, head_size_v}, opts.dtype(out_type));
     at::Tensor softmax_lse = torch::empty({batch_size, num_heads, q_seq_per_hk}, opts.dtype(at::kFloat));
     CHECK_CONTIGUOUS(softmax_lse);
 
