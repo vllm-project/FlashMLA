@@ -260,8 +260,8 @@ TORCH_LIBRARY(_flashmla_C, m) {
     m.impl("fwd_kvcache_mla", torch::kCUDA, make_pytorch_shim(&mha_fwd_kvcache_mla));
 }
 
-PyMODINIT_FUNC PyInit_flash_mla_cuda() {
+PyMODINIT_FUNC PyInit__flashmla_C() {
     static struct PyModuleDef module = {
-        PyModuleDef_HEAD_INIT, "flash_mla_cuda", nullptr, 0, nullptr};
+        PyModuleDef_HEAD_INIT, "_flashmla_C", nullptr, 0, nullptr};
     return PyModule_Create(&module);
 }
