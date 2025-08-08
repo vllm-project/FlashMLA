@@ -2,8 +2,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from . import flash_mla_cuda
-
+import flash_mla._flashmla_C  # noqa: F401
 
 def get_mla_metadata(
     cache_seqlens: torch.Tensor,
