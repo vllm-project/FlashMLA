@@ -554,7 +554,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params_fp8 pa
     int begin_seqlen = tile_scheduler_metadata.y;
     int end_idx = tile_scheduler_metadata.z;
     int end_seqlen = tile_scheduler_metadata.w;
-    if (begin_idx >= params.b) return;
+    if (begin_idx >= params.b || begin_idx < 0) return;
     int begin_n_split_idx = __ldg(tile_scheduler_metadata_ptr + 4);
 
     float descale_k = 1.f;
