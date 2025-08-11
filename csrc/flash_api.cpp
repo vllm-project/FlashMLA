@@ -223,5 +223,5 @@ TORCH_LIBRARY(_flashmla_C, m) {
 PyMODINIT_FUNC PyInit__flashmla_C() {
     static struct PyModuleDef module = {
         PyModuleDef_HEAD_INIT, "_flashmla_C", nullptr, 0, nullptr};
-    return PyModule_Create(&module);                                           
+    return PyModule_Create(&module);
 }
