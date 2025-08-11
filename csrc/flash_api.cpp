@@ -225,16 +225,11 @@ mha_fwd_kvcache_mla(
 #ifdef FLASH_MLA_DISABLE_FP8
         TORCH_CHECK(false, "FlashMLA is compiled with -DFLASH_MLA_DISABLE_FP8. Please remove this flag from your environment and re-compile FlashMLA.");
 #else
-        // Create FP8-specific params by copying base params and setting FP8 fields
         Flash_fwd_mla_params_fp8 fp8_params;
-        // Copy all base fields
         static_cast<Flash_fwd_mla_params&>(fp8_params) = params;
-        
-        // Set FP8-specific fields
         fp8_params.h_h_k_ratio = 1;
         fp8_params.descale_q_ptr = reinterpret_cast<float *>(descale_q.value().data_ptr());
         fp8_params.descale_k_ptr = reinterpret_cast<float *>(descale_k.value().data_ptr());
-        
         run_mha_fwd_splitkv_mla<cutlass::float_e4m3_t, cutlass::bfloat16_t, 576>(fp8_params, stream);
 #endif
     } else {
