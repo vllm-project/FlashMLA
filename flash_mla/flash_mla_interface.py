@@ -2,8 +2,7 @@ from typing import Optional, Tuple
 
 import torch
 
-import flash_mla_cuda
-
+import flash_mla._flashmla_C  # noqa: F401
 
 def get_mla_metadata(
     cache_seqlens: torch.Tensor,
@@ -20,7 +19,7 @@ def get_mla_metadata(
         tile_scheduler_metadata: (num_sm_parts, TileSchedulerMetaDataSize), dtype torch.int32.
         num_splits: (batch_size + 1), dtype torch.int32.
     """
-    return flash_mla_cuda.get_mla_metadata(cache_seqlens, num_heads_per_head_k, num_heads_k)
+    return torch.ops._flashmla_C.get_mla_metadata(cache_seqlens, num_heads_per_head_k, num_heads_k)
 
 
 def flash_mla_with_kvcache(
@@ -33,6 +32,8 @@ def flash_mla_with_kvcache(
     num_splits: torch.Tensor,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
+    descale_q: Optional[torch.Tensor] = None,
+    descale_k: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -45,6 +46,8 @@ def flash_mla_with_kvcache(
         num_splits: (batch_size + 1), torch.int32, returned by get_mla_metadata.
         softmax_scale: float. The scale of QK^T before applying softmax. Default to 1 / sqrt(head_dim).
         causal: bool. Whether to apply causal attention mask.
+        descale_q: (batch_size), torch.float32. Descaling factors for Q, used for fp8 quantization.
+        descale_k: (batch_size), torch.float32. Descaling factors for K, used for fp8 quantization.
 
     Returns:
         out: (batch_size, seq_len_q, num_heads_q, head_dim_v).
@@ -52,7 +55,7 @@ def flash_mla_with_kvcache(
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
-    out, softmax_lse = flash_mla_cuda.fwd_kvcache_mla(
+    out, softmax_lse = torch.ops._flashmla_C.fwd_kvcache_mla(
         q,
         k_cache,
         head_dim_v,
@@ -62,5 +65,7 @@ def flash_mla_with_kvcache(
         causal,
         tile_scheduler_metadata,
         num_splits,
+        descale_q,
+        descale_k,
     )
     return out, softmax_lse

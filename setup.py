@@ -20,6 +20,9 @@ def get_features_args():
     DISABLE_FP16 = os.getenv("FLASH_MLA_DISABLE_FP16", "FALSE") in ["TRUE", "1"]
     if DISABLE_FP16:
         features_args.append("-DFLASH_MLA_DISABLE_FP16")
+    DISABLE_FP8 = os.getenv("FLASH_MLA_DISABLE_FP8", "FALSE") in ["TRUE", "1"]
+    if DISABLE_FP8:
+        features_args.append("-DFLASH_MLA_DISABLE_FP8")
     return features_args
 
 
@@ -39,12 +42,13 @@ else:
 ext_modules = []
 ext_modules.append(
     CUDAExtension(
-        name="flash_mla_cuda",
+        name="flash_mla._flashmla_C",
         sources=[
             "csrc/flash_api.cpp",
             "csrc/kernels/get_mla_metadata.cu",
             "csrc/kernels/mla_combine.cu",
             "csrc/kernels/splitkv_mla.cu",
+            "csrc/kernels_fp8/flash_fwd_mla_fp8_sm90.cu",
         ],
         extra_compile_args={
             "cxx": cxx_args + get_features_args(),
@@ -90,4 +94,8 @@ setup(
     packages=find_packages(include=['flash_mla']),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
+    package_data={
+        'flash_mla': ['*.so'],  # Include any .so files in the flash_mla package
+    },
+    zip_safe=False,  # Important for extensions
 )
