@@ -602,7 +602,7 @@ flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const Flash_fwd_mla_param
     const int split_offset = __ldg(params.num_splits_ptr + batch_idx);
     const int actual_num_splits = __ldg(params.num_splits_ptr + batch_idx + 1) - split_offset;
     FLASH_DEVICE_ASSERT(actual_num_splits <= kMaxSplits);
-    if (actual_num_splits == 1) return;
+    if (actual_num_splits <= 1) return;
 
     __shared__ ElementAccum sLseScale[kMaxSplits];
 
