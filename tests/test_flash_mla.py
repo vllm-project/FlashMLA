@@ -102,7 +102,6 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, torch_dtyp
         blocked_v = blocked_v_fp8
     
     def flash_mla():
-        breakpoint()
         return flash_mla_with_kvcache(
             q,
             blocked_k,
