@@ -1,3 +1,8 @@
+/*
+ * Taken from FlashMLA PR https://github.com/deepseek-ai/FlashMLA/pull/54
+ * originally authored by @endurehero
+ */
+
 #include "flash_fwd_mla_kernel.h"
 
 #ifndef FLASH_MLA_DISABLE_FP8

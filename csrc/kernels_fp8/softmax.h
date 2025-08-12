@@ -1,3 +1,8 @@
+/*
+ * Taken from FlashMLA PR https://github.com/deepseek-ai/FlashMLA/pull/54
+ * originally authored by @endurehero
+ */
+
 // Adapted from https://github.com/Dao-AILab/flash-attention/blob/main/csrc/flash_attn/src/softmax.h
 
 #pragma once

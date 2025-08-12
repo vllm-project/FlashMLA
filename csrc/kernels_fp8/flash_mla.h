@@ -1,3 +1,8 @@
+/*
+ * Taken from FlashMLA PR https://github.com/deepseek-ai/FlashMLA/pull/54
+ * originally authored by @endurehero
+ */
+
 #pragma once
 
 #include "../kernels/params.h"
