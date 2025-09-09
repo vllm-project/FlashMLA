@@ -321,7 +321,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
     flash::Softmax<2 * size<1>(tOrO)> softmax;
 
     int warp_group_idx = cutlass::canonical_warp_group_idx();
-    if (warp_group_idx == 0) {
+    if (warp_group_idx == 0 && n_block >= n_block_min) {
         typename Kernel_traits::TiledMma tiled_mma;
         auto thr_mma = tiled_mma.get_thread_slice(tidx);
         Tensor tSrQ = thr_mma.partition_fragment_A(sQ);                           // (MMA,MMA_M,MMA_K)
@@ -410,7 +410,8 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
         cute::copy(softmax.row_max, tRow_maxsRow_max);
         cute::copy(softmax.row_sum, tRow_sumsRow_sum);
         cutlass::arch::NamedBarrier::arrive(kNThreads, static_cast<int>(NamedBarriers::SoftmaxReady));
-    } else {
+    }
+    if (warp_group_idx != 0 && n_block >= n_block_min) {
         const int *block_table = params.block_table + bidb * params.block_table_batch_stride;
         int cur_block_table = __ldg(&block_table[n_block]);
 

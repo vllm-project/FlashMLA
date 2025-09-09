@@ -36,6 +36,9 @@ def scaled_dot_product_attention(query, key, value, h_q, h_kv, is_causal=False):
 def cal_diff(x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool=False) -> None:
     x, y = x.double(), y.double()
     RMSE = ((x - y) * (x - y)).mean().sqrt().item()
+    # Note(hc): attn_out is full zeros when seqlen_k=0 and batch=1.
+    if (x * x + y * y).sum().item() < 1e-20:
+        return
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
     amax_diff = (x - y).abs().max().item()
     if use_fp8:
@@ -45,7 +48,7 @@ def cal_diff(x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool=False) -
 
 
 @torch.inference_mode()
-def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, torch_dtype):
+def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, torch_dtype, test_zero_seqlen: bool = False):
     print(
         f"{b=}, {s_q=}, {mean_sk=}, {h_q=}, {h_kv=}, {d=}, {dv=}, {causal=}, {varlen=}, {torch_dtype=}"
     )
@@ -55,9 +58,17 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, torch_dtyp
     if varlen:
         for i in range(b):
             cache_seqlens[i] = max(random.normalvariate(mean_sk, mean_sk / 2), s_q)
+            if test_zero_seqlen and i % 7 == 0:
+                cache_seqlens[i] = 0
     total_seqlens = cache_seqlens.sum().item()
     mean_seqlens = cache_seqlens.float().mean().int().item()
     max_seqlen = cache_seqlens.max().item()
+    # Note(hc): When testing with seqlen_k = 0 and batch = 1, max_seqlen becomes 0,
+    # causing blocked_k to be constructed as an empty tensor. This leads to an
+    # invalid params.k_ptr being used in `auto tma_K = cute::make_tma_copy`,
+    # resulting in "Error: Failed to initialize the TMA descriptor 1".
+    # Therefore, we force max_seqlen to be at least 1 to workaround it.
+    max_seqlen = max(max_seqlen, 1)
     max_seqlen_pad = triton.cdiv(max_seqlen, 256) * 256
     # print(f"{total_seqlens=}, {mean_seqlens=}, {max_seqlen=}")
 
@@ -139,13 +150,18 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, torch_dtyp
     out_flash, lse_flash = flash_mla()
     out_torch, lse_torch = ref_mla()
     cal_diff(out_flash, out_torch, "out", use_fp8)
+    # Note(hc): the lse_flash is 'inf' when current seqlen_k is 0
+    lse_flash = torch.where(torch.isinf(lse_flash), torch.tensor(float(0.0)), lse_flash)
+    # Note(hc): the lse_torch is '-inf' when current seqlen_k is 0
+    lse_torch = torch.where(torch.isneginf(lse_torch), torch.tensor(float(0.0)), lse_torch)
     cal_diff(lse_flash, lse_torch, "lse")
 
     t = triton.testing.do_bench(flash_mla)
     FLOPS = s_q * total_seqlens * h_q * (d + dv) * 2
     bytes = (total_seqlens * h_kv * d + b * s_q * h_q * d) * (torch.finfo(torch_dtype).bits // 8) + (b * s_q * h_q * dv) * (torch.finfo(init_dtype).bits // 8)
+    logger_prefix = "" if not test_zero_seqlen else "**** test corner case: "
     print(
-        f"{t:.3f} ms, {FLOPS / 10 ** 9 / t:.0f} TFLOPS, {bytes / 10 ** 6 / t:.0f} GB/s"
+        f"{logger_prefix} {t:.3f} ms, {FLOPS / 10 ** 9 / t:.0f} TFLOPS, {bytes / 10 ** 6 / t:.0f} GB/s"
     )
 
 
@@ -168,6 +184,14 @@ def main(torch_dtype):
                 for s_q in [1, 2]:  # MTP = 1, 2
                     for varlen in [False, True]:
                         test_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen, torch_dtype)
+
+    print("start testing ctx_len=0 corner case: ")
+    for b in [1, 4, 8, 128]:
+        for s in [4096]:
+            for h_q in [128]:
+                for s_q in [1]:
+                    for varlen in [True]:
+                        test_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen, torch_dtype, test_zero_seqlen=True)
 
 
 if __name__ == "__main__":
