@@ -1035,6 +1035,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
         int seqlen_k = __ldg(params.seqlens_k_ptr + batch_idx);
         const int start_block_idx = batch_idx == begin_idx ? begin_seqlen / kBlockN : 0;
         int end_block_idx = batch_idx == end_idx ? cute::ceil_div(end_seqlen, kBlockN) : cute::ceil_div(seqlen_k, kBlockN);
+        int n_block = end_block_idx - 1;
         const bool is_no_split = start_block_idx == 0 && end_block_idx == cute::ceil_div(seqlen_k, kBlockN);
         
         int rRightBorderForQSeq[2];
@@ -1083,10 +1084,12 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
         >{});
 
         // Copy K0 and K1
-        launch_kv_tiles_copy_tma<0, 9>(tma_gK(_, _, __ldg(block_table_ptr + start_block_idx)), sK0, tma_params.tma_K, barriers_K0, threadIdx.x);
-        if (start_block_idx+1 < end_block_idx) {
-            launch_kv_tiles_copy_tma<4, 9>(tma_gK(_, _, __ldg(block_table_ptr + start_block_idx+1)), sK1, tma_params.tma_K, barriers_K1, threadIdx.x);
-            launch_kv_tiles_copy_tma<0, 4>(tma_gK(_, _, __ldg(block_table_ptr + start_block_idx+1)), sK1, tma_params.tma_K, barriers_K1, threadIdx.x);
+        if (n_block >= start_block_idx) {
+            launch_kv_tiles_copy_tma<0, 9>(tma_gK(_, _, __ldg(block_table_ptr + start_block_idx)), sK0, tma_params.tma_K, barriers_K0, threadIdx.x);
+            if (start_block_idx+1 < end_block_idx) {
+                launch_kv_tiles_copy_tma<4, 9>(tma_gK(_, _, __ldg(block_table_ptr + start_block_idx+1)), sK1, tma_params.tma_K, barriers_K1, threadIdx.x);
+                launch_kv_tiles_copy_tma<0, 4>(tma_gK(_, _, __ldg(block_table_ptr + start_block_idx+1)), sK1, tma_params.tma_K, barriers_K1, threadIdx.x);
+            }
         }
 
         Tensor rO = partition_fragment_C((typename T::TiledMMA_PV_LocalP){}, Shape<Int<T::BLOCK_SIZE_M>, Int<T::HEAD_DIM_V / 2>>{});	// ((2, 2, 32), 1, 1)
@@ -1106,7 +1109,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
         Tensor rQ8 = make_tensor<InputT>(Shape<Shape<_2, _2, _2>, _1, _4>{});
         retrieve_rP_from_sP<T>(rQ8, local_tile(sQ, Shape<_64, _64>{}, Coord<_0, _8>{}), idx_in_warpgroup);
 
-        if (warpgroup_idx == 0) {
+        if (warpgroup_idx == 0 && n_block >= start_block_idx) {
             // Warpgroup 0
             Tensor rP0 = make_tensor<float>((typename T::rP0Layout){});
             
@@ -1146,7 +1149,8 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
                 LAUNCH_WG0_SUBROUTINE(true, false);
             }
 
-        } else {
+        }
+        if (warpgroup_idx != 0 && n_block >= start_block_idx) {
             // Warpgroup 1
             Tensor rP1 = make_tensor<float>((typename T::rP0Layout){});
             
