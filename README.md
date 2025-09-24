@@ -33,6 +33,8 @@ python tests/test_flash_mla_decoding.py
 
 The dense MLA decoding kernel can achieve up to 3000 GB/s in memory-bound configuration and 660 TFLOPS in computation-bound configuration on H800 SXM5, using CUDA 12.8. For token-level sparse MLA decoding kernel (which uses an FP8 KV cache while performing the matrix multiplication in bfloat16), it can achieve 410 TFLOPS in compute-bound configuration on H800 SXM5, CUDA 12.8.
 
+For Blackwell GPUs, the token-level sparse MLA decoding kernel can achieve up to 350 TFlops (on B200) which is not really optimized yet.
+
 #### Test & benchmark MHA prefill (Dense):
 
 ```bash
@@ -47,7 +49,7 @@ It achieves up to 1460 TFlops in forward and 1000 TFlops in backward computation
 python tests/test_flash_mla_prefill.py
 ```
 
-It achieves up to 640 TFlops in forward computation on H800 SXM5, CUDA 12.8.
+It achieves up to 640 TFlops in forward computation on H800 SXM5, CUDA 12.8, and achieves up to 1450 TFlops on B200, CUDA 12.9.
 
 ## Requirements
 
@@ -60,9 +62,9 @@ Support matrix:
 | Kernel | GPU Architecture | MLA Mode [2] | KVCache Format |
 | :---: | :---: | :---: | :---: |
 | Dense Decoding | Hopper | MQA | BF16 |
-| Sparse Decoding | Hopper | MQA | FP8 [1] |
+| Sparse Decoding | Hopper & Blackwell | MQA | FP8 [1] |
 | Dense Prefill | Blackwell | MHA |  |
-| Sparse Prefill | Hopper | MQA |  |
+| Sparse Prefill | Hopper & Blackwell | MQA |  |
 
 [1]: For more details on using FP8 KV cache, see documents below.
 

@@ -319,6 +319,11 @@ def main(torch_dtype):
     ]
 
     testcases = correctness_cases + corner_cases + performance_cases
+
+    # Prune out unsupported cases
+    cc_major, cc_minor = torch.cuda.get_device_capability()
+    if cc_major == 10:
+        testcases = [t for t in testcases if (t.is_fp8 and t.topk is not None)]
     
     for testcase in testcases:
         test_flash_mla(testcase)

@@ -16,7 +16,9 @@
 #include "sm90/decode/dense/splitkv_mla.h"
 #include "sm90/decode/sparse_fp8/splitkv_mla.h"
 #include "sm90/prefill/sparse/fwd.h"
+#include "sm100/decode/sparse_fp8/splitkv_mla.h"
 #include "sm100/prefill/dense/interface.h"
+#include "sm100/prefill/sparse/fwd.h"
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
@@ -31,7 +33,7 @@ struct Arch {
     }
 
     bool is_sm100() const {
-        return major == 10 && minor == 0;
+        return major == 10;
     }
 
     void assert_is_supported() const {
@@ -86,7 +88,31 @@ DecodingAttnImplMeta get_attn_impl_meta(
             }
         }
     } else if (arch.is_sm100()) {
-        TORCH_CHECK(false, "Unsupported GPU architecture");
+        if (is_sparse_attn) {
+            if (is_fp8_kvcache) {
+                TORCH_CHECK(h_q_.has_value());
+                int h_q = h_q_.value();
+                TORCH_CHECK(h_q % h_k == 0);
+                int s_q = num_q_tokens_per_head_k * h_k / h_q;
+                // FP8 + Sparse MLA
+                return {
+                    std::max(sm_count / h_k / (cutlass::ceil_div(h_q/h_k, 64) * s_q), 1),
+                    5,
+                    64
+                };
+            } else {
+                // Sparse BF16 MLA
+                TORCH_CHECK(false, "Sparse BF16 MLA is not supported on SM100");
+            }
+        } else {
+            if (is_fp8_kvcache) {
+                // FP8 MLA
+                TORCH_CHECK(false, "FP8 Dence MLA is not supported on SM100");
+            } else {
+                // Normal BF16 MLA
+                TORCH_CHECK(false, "BF16 Dence MLA is not supported on SM100");
+            }
+        }
     } else {
         TORCH_CHECK(false, "Unsupported GPU architecture");
     }
@@ -326,7 +352,8 @@ fwd_kvcache_mla(
             }
         }
     } else if (arch.is_sm100()) {
-        TORCH_CHECK(false, "Unsupported GPU architecture");
+        TORCH_CHECK(is_fp8 && is_sparse_attn, "Only FP8 + Sparse attention is supported on SM100");
+        sm100::run_flash_splitkv_mla_fp8_sparse_kernel(params, stream);
     } else {
         TORCH_CHECK(false, "Unsupported GPU architecture");
     }
@@ -366,7 +393,8 @@ std::vector<at::Tensor> sparse_prefill_fwd(
 ) {
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm90 = dprops->major == 9;
-    TORCH_CHECK(is_sm90, "Sparse Attention Forward Kernel (sparse_prefill_fwd) is only supported on SM90 architectures");
+    bool is_sm100 = dprops->major == 10;
+    TORCH_CHECK(is_sm90 || is_sm100, "Sparse Attention Forward Kernel (sparse_prefill_fwd) is only supported on SM90 or SM100 architectures");
 
     CHECK_DEVICE(q);
     CHECK_DEVICE(kv);
@@ -423,6 +451,8 @@ std::vector<at::Tensor> sparse_prefill_fwd(
 
     if (is_sm90) {
         sm90::run_fwd_kernel(params);
+    } else if (is_sm100) {
+        sm100::run_fwd_kernel(params);
     } else {
         TORCH_CHECK(false, "Unknown architecture");
     }
