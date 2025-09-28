@@ -3,7 +3,10 @@
  * Copyright (c) 2024, Tri Dao.
  ******************************************************************************/
 
+#if defined(NO_PYBIND11) && NO_PYBIND11 == 1
 #include <torch/python.h>
+#endif
+
 #include <torch/nn/functional.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -77,7 +80,11 @@ DecodingAttnImplMeta get_attn_impl_meta(
         } else {
             if (is_fp8_kvcache) {
                 // Dense FP8 MLA
-                TORCH_CHECK(false, "Dense FP8 MLA is not supported on SM90");
+                return {
+                    std::max((sm_count/2) / h_k / cutlass::ceil_div(num_q_tokens_per_head_k, 2*64), 1),
+                    5,
+                    64
+                };
             } else {
                 // Dense BF16 MLA
                 return {
@@ -461,7 +468,7 @@ std::vector<at::Tensor> sparse_prefill_fwd(
 }
 
 
-
+#if defined(NO_PYBIND11) && NO_PYBIND11 == 1
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashMLA";
     m.def("get_mla_decoding_metadata", &get_mla_decoding_metadata);
@@ -470,3 +477,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dense_prefill_bwd", &FMHACutlassSM100BwdRun);
     m.def("sparse_prefill_fwd", &sparse_prefill_fwd);
 }
+#endif

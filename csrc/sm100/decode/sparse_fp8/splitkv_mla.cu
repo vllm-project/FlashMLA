@@ -163,7 +163,7 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const DecodingParams p
     int sched_begin_block_idx = tile_scheduler_metadata.y;
     int end_idx = tile_scheduler_metadata.z;
     int sched_end_block_idx = tile_scheduler_metadata.w;
-    if (begin_idx >= params.b) {
+    if (begin_idx >= params.b || begin_idx < 0) {
         if (warp_idx == 0) {
             cute::TMEM::Allocator1Sm().free(0, 512);
         }
