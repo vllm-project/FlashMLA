@@ -25,7 +25,7 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const DecodingParams params) {
     const int end_split_idx = __ldg(params.num_splits_ptr + batch_idx + 1);
     const int my_num_splits = end_split_idx - start_split_idx;
     FLASH_DEVICE_ASSERT(my_num_splits <= MAX_SPLITS);
-    if (my_num_splits == 1) {
+    if (my_num_splits <= 1) {
         return;
     }
     

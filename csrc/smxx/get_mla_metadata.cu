@@ -51,7 +51,7 @@ get_mla_metadata_kernel(__grid_constant__ const GetDecodingMetadataParams params
         num_splits_shared[0] = 0;
         for (int i = 0; i < num_sm_parts; ++i) {
             int tile_scheduler_metadata0[4], tile_scheduler_metadata1;
-            tile_scheduler_metadata0[0] = now_idx;
+            tile_scheduler_metadata0[0] = (now_idx >= batch_size ? -1 : now_idx);
             tile_scheduler_metadata0[1] = now_block + first_block_idx_shared[now_idx];
             tile_scheduler_metadata1 = now_n_split_idx;
             int remain_payload = payload;

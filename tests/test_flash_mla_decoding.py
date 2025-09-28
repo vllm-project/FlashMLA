@@ -216,9 +216,20 @@ def test_flash_mla(t: TestParam):
     if t.is_fp8:
         # The quantization error may be too large to be distinguished from wrong kernels
         # So we quantize and de-quantize kv-cache here to mitigate quantization error
-        blocked_k_quantized = quant.quantize_k_cache(blocked_k, t.dv, 128)
-        blocked_k_dequantized = quant.dequantize_k_cache(blocked_k_quantized)
-        blocked_k = blocked_k_dequantized
+        if t.topk is not None:
+            # Use custom quantization for sparse attention            
+            blocked_k_quantized = quant.quantize_k_cache(blocked_k, t.dv, 128)
+            blocked_k_dequantized = quant.dequantize_k_cache(blocked_k_quantized)
+            blocked_k = blocked_k_dequantized
+        else:
+            descale_q = torch.ones((1), dtype=torch.float32, device=q.device)
+            descale_k = torch.ones((1), dtype=torch.float32, device=q.device)
+            q_quantized = q.to(torch.float8_e4m3fn)
+            blocked_k_quantized = blocked_k.to(torch.float8_e4m3fn)
+            q_dequantized = q_quantized.to(q.dtype)
+            blocked_k_dequantized = blocked_k_quantized.to(blocked_k.dtype)
+            q = q_dequantized
+            blocked_k = blocked_k_dequantized
 
     # Get schedule metadata
     torch.cuda.synchronize()
@@ -233,6 +244,20 @@ def test_flash_mla(t: TestParam):
     torch.cuda.synchronize()
 
     def run_flash_mla():
+        if t.is_fp8 and t.topk is None:
+            return flash_mla.flash_mla_with_kvcache_fp8(
+                q_quantized,
+                blocked_k_quantized,
+                block_table,
+                cache_seqlens,
+                t.dv,
+                tile_scheduler_metadata,
+                num_splits,
+                causal=t.is_causal,
+                descale_q=descale_q,
+                descale_k=descale_k,
+            )
+
         return flash_mla.flash_mla_with_kvcache(
             q,
             blocked_k if not t.is_fp8 else blocked_k_quantized, # type: ignore
@@ -248,8 +273,12 @@ def test_flash_mla(t: TestParam):
 
     out_ans, lse_ans = run_flash_mla()
     out_ref, lse_ref = reference_torch(cache_seqlens, block_table, q, blocked_k, t.dv, t.is_causal, abs_indices)
-    assert check_is_allclose("out", out_ans, out_ref, abs_tol=8e-4, rel_tol=2.01/128, cos_diff_tol=5e-6)
-    assert check_is_allclose("lse", lse_ans, lse_ref, abs_tol=1e-6, rel_tol=8.01/65536)
+    if t.is_fp8 and t.topk is None:
+        assert check_is_allclose("out", out_ans, out_ref, abs_tol=8e-3, rel_tol=2.01/128, cos_diff_tol=5e-4)
+        assert check_is_allclose("lse", lse_ans, lse_ref, abs_tol=1e-5, rel_tol=8.01/65536)
+    else:
+        assert check_is_allclose("out", out_ans, out_ref, abs_tol=8e-4, rel_tol=2.01/128, cos_diff_tol=5e-6)
+        assert check_is_allclose("lse", lse_ans, lse_ref, abs_tol=1e-6, rel_tol=8.01/65536)
 
     if t.test_performance:
         time_usage: float = triton.testing.do_bench(run_flash_mla)/1000  # type: ignore
@@ -286,6 +315,7 @@ def main(torch_dtype):
         for is_causal in [False, True]
         for (is_fp8, topk) in [
             (False, None),
+            (True, None),
             (True, 128),
             (True, 2048)
         ]
@@ -302,6 +332,8 @@ def main(torch_dtype):
         for (is_causal, is_fp8, topk) in [
             (False, False, None),
             (True, False, None),
+            (False, True, None),
+            (True, True, None),
             (False, True, 128),
             (False, True, 2048),
         ]
@@ -312,6 +344,8 @@ def main(torch_dtype):
         for (is_causal, is_fp8, topk) in [
             (False, False, None),
             (True, False, None),
+            (False, True, None),
+            (True, True, None),
             (False, True, 2048),
         ]
         for s_q in [1, 2]

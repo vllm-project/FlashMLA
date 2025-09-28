@@ -435,7 +435,8 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
         auto thr_tma = tma_params.tma_O.get_slice(_0{});
 
         float2 o[B_EPI/2];
-        if (li == 0) {
+        bool have_valid_indices = __any_sync(0xffffffff, li != 0);  // Prevent some threads' li == 0 and some threads' li != 0 which lead to deadlock during tmem_ld
+        if (!have_valid_indices) {
             // If there are no valid indices, we set o[i] to 0 and don't load from TMEM
             CUTE_UNROLL
             for (int i = 0; i < B_EPI/2; ++i)
@@ -448,7 +449,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
         CUTE_UNROLL
         for (int k = 0; k < (D_V/2)/B_EPI; ++k) {
             // Load O from tO
-            if (li != 0) {
+            if (have_valid_indices) {
                 tmem_ld_32dp32bNx<B_EPI>(tmem_cols::o + k*B_EPI, o);
                 cutlass::arch::fence_view_async_tmem_load();
             }
