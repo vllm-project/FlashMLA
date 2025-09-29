@@ -20,11 +20,31 @@ using namespace cute;
 
 CUTE_DEVICE int32x8_t ldg_256_indices(void* src_ptr) {
     int32x8_t val;
+
+#if (__CUDACC_VER_MAJOR__ > 12) || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9)
+    // CUDA 12.9+: single 256-bit load
     asm volatile("ld.global.nc.L1::evict_normal.L2::evict_normal.L2::256B.v8.s32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
         : "=r"(val.a0), "=r"(val.a1), "=r"(val.a2), "=r"(val.a3),
           "=r"(val.a4), "=r"(val.a5), "=r"(val.a6), "=r"(val.a7)
         : "l"(src_ptr)
     );
+#else
+    // CUDA 12.8 and earlier: two 128-bit loads
+    const char* base = static_cast<const char*>(src_ptr);
+
+    asm volatile(
+        "ld.global.nc.L1::evict_normal.L2::128B.v4.s32 {%0, %1, %2, %3}, [%4];\n"
+        : "=r"(val.a0), "=r"(val.a1), "=r"(val.a2), "=r"(val.a3)
+        : "l"(base)
+    );
+
+    asm volatile(
+        "ld.global.nc.L1::evict_normal.L2::128B.v4.s32 {%0, %1, %2, %3}, [%4];\n"
+        : "=r"(val.a4), "=r"(val.a5), "=r"(val.a6), "=r"(val.a7)
+        : "l"(base + 16)
+    );
+#endif
+
     return val;
 }
 
