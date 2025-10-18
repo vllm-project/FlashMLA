@@ -2,6 +2,7 @@
 #include <torch/nn/functional.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cutlass/fast_math.h>
 #include <cutlass/numeric_types.h>
 
 #include "flash_mla.h"
@@ -185,9 +186,49 @@ fwd_kvcache_mla_fp8(
     return {out, softmax_lse};
 }
 
+std::vector<at::Tensor>
+get_mla_decoding_metadata_dense_fp8(
+    at::Tensor &seqlens_k,
+    const int num_heads_per_head_k,
+    const int num_heads_k
+) {
+    // This should match the logic in the MLA kernel.
+    static constexpr int block_size_m = 64;
+    static constexpr int block_size_n = 64;
+    static constexpr int fixed_overhead_num_blocks = 5;
+    CHECK_DEVICE(seqlens_k);
+    TORCH_CHECK(seqlens_k.is_contiguous());
+    TORCH_CHECK(seqlens_k.dtype() == torch::kInt32);
+    int batch_size = seqlens_k.size(0);
+    int *seqlens_k_ptr = seqlens_k.data_ptr<int>();
+    auto options = seqlens_k.options();
+    auto dprops = at::cuda::getCurrentDeviceProperties();
+    int sm_count = dprops->multiProcessorCount;
+    int num_sm_parts = sm_count / num_heads_k / cutlass::ceil_div(num_heads_per_head_k, block_size_m);
+    auto tile_scheduler_metadata = torch::empty({num_sm_parts, TileSchedulerMetaDataSize}, options);
+    auto num_splits = torch::empty({batch_size + 1}, options);
+    int *tile_scheduler_metadata_ptr = tile_scheduler_metadata.data_ptr<int>();
+    int *num_splits_ptr = num_splits.data_ptr<int>();
+    at::cuda::CUDAGuard device_guard{(char)seqlens_k.get_device()};
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    Mla_metadata_params params = {};
+    params.seqlens_k_ptr = seqlens_k_ptr;
+    params.tile_scheduler_metadata_ptr = tile_scheduler_metadata_ptr;
+    params.num_splits_ptr = num_splits_ptr;
+    params.batch_size = batch_size;
+    params.block_size_n = block_size_n;
+    params.fixed_overhead_num_blocks = fixed_overhead_num_blocks;
+    params.num_sm_parts = num_sm_parts;
+    get_mla_metadata_func(params, stream);
+    return {tile_scheduler_metadata, num_splits};
+}
+
 #if defined(NO_PYBIND11) && NO_PYBIND11 == 1
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashMLA Dense FP8 kernels";
-    m.def("fwd_kvcache_mla_fp8", &fwd_kvcache_mla_fp8, "Forward pass for MLA with FP8 dense attention");
+    m.def("fwd_kvcache_mla_fp8", &fwd_kvcache_mla_fp8,
+          "Forward pass for MLA with FP8 dense attention");
+    m.def("get_mla_decoding_metadata_dense_fp8", &get_mla_decoding_metadata_dense_fp8,
+          "Get decoding metadata for MLA with FP8 dense attention");
 }
 #endif
