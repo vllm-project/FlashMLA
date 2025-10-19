@@ -20,3 +20,14 @@ struct DecodingParams_fp8 : public DecodingParams {
 
 template<typename T, typename To, int Headdim>
 void run_mha_fwd_splitkv_mla(DecodingParams_fp8 &params, cudaStream_t stream);
+
+struct Mla_metadata_params {
+    int *__restrict__ seqlens_k_ptr;
+    int *__restrict__ tile_scheduler_metadata_ptr;
+    int *__restrict__ num_splits_ptr;
+    int batch_size;
+    int block_size_n;
+    int fixed_overhead_num_blocks;
+    int num_sm_parts;
+};
+void get_mla_metadata_func(Mla_metadata_params &params, cudaStream_t stream);

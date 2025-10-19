@@ -20,9 +20,22 @@ fwd_kvcache_mla_fp8(
     const std::optional<at::Tensor> &descale_k   // None or batch_size
 );
 
+extern
+std::vector<at::Tensor>
+get_mla_decoding_metadata_dense_fp8(
+    at::Tensor &seqlens_k,
+    const int num_heads_per_head_k,
+    const int num_heads_k
+);
+
 TORCH_LIBRARY(_flashmla_extension_C, m) {
     m.def("fwd_kvcache_mla_fp8", make_pytorch_shim(&fwd_kvcache_mla_fp8));
     m.impl("fwd_kvcache_mla_fp8", torch::kCUDA, make_pytorch_shim(&fwd_kvcache_mla_fp8));
+
+    m.def("get_mla_decoding_metadata_dense_fp8",
+          make_pytorch_shim(&get_mla_decoding_metadata_dense_fp8));
+    m.impl("get_mla_decoding_metadata_dense_fp8", torch::kCUDA,
+           make_pytorch_shim(&get_mla_decoding_metadata_dense_fp8));
 }
 
 PyMODINIT_FUNC PyInit__flashmla_extension_C() {
