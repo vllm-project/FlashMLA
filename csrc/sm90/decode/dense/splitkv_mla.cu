@@ -1,3 +1,10 @@
+// SM90-specific file - only compile for SM90+ architectures
+#include "params.h"
+#include <stdexcept>
+#include <cutlass/numeric_types.h>
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1000) || !defined(__CUDA_ARCH__)
+
 #include <cutlass/cutlass.h>
 
 #include "utils.h"
@@ -1363,3 +1370,22 @@ template void run_flash_splitkv_mla_kernel<cutlass::half_t>(DecodingParams &para
 #endif
 
 }
+
+#else // !SM90+ architecture
+
+namespace sm90 {
+
+template<typename InputT>
+void run_flash_splitkv_mla_kernel(DecodingParams &params, cudaStream_t stream) {
+    throw std::runtime_error("FlashMLA requires SM90+ architecture. This build was compiled without SM90 support.");
+}
+
+template void run_flash_splitkv_mla_kernel<cutlass::bfloat16_t>(DecodingParams &params, cudaStream_t stream);
+
+#ifndef FLASH_MLA_DISABLE_FP16
+template void run_flash_splitkv_mla_kernel<cutlass::half_t>(DecodingParams &params, cudaStream_t stream);
+#endif
+
+}
+
+#endif // SM90+ architecture check

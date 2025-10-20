@@ -1,3 +1,6 @@
+// SM100-specific file - only compile for SM100+ architectures
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) || !defined(__CUDA_ARCH__)
+
 #include "interface.h"
 
 #include <c10/cuda/CUDAGuard.h>
@@ -81,3 +84,5 @@ void FMHACutlassSM100BwdRun(at::Tensor workspace_buffer, at::Tensor d_o, at::Ten
     FLASH_MLA_ASSERT(false);
   }
 }
+
+#endif // SM100+ architecture check

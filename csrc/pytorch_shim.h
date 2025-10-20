@@ -40,7 +40,9 @@
 template <typename T>
 struct pytorch_library_compatible_type {
   using type = T;
-  static T convert_from_type(T arg) { return arg; }
+  static T convert_from_type(T arg) {
+    return arg;
+  }
 };
 
 template <typename T>
@@ -57,10 +59,10 @@ T convert_from_pytorch_compatible_type(
 //  (NOTE: this is bit unsafe but non of the ops in flash_attn mutate
 //   the optional container)
 template <typename T>
-struct pytorch_library_compatible_type<c10::optional<T>&> {
-  using type = const c10::optional<T>&;
-  static c10::optional<T>& convert_from_type(const c10::optional<T>& arg) {
-    return const_cast<c10::optional<T>&>(arg);
+struct pytorch_library_compatible_type<std::optional<T>&> {
+  using type = const std::optional<T>&;
+  static std::optional<T>& convert_from_type(const std::optional<T>& arg) {
+    return const_cast<std::optional<T>&>(arg);
   }
 };
 
@@ -68,22 +70,22 @@ struct pytorch_library_compatible_type<c10::optional<T>&> {
 //          `c10::optional<pytorch_library_compatible_type_t<T>>`
 //  (NOTE: tested for `c10::optional<int>` -> `c10::optional<int64_t>`)
 template <typename T>
-struct pytorch_library_compatible_type<c10::optional<T>> {
-  using type = c10::optional<pytorch_library_compatible_type_t<T>>;
-  static c10::optional<pytorch_library_compatible_type_t<T>> convert_from_type(
-      c10::optional<T> arg) {
+struct pytorch_library_compatible_type<std::optional<T>> {
+  using type = std::optional<pytorch_library_compatible_type_t<T>>;
+  static std::optional<pytorch_library_compatible_type_t<T>> convert_from_type(
+      std::optional<T> arg) {
     return arg;
   }
 };
 
 // Map `c10::optional<const at::Tensor>&` -> `const c10::optional<at::Tensor>&`
 template <>
-struct pytorch_library_compatible_type<c10::optional<const at::Tensor>&> {
-  using type = const c10::optional<at::Tensor>&;
-  static c10::optional<const at::Tensor>& convert_from_type(
-      const c10::optional<at::Tensor>& arg) {
-    return const_cast<c10::optional<const at::Tensor>&>(
-        reinterpret_cast<const c10::optional<const at::Tensor>&>(arg));
+struct pytorch_library_compatible_type<std::optional<const at::Tensor>&> {
+  using type = const std::optional<at::Tensor>&;
+  static std::optional<const at::Tensor>& convert_from_type(
+      const std::optional<at::Tensor>& arg) {
+    return const_cast<std::optional<const at::Tensor>&>(
+        reinterpret_cast<const std::optional<const at::Tensor>&>(arg));
   }
 };
 
@@ -92,10 +94,12 @@ template <>
 struct pytorch_library_compatible_type<int> {
   using type = int64_t;
   static int convert_from_type(int64_t arg) {
-    TORCH_CHECK(arg <= std::numeric_limits<int>::max(),
-                "int64_t value is too large to be converted to int");
-    TORCH_CHECK(arg >= std::numeric_limits<int>::min(),
-                "int64_t value is too small to be converted to int");
+    TORCH_CHECK(
+        arg <= std::numeric_limits<int>::max(),
+        "int64_t value is too large to be converted to int");
+    TORCH_CHECK(
+        arg >= std::numeric_limits<int>::min(),
+        "int64_t value is too small to be converted to int");
     return arg;
   }
 };
@@ -105,22 +109,27 @@ template <>
 struct pytorch_library_compatible_type<float> {
   using type = double;
   static float convert_from_type(double arg) {
-    TORCH_CHECK(std::abs(arg) <= std::numeric_limits<float>::max(),
-                "double value is too large to be converted to float");
+    TORCH_CHECK(
+        std::abs(arg) <= std::numeric_limits<float>::max(),
+        "double value is too large to be converted to float");
     return arg;
   }
 };
 
 // Forward cv-qualifiers to the base specialization so that e.g.
-// pytorch_library_compatible_type<const float> == pytorch_library_compatible_type<float>
+// pytorch_library_compatible_type<const float> ==
+// pytorch_library_compatible_type<float>
 template <typename T>
-struct pytorch_library_compatible_type<const T> : pytorch_library_compatible_type<T> {};
+struct pytorch_library_compatible_type<const T>
+    : pytorch_library_compatible_type<T> {};
 
 template <typename T>
-struct pytorch_library_compatible_type<volatile T> : pytorch_library_compatible_type<T> {};
+struct pytorch_library_compatible_type<volatile T>
+    : pytorch_library_compatible_type<T> {};
 
 template <typename T>
-struct pytorch_library_compatible_type<const volatile T> : pytorch_library_compatible_type<T> {};
+struct pytorch_library_compatible_type<const volatile T>
+    : pytorch_library_compatible_type<T> {};
 
 //
 //  Shim Utils

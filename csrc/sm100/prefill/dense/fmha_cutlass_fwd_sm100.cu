@@ -1,4 +1,8 @@
+// SM100-specific file - only compile for SM100+ architectures
 #include "interface.h"
+#include <stdexcept>
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) || !defined(__CUDA_ARCH__)
 
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -81,3 +85,23 @@ void FMHACutlassSM100FwdRun(at::Tensor workspace_buffer, at::Tensor q, at::Tenso
     FLASH_MLA_ASSERT(false);
   }
 }
+
+#else // !SM100+ architecture
+
+void FMHACutlassSM100FwdRun(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k,
+                           at::Tensor v, at::Tensor cumulative_seqlen_q,
+                           at::Tensor cumulative_seqlen_kv, at::Tensor o, at::Tensor lse,
+                           int mask_mode_code, float sm_scale, int max_seqlen_q,
+                           int max_seqlen_kv, bool is_varlen) {
+    throw std::runtime_error("FlashMLA dense prefill requires SM100+ architecture. This build was compiled without SM100 support.");
+}
+
+void FMHACutlassSM100BwdRun(at::Tensor workspace_buffer, at::Tensor d_o, at::Tensor q, at::Tensor k,
+                           at::Tensor v, at::Tensor o, at::Tensor lse,
+                           at::Tensor cumulative_seqlen_q, at::Tensor cumulative_seqlen_kv,
+                           at::Tensor dq, at::Tensor dk, at::Tensor dv,
+                           int mask_mode_code, float softmax_scale, int max_seqlen_q, int max_seqlen_kv, bool is_varlen) {
+    throw std::runtime_error("FlashMLA dense prefill backward requires SM100+ architecture. This build was compiled without SM100 support.");
+}
+
+#endif // SM100+ architecture check

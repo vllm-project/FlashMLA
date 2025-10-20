@@ -1,4 +1,8 @@
+// SM100-specific file - only compile for SM100+ architectures
 #include "fwd.h"
+#include <stdexcept>
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) || !defined(__CUDA_ARCH__)
 
 #include <math_constants.h>
 #include <cute/tensor.hpp>
@@ -803,3 +807,15 @@ void run_fwd_kernel(const SparsePrefillParams& params) {
 }
 
 }
+
+#else // !SM100+ architecture
+
+namespace sm100 {
+
+void run_fwd_kernel(const SparsePrefillParams& params) {
+    throw std::runtime_error("FlashMLA sparse prefill kernel requires SM100+ architecture. This build was compiled without SM100 support.");
+}
+
+}
+
+#endif // SM100+ architecture check

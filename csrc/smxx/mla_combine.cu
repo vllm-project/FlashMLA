@@ -176,6 +176,7 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const DecodingParams params) {
 
 template<typename ElementT>
 void run_flash_mla_combine_kernel(DecodingParams &params, cudaStream_t stream) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) || !defined(__CUDA_ARCH__)
     static constexpr int HEAD_DIM_V = 512;  // Since only this head dimension is supported by Flash MLA
     FLASH_ASSERT(params.d_v == HEAD_DIM_V);
     MLA_NUM_SPLITS_SWITCH(params.num_sm_parts, NUM_SPLITS, [&] {
@@ -199,6 +200,9 @@ void run_flash_mla_combine_kernel(DecodingParams &params, cudaStream_t stream) {
         cudaLaunchKernelEx(&combine_kernel_config, combine_kernel, params);
     });
     CHECK_CUDA_KERNEL_LAUNCH();
+#else
+    throw std::runtime_error("FlashMLA requires SM90+.");
+#endif
 }
 
 template void run_flash_mla_combine_kernel<cutlass::bfloat16_t>(DecodingParams &params, cudaStream_t stream);

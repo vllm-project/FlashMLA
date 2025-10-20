@@ -1,4 +1,8 @@
+// SM90-specific file - only compile for SM90+ architectures
 #include "splitkv_mla.h"
+#include <stdexcept>
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1000) || !defined(__CUDA_ARCH__)
 
 #include <cutlass/barrier.h>
 #include <cutlass/arch/barrier.h>
@@ -612,3 +616,15 @@ void run_flash_splitkv_mla_fp8_sparse_kernel(DecodingParams &params, cudaStream_
 }
 
 }
+
+#else // !SM90+ architecture
+
+namespace sm90 {
+
+void run_flash_splitkv_mla_fp8_sparse_kernel(DecodingParams &params, cudaStream_t stream) {
+    throw std::runtime_error("FlashMLA sparse FP8 kernel requires SM90+ architecture. This build was compiled without SM90 support.");
+}
+
+}
+
+#endif // SM90+ architecture check

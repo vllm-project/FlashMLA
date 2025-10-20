@@ -1,4 +1,8 @@
+// SM100-specific file - only compile for SM100+ architectures
 #include "splitkv_mla.h"
+#include <stdexcept>
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) || !defined(__CUDA_ARCH__)
 
 #include <cutlass/barrier.h>
 #include <cutlass/arch/barrier.h>
@@ -590,3 +594,15 @@ void run_flash_splitkv_mla_fp8_sparse_kernel(DecodingParams &params, cudaStream_
 }
     
 }
+
+#else // !SM100+ architecture
+
+namespace sm100 {
+
+void run_flash_splitkv_mla_fp8_sparse_kernel(DecodingParams &params, cudaStream_t stream) {
+    throw std::runtime_error("FlashMLA sparse FP8 kernel requires SM100+ architecture. This build was compiled without SM100 support.");
+}
+
+}
+
+#endif // SM100+ architecture check

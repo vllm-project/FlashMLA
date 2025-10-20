@@ -1,4 +1,8 @@
+// SM90-specific file - only compile for SM90+ architectures
 #include "fwd.h"
+#include <stdexcept>
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1000) || !defined(__CUDA_ARCH__)
 
 #include <math_constants.h>
 #include <cute/tensor.hpp>
@@ -707,3 +711,15 @@ void run_fwd_kernel(const SparsePrefillParams& params) {
 }
 
 }
+
+#else // !SM90+ architecture
+
+namespace sm90 {
+
+void run_fwd_kernel(const SparsePrefillParams& params) {
+    throw std::runtime_error("FlashMLA sparse prefill kernel requires SM90+ architecture. This build was compiled without SM90 support.");
+}
+
+}
+
+#endif // SM90+ architecture check

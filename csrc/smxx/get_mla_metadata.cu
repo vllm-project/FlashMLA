@@ -5,6 +5,7 @@
 
 #include "utils.h"
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) || !defined(__CUDA_ARCH__)
 __global__ void __launch_bounds__(32, 1, 1)
 get_mla_metadata_kernel(__grid_constant__ const GetDecodingMetadataParams params) {
     int *seqlens_k_ptr = params.seqlens_k_ptr;
@@ -87,10 +88,15 @@ get_mla_metadata_kernel(__grid_constant__ const GetDecodingMetadataParams params
         num_splits_ptr[i] = num_splits_shared[i];
     }
 }
+#endif
 
 void run_get_mla_metadata_kernel(GetDecodingMetadataParams &params, cudaStream_t stream) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) || !defined(__CUDA_ARCH__)
     int smem_size = sizeof(int) * (params.batch_size*5+1);
     CHECK_CUDA(cudaFuncSetAttribute(get_mla_metadata_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     get_mla_metadata_kernel<<<1, 32, smem_size, stream>>>(params);
     CHECK_CUDA_KERNEL_LAUNCH();
+#else
+    throw std::runtime_error("FlashMLA requires SM90+.");
+#endif
 }
