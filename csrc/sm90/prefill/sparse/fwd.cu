@@ -18,19 +18,18 @@ constexpr int D_Q = 576;
 constexpr int D_K = 576;
 constexpr int D_V = 512;
 
-constexpr int B_H = 64;
 constexpr int B_TOPK = 64;    // TopK block size
 constexpr int NUM_THREADS = 128*3;
 static constexpr float MAX_INIT_VAL = -1e30;    // We use this number as the initial value for mi (max logits)
 
-template<int NUM_TILES>
+template<int B_H, int NUM_TILES>
 using SmemLayoutQTiles = decltype(coalesce(tile_to_shape(
     GMMA::Layout_K_SW128_Atom<bf16>{},
     Shape<Int<B_H>, Int<64*NUM_TILES>>{},
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
 
-template<int NUM_TILES>
+template<int B_H, int NUM_TILES>
 using SmemLayoutOTiles = decltype(coalesce(tile_to_shape(
     GMMA::Layout_K_SW128_Atom<bf16>{},
     Shape<Int<B_H>, Int<64*NUM_TILES>>{},
@@ -50,29 +49,35 @@ using SmemLayoutKTilesTransposed = decltype(composition(
 	Layout<Shape<Int<64*NUM_TILES>, Int<B_TOPK>>, Stride<Int<B_TOPK>, _1>>{}
 ));
 
-using SmemLayoutQ = SmemLayoutQTiles<9>;
-using SmemLayoutO = SmemLayoutOTiles<8>;
+template<int B_H>
+using SmemLayoutQ = SmemLayoutQTiles<B_H, 9>;
+
+template<int B_H>
+using SmemLayoutO = SmemLayoutOTiles<B_H, 8>;
+
 using SmemLayoutK = SmemLayoutKTiles<9>;
 using SmemLayoutV = SmemLayoutKTilesTransposed<8>;
 using SmemLayoutHalfV = SmemLayoutKTilesTransposed<4>;
 
+template<int B_H>
 using SmemLayoutS = decltype(coalesce(tile_to_shape(
     GMMA::Layout_K_SW128_Atom<bf16>{},
     Shape<Int<B_H>, Int<B_TOPK>>{}
 ), Shape<_1, _1>{}));
 
+template<int B_H>
 struct SharedMemoryPlan {
     union {
-        array_aligned<bf16, cosize_v<SmemLayoutQ>> q;
-        array_aligned<bf16, cosize_v<SmemLayoutO>> o;
+        array_aligned<bf16, cosize_v<SmemLayoutQ<B_H>>> q;
+        array_aligned<bf16, cosize_v<SmemLayoutO<B_H>>> o;
     } q_o;
     array_aligned<bf16, cosize_v<SmemLayoutK>> k[2];
-    array_aligned<bf16, cosize_v<SmemLayoutS>> s;
+    array_aligned<bf16, cosize_v<SmemLayoutS<B_H>>> s;
 
     bool is_kv_valid[2][B_TOPK];
     float2 sM[32];
     float2 sL[64];   // For reduction across WG0/1 in epilogue
-    float final_max_logits[64], final_lse[64];
+    float final_max_logits[B_H], final_lse[B_H];
     transac_bar_t bar_q, bar_k0_free[2], bar_k0_ready[2], bar_k1_free[2], bar_k1_ready[2], bar_is_kv_valid_ready;
 };
 
@@ -130,7 +135,7 @@ __forceinline__ __device__ void save_rS_to_sS(
 }
 
 
-template<typename TmaParams>
+template<int B_H, typename TmaParams>
 __global__ void __launch_bounds__(NUM_THREADS, 1, 1)
 sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __grid_constant__ const TmaParams tma_params) {
     // NOTE This kernel uses a similar schedule to Flash MLA - 0422. For a detailed explanation, please refer to https://github.com/deepseek-ai/FlashMLA/blob/main/docs/20250422-new-kernel-deep-dive.md
@@ -143,11 +148,11 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
 
     // Define shared tensors
     extern __shared__ char wksp_buf[];
-    SharedMemoryPlan &plan = *reinterpret_cast<SharedMemoryPlan*>(wksp_buf);
-    Tensor sQ = make_tensor(make_smem_ptr(plan.q_o.q.data()), SmemLayoutQ{});
-    Tensor sO = make_tensor(make_smem_ptr(plan.q_o.o.data()), SmemLayoutO{});
-    Tensor sS0 = make_tensor(make_smem_ptr(plan.k[0].data()+64*512), SmemLayoutS{});    // Overlap with sK0's RoPE part
-    Tensor sS1 = make_tensor(make_smem_ptr(plan.s.data()), SmemLayoutS{});
+    SharedMemoryPlan<B_H> &plan = *reinterpret_cast<SharedMemoryPlan<B_H>*>(wksp_buf);
+    Tensor sQ = make_tensor(make_smem_ptr(plan.q_o.q.data()), SmemLayoutQ<B_H>{});
+    Tensor sO = make_tensor(make_smem_ptr(plan.q_o.o.data()), SmemLayoutO<B_H>{});
+    Tensor sS0 = make_tensor(make_smem_ptr(plan.k[0].data()+64*512), SmemLayoutS<B_H>{});    // Overlap with sK0's RoPE part
+    Tensor sS1 = make_tensor(make_smem_ptr(plan.s.data()), SmemLayoutS<B_H>{});
 
     if (warp_idx == 0 && elect_one_sync()) {
         // Prefetch TMA descriptors
@@ -294,7 +299,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
             for (int i = 0; i < 2; ++i)
                 scale_factors[i] = rL[i] == 0.0f ? 1.0f : 1.0f / rL[i];
 
-            Tensor sO = make_tensor(make_smem_ptr(plan.q_o.o.data() + warpgroup_idx*B_H*(D_V/2)), SmemLayoutOTiles<4>{});
+            Tensor sO = make_tensor(make_smem_ptr(plan.q_o.o.data() + warpgroup_idx*B_H*(D_V/2)), SmemLayoutOTiles<B_H, 4>{});
             bf16* stsm_addrs[4];
             int stsm_row = (idx_in_warpgroup/32)*16 + (idx_in_warpgroup%16);
             CUTE_UNROLL
@@ -640,7 +645,8 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
 }
 
 
-void run_fwd_kernel(const SparsePrefillParams& params) {
+template<int B_H>
+void run_fwd_kernel_impl(const SparsePrefillParams& params) {
     FLASH_ASSERT(params.h_kv == 1);
     FLASH_ASSERT(params.topk % (2*B_TOPK) == 0);   // To save some boundry checkings
     FLASH_ASSERT(params.topk > 0);
@@ -656,7 +662,7 @@ void run_fwd_kernel(const SparsePrefillParams& params) {
                 make_stride(params.stride_q_h_q, _1{}, params.stride_q_s_q)
             )
         ),
-        SmemLayoutQ{}
+        SmemLayoutQ<B_H>{}
     );
 
     CUtensorMap tensor_map_O;
@@ -688,9 +694,9 @@ void run_fwd_kernel(const SparsePrefillParams& params) {
         shape_Q, tma_Q,
         tensor_map_O
     };
-    auto kernel = &sparse_attn_fwd_kernel<decltype(tma_params)>;
+    auto kernel = &sparse_attn_fwd_kernel<B_H, decltype(tma_params)>;
 
-    constexpr size_t smem_size = sizeof(SharedMemoryPlan);
+    constexpr size_t smem_size = sizeof(SharedMemoryPlan<B_H>);
     CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
     cutlass::ClusterLaunchParams launch_params = {
@@ -704,6 +710,20 @@ void run_fwd_kernel(const SparsePrefillParams& params) {
         launch_params, (void*)kernel, params, tma_params
     );
     CHECK_CUDA_KERNEL_LAUNCH();
+}
+
+void run_fwd_kernel(const SparsePrefillParams& params) {
+    // Determine B_H based on h_q
+    // Try to use the largest possible B_H that divides h_q evenly
+    if (params.h_q % 64 == 0) {
+        run_fwd_kernel_impl<64>(params);
+    } else if (params.h_q % 32 == 0) {
+        run_fwd_kernel_impl<32>(params);
+    } else if (params.h_q % 16 == 0) {
+        run_fwd_kernel_impl<16>(params);
+    } else {
+        FLASH_ASSERT(false && "h_q must be divisible by 16, 32, or 64");
+    }
 }
 
 }
