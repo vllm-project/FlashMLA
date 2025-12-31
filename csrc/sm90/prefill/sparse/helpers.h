@@ -12,6 +12,48 @@ using cutlass::arch::fence_view_async_shared;
 using cutlass::arch::fence_barrier_init;
 using cutlass::arch::NamedBarrier;
 
+// SM90 TMA Load 3D instruction
+struct SM90_TMA_LOAD_3D {
+    CUTE_HOST_DEVICE static void
+    copy(void const* desc_ptr, void* smem_ptr,
+         int32_t const& crd0, int32_t const& crd1, int32_t const& crd2) {
+#if defined(CUTE_ARCH_TMA_SM90_ENABLED)
+        uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(desc_ptr);
+        uint32_t smem_int_ptr = cute::cast_smem_ptr_to_uint(smem_ptr);
+        asm volatile(
+            "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::arrive_tx::bytes"
+            " [%0], [%1, {%2, %3, %4}];"
+            :
+            : "r"(smem_int_ptr), "l"(gmem_int_desc),
+              "r"(crd0), "r"(crd1), "r"(crd2)
+            : "memory");
+#else
+        CUTE_INVALID_CONTROL_PATH("Trying to use SM90 TMA without CUTE_ARCH_TMA_SM90_ENABLED.");
+#endif
+    }
+};
+
+// SM90 TMA Store 3D instruction
+struct SM90_TMA_STORE_3D {
+    CUTE_HOST_DEVICE static void
+    copy(void const* desc_ptr, void const* smem_ptr,
+         int32_t const& crd0, int32_t const& crd1, int32_t const& crd2) {
+#if defined(CUTE_ARCH_TMA_SM90_ENABLED)
+        uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(desc_ptr);
+        uint32_t smem_int_ptr = cute::cast_smem_ptr_to_uint(smem_ptr);
+        asm volatile(
+            "cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group"
+            " [%0, {%2, %3, %4}], [%1];"
+            :
+            : "l"(gmem_int_desc), "r"(smem_int_ptr),
+              "r"(crd0), "r"(crd1), "r"(crd2)
+            : "memory");
+#else
+        CUTE_INVALID_CONTROL_PATH("Trying to use SM90 TMA without CUTE_ARCH_TMA_SM90_ENABLED.");
+#endif
+    }
+};
+
 __forceinline__ __device__ void cp_async_cacheglobal_l2_prefetch_256B(const void* src, void* dst) {
     uint32_t dst_addr = cute::cast_smem_ptr_to_uint(dst);
     asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], %2;\n"

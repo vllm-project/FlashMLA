@@ -18,18 +18,19 @@ constexpr int D_Q = 576;
 constexpr int D_K = 576;
 constexpr int D_V = 512;
 
+constexpr int B_H = 64;
 constexpr int B_TOPK = 64;    // TopK block size
 constexpr int NUM_THREADS = 128*3;
 static constexpr float MAX_INIT_VAL = -1e30;    // We use this number as the initial value for mi (max logits)
 
-template<int B_H, int NUM_TILES>
+template<int NUM_TILES>
 using SmemLayoutQTiles = decltype(coalesce(tile_to_shape(
     GMMA::Layout_K_SW128_Atom<bf16>{},
     Shape<Int<B_H>, Int<64*NUM_TILES>>{},
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
 
-template<int B_H, int NUM_TILES>
+template<int NUM_TILES>
 using SmemLayoutOTiles = decltype(coalesce(tile_to_shape(
     GMMA::Layout_K_SW128_Atom<bf16>{},
     Shape<Int<B_H>, Int<64*NUM_TILES>>{},
@@ -49,35 +50,29 @@ using SmemLayoutKTilesTransposed = decltype(composition(
 	Layout<Shape<Int<64*NUM_TILES>, Int<B_TOPK>>, Stride<Int<B_TOPK>, _1>>{}
 ));
 
-template<int B_H>
-using SmemLayoutQ = SmemLayoutQTiles<B_H, 9>;
-
-template<int B_H>
-using SmemLayoutO = SmemLayoutOTiles<B_H, 8>;
-
+using SmemLayoutQ = SmemLayoutQTiles<9>;
+using SmemLayoutO = SmemLayoutOTiles<8>;
 using SmemLayoutK = SmemLayoutKTiles<9>;
 using SmemLayoutV = SmemLayoutKTilesTransposed<8>;
 using SmemLayoutHalfV = SmemLayoutKTilesTransposed<4>;
 
-template<int B_H>
 using SmemLayoutS = decltype(coalesce(tile_to_shape(
     GMMA::Layout_K_SW128_Atom<bf16>{},
     Shape<Int<B_H>, Int<B_TOPK>>{}
 ), Shape<_1, _1>{}));
 
-template<int B_H>
 struct SharedMemoryPlan {
     union {
-        array_aligned<bf16, cosize_v<SmemLayoutQ<B_H>>> q;
-        array_aligned<bf16, cosize_v<SmemLayoutO<B_H>>> o;
+        array_aligned<bf16, cosize_v<SmemLayoutQ>> q;
+        array_aligned<bf16, cosize_v<SmemLayoutO>> o;
     } q_o;
     array_aligned<bf16, cosize_v<SmemLayoutK>> k[2];
-    array_aligned<bf16, cosize_v<SmemLayoutS<B_H>>> s;
+    array_aligned<bf16, cosize_v<SmemLayoutS>> s;
 
     bool is_kv_valid[2][B_TOPK];
     float2 sM[32];
     float2 sL[64];   // For reduction across WG0/1 in epilogue
-    float final_max_logits[B_H], final_lse[B_H];
+    float final_max_logits[64], final_lse[64];
     transac_bar_t bar_q, bar_k0_free[2], bar_k0_ready[2], bar_k1_free[2], bar_k1_ready[2], bar_is_kv_valid_ready;
 };
 
@@ -96,11 +91,8 @@ using TiledMMA_PV_RemoteP = decltype(make_tiled_mma(
     Layout<Shape<_1, _1, _1>>{}
 ));
 
-template<
-    typename Shape_Q, typename TMA_Q
->
 struct TmaParams {
-    Shape_Q shape_Q; TMA_Q tma_Q;
+    CUtensorMap tensor_map_Q;
     CUtensorMap tensor_map_O;
 };
 
@@ -135,28 +127,29 @@ __forceinline__ __device__ void save_rS_to_sS(
 }
 
 
-template<int B_H, typename TmaParams>
+template<typename TmaParams>
 __global__ void __launch_bounds__(NUM_THREADS, 1, 1)
 sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __grid_constant__ const TmaParams tma_params) {
     // NOTE This kernel uses a similar schedule to Flash MLA - 0422. For a detailed explanation, please refer to https://github.com/deepseek-ai/FlashMLA/blob/main/docs/20250422-new-kernel-deep-dive.md
 #if IS_SM90
-    const int q_h_idx = blockIdx.x % (params.h_q/B_H);
-    const int s_q_idx = blockIdx.x / (params.h_q/B_H);
+    const int total_tiles_h = (params.h_q + B_H - 1) / B_H;
+    const int q_h_idx = blockIdx.x % total_tiles_h;
+    const int s_q_idx = blockIdx.x / total_tiles_h;
     const int warpgroup_idx = cutlass::canonical_warp_group_idx();
     const int warp_idx = cutlass::canonical_warp_idx_sync();
     const int idx_in_warpgroup = threadIdx.x % 128;
 
     // Define shared tensors
     extern __shared__ char wksp_buf[];
-    SharedMemoryPlan<B_H> &plan = *reinterpret_cast<SharedMemoryPlan<B_H>*>(wksp_buf);
-    Tensor sQ = make_tensor(make_smem_ptr(plan.q_o.q.data()), SmemLayoutQ<B_H>{});
-    Tensor sO = make_tensor(make_smem_ptr(plan.q_o.o.data()), SmemLayoutO<B_H>{});
-    Tensor sS0 = make_tensor(make_smem_ptr(plan.k[0].data()+64*512), SmemLayoutS<B_H>{});    // Overlap with sK0's RoPE part
-    Tensor sS1 = make_tensor(make_smem_ptr(plan.s.data()), SmemLayoutS<B_H>{});
+    SharedMemoryPlan &plan = *reinterpret_cast<SharedMemoryPlan*>(wksp_buf);
+    Tensor sQ = make_tensor(make_smem_ptr(plan.q_o.q.data()), SmemLayoutQ{});
+    Tensor sO = make_tensor(make_smem_ptr(plan.q_o.o.data()), SmemLayoutO{});
+    Tensor sS0 = make_tensor(make_smem_ptr(plan.k[0].data()+64*512), SmemLayoutS{});    // Overlap with sK0's RoPE part
+    Tensor sS1 = make_tensor(make_smem_ptr(plan.s.data()), SmemLayoutS{});
 
     if (warp_idx == 0 && elect_one_sync()) {
         // Prefetch TMA descriptors
-        cute::prefetch_tma_descriptor(tma_params.tma_Q.get_tma_descriptor());
+        cute::prefetch_tma_descriptor(&tma_params.tensor_map_Q);
         cute::prefetch_tma_descriptor(&tma_params.tensor_map_O);
 
         // Initialize barriers
@@ -179,12 +172,18 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
         cutlass::arch::warpgroup_reg_alloc<216>();
 
         if (warp_idx == 0 && elect_one_sync()) {
-            // Load Q
-            Tensor gQ = flat_divide(
-                tma_params.tma_Q.get_tma_tensor(tma_params.shape_Q)(_, _, s_q_idx),
-                Tile<Int<B_H>, Int<D_Q>>{}
-            )(_, _, q_h_idx, _0{});
-            launch_tma_copy(tma_params.tma_Q, gQ, sQ, plan.bar_q, TMA::CacheHintSm90::EVICT_FIRST);
+            // Load Q using TMA with manually created tensor map
+            // The TMA map is configured with OOB Fill Zero, so it's safe to load B_H rows
+            // even when params.h_q is smaller (e.g., 32 or 16)
+            // Use CuTe's TMA copy interface
+            cute::SM90_TMA_LOAD_3D tma_load;
+            tma_load.with(*reinterpret_cast<typename transac_bar_t::ValueType*>(&plan.bar_q), 0 /*phase*/).copy(
+                &tma_params.tensor_map_Q,
+                plan.q_o.q.data(),
+                0,                  // D dimension coordinate (start at 0, load full D_Q)
+                q_h_idx * B_H,      // H dimension coordinate (global index)
+                s_q_idx             // S dimension coordinate
+            );
             plan.bar_q.arrive_and_expect_tx(B_H*D_Q*sizeof(bf16));
         }
 
@@ -299,7 +298,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
             for (int i = 0; i < 2; ++i)
                 scale_factors[i] = rL[i] == 0.0f ? 1.0f : 1.0f / rL[i];
 
-            Tensor sO = make_tensor(make_smem_ptr(plan.q_o.o.data() + warpgroup_idx*B_H*(D_V/2)), SmemLayoutOTiles<B_H, 4>{});
+            Tensor sO = make_tensor(make_smem_ptr(plan.q_o.o.data() + warpgroup_idx*B_H*(D_V/2)), SmemLayoutOTiles<4>{});
             bf16* stsm_addrs[4];
             int stsm_row = (idx_in_warpgroup/32)*16 + (idx_in_warpgroup%16);
             CUTE_UNROLL
@@ -331,15 +330,17 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
                 }
                 fence_view_async_shared();
                 NamedBarrier::arrive_and_wait(128, warpgroup_idx ? NamedBarriers::warpgroup1_sync : NamedBarriers::warpgroup0_sync);
-                // S -> G
+                // S -> G using TMA Store
+                // The TMA map will automatically discard OOB writes
                 if (s2g_pred) {
                     int g_tile_idx = warpgroup_idx*4 + tile_idx;
-                    SM90_TMA_STORE_3D::copy(
+                    cute::SM90_TMA_STORE_3D tma_store;
+                    tma_store.copy(
                         &tma_params.tensor_map_O,
                         plan.q_o.o.data() + g_tile_idx*(B_H*64),
-                        g_tile_idx*64,
-                        q_h_idx*B_H,
-                        s_q_idx
+                        g_tile_idx*64,  // D dimension coordinate
+                        q_h_idx*B_H,    // H dimension coordinate (OOB writes will be discarded)
+                        s_q_idx         // S dimension coordinate
                     );
                 }
             }
@@ -645,32 +646,52 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
 }
 
 
-template<int B_H>
-void run_fwd_kernel_impl(const SparsePrefillParams& params) {
+void run_fwd_kernel(const SparsePrefillParams& params) {
     FLASH_ASSERT(params.h_kv == 1);
     FLASH_ASSERT(params.topk % (2*B_TOPK) == 0);   // To save some boundry checkings
     FLASH_ASSERT(params.topk > 0);
-    FLASH_ASSERT(params.h_q % B_H == 0);
+    // No longer require params.h_q % B_H == 0
+    // TMA will handle OOB with zero-fill for Q and discard OOB writes for O
 
-    auto shape_Q = make_shape(params.h_q, params.d_qk, params.s_q);
-    auto tma_Q = cute::make_tma_copy(
-        SM90_TMA_LOAD{},
-        make_tensor(
-            make_gmem_ptr((bf16*)params.q),
-            make_layout(
-                shape_Q,
-                make_stride(params.stride_q_h_q, _1{}, params.stride_q_s_q)
-            )
-        ),
-        SmemLayoutQ<B_H>{}
-    );
+    // Create Q Tensor Map with OOB Fill Zero
+    CUtensorMap tensor_map_Q;
+    {
+        // Global Size: Use actual params.h_q (e.g., 32 or 16)
+        uint64_t size[3] = {(uint64_t)D_Q, (uint64_t)params.h_q, (uint64_t)params.s_q};
+        // Strides (in bytes)
+        uint64_t stride[2] = {(uint64_t)params.stride_q_h_q * sizeof(bf16), (uint64_t)params.stride_q_s_q * sizeof(bf16)};
+        // Box Size: Height fixed at B_H (64)
+        uint32_t box_size[3] = {(uint32_t)D_Q, (uint32_t)B_H, 1};
+        uint32_t elem_stride[3] = {1, 1, 1};
 
+        CUresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
+            &tensor_map_Q,
+            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+            3,
+            params.q, // pointer
+            size,
+            stride,
+            box_size,
+            elem_stride,
+            CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
+            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            // Key: Out-of-bounds fill with zero
+            CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_ZERO
+        );
+        FLASH_ASSERT(res == CUresult::CUDA_SUCCESS);
+    }
+
+    // Create O Tensor Map
     CUtensorMap tensor_map_O;
     {
+        // Global Size: Use actual params.h_q
         uint64_t size[3] = {D_V, (unsigned long)params.h_q, (unsigned long)params.s_q};
         uint64_t stride[2] = {D_V*sizeof(bf16), D_V*params.h_q*sizeof(bf16)};
+        // Box Size: Height fixed at B_H (64)
         uint32_t box_size[3] = {64, B_H, 1};
         uint32_t elem_stride[3] = {1, 1, 1};
+        
         CUresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
             &tensor_map_O,
             CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
@@ -683,24 +704,27 @@ void run_fwd_kernel_impl(const SparsePrefillParams& params) {
             CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
             CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
             CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            // OOB writes will be automatically discarded
             CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
         );
         FLASH_ASSERT(res == CUresult::CUDA_SUCCESS);
     }
 
-    TmaParams<
-        decltype(shape_Q), decltype(tma_Q)
-    > tma_params = {
-        shape_Q, tma_Q,
+    TmaParams tma_params = {
+        tensor_map_Q,
         tensor_map_O
     };
-    auto kernel = &sparse_attn_fwd_kernel<B_H, decltype(tma_params)>;
+    
+    auto kernel = &sparse_attn_fwd_kernel<TmaParams>;
 
-    constexpr size_t smem_size = sizeof(SharedMemoryPlan<B_H>);
+    constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
+    // Grid calculation: round up to handle partial tiles
+    int grid_h = (params.h_q + B_H - 1) / B_H;
+    
     cutlass::ClusterLaunchParams launch_params = {
-        dim3((params.h_q/B_H)*params.s_q, 1, 1),    // NOTE We put s_q on the first dim since it can be larger than 65536 (the maximum size of griddim.y and griddim.z)
+        dim3(grid_h * params.s_q, 1, 1),    // NOTE We put s_q on the first dim since it can be larger than 65536 (the maximum size of griddim.y and griddim.z)
         dim3(NUM_THREADS, 1, 1),
         dim3(1, 1, 1),
         smem_size,
@@ -710,20 +734,6 @@ void run_fwd_kernel_impl(const SparsePrefillParams& params) {
         launch_params, (void*)kernel, params, tma_params
     );
     CHECK_CUDA_KERNEL_LAUNCH();
-}
-
-void run_fwd_kernel(const SparsePrefillParams& params) {
-    // Determine B_H based on h_q
-    // Try to use the largest possible B_H that divides h_q evenly
-    if (params.h_q % 64 == 0) {
-        run_fwd_kernel_impl<64>(params);
-    } else if (params.h_q % 32 == 0) {
-        run_fwd_kernel_impl<32>(params);
-    } else if (params.h_q % 16 == 0) {
-        run_fwd_kernel_impl<16>(params);
-    } else {
-        FLASH_ASSERT(false && "h_q must be divisible by 16, 32, or 64");
-    }
 }
 
 }
