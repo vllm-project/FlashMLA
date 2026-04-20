@@ -20,7 +20,8 @@ dense_attn_decode_interface(
     const float softmax_scale,
     bool is_causal,
     std::optional<at::Tensor> &tile_scheduler_metadata,   // num_sm_parts x (DecodingSchedMetaSize/4)
-    std::optional<at::Tensor> &num_splits                 // batch_size + 1
+    std::optional<at::Tensor> &num_splits,                // batch_size + 1
+    const std::optional<at::Tensor> &out_
 ) {
     // Check arch
     Arch arch = Arch();
@@ -87,7 +88,16 @@ dense_attn_decode_interface(
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
 
     auto opts = q.options();
-    at::Tensor out = torch::empty({batch_size, num_heads, q_seq_per_hk, head_size_v}, opts);
+    at::Tensor out;
+    if (out_.has_value()) {
+        out = out_.value();
+        TORCH_CHECK(out.dtype() == q_dtype, "out must have the same dtype as q");
+        KU_CHECK_SHAPE(out, batch_size, num_heads, q_seq_per_hk, head_size_v);
+        KU_CHECK_CONTIGUOUS(out);
+        KU_CHECK_DEVICE(out);
+    } else {
+        out = torch::empty({batch_size, num_heads, q_seq_per_hk, head_size_v}, opts);
+    }
     at::Tensor lse = torch::empty({batch_size, num_heads, q_seq_per_hk}, opts.dtype(at::kFloat));
     KU_CHECK_CONTIGUOUS(out);
     KU_CHECK_CONTIGUOUS(lse);

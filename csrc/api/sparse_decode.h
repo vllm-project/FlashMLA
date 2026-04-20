@@ -193,7 +193,8 @@ sparse_attn_decode_interface(
     const std::optional<at::Tensor> &extra_indices,
     const std::optional<at::Tensor> &extra_topk_length,
     int d_v,
-    float sm_scale
+    float sm_scale,
+    const std::optional<at::Tensor> &out_
 ) {
     using bf16 = cutlass::bfloat16_t;
 
@@ -312,7 +313,16 @@ sparse_attn_decode_interface(
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
     auto opts = q.options();
 
-    at::Tensor out = torch::empty({b, s_q, h_q, d_v}, opts);
+    at::Tensor out;
+    if (out_.has_value()) {
+        out = out_.value();
+        KU_CHECK_DTYPE(out, torch::kBFloat16);
+        KU_CHECK_SHAPE(out, b, s_q, h_q, d_v);
+        KU_CHECK_LAST_DIM_CONTIGUOUS(out);
+        KU_CHECK_DEVICE(out);
+    } else {
+        out = torch::empty({b, s_q, h_q, d_v}, opts);
+    }
     at::Tensor lse = torch::empty({b, s_q, h_q}, opts.dtype(at::kFloat));
 
     ModelType model_type;

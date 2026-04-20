@@ -105,7 +105,8 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
     float sm_scale,
     int d_v,
     const std::optional<at::Tensor> &attn_sink,
-    const std::optional<at::Tensor> &topk_length
+    const std::optional<at::Tensor> &topk_length,
+    const std::optional<at::Tensor> &out_
 ) {
     using bf16 = cutlass::bfloat16_t;
     
@@ -159,7 +160,16 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
     auto opts = q.options();
     
-    at::Tensor out = torch::empty({s_q, h_q, d_v}, opts);
+    at::Tensor out;
+    if (out_.has_value()) {
+        out = out_.value();
+        KU_CHECK_DTYPE(out, torch::kBFloat16);
+        KU_CHECK_SHAPE(out, s_q, h_q, d_v);
+        KU_CHECK_LAST_DIM_CONTIGUOUS(out);
+        KU_CHECK_DEVICE(out);
+    } else {
+        out = torch::empty({s_q, h_q, d_v}, opts);
+    }
     at::Tensor lse = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
     at::Tensor max_logits = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
     KU_CHECK_CONTIGUOUS(out);
