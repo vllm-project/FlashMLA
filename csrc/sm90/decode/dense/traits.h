@@ -10,14 +10,20 @@
 using TMABarrier = cutlass::arch::ClusterTransactionBarrier;
 using namespace cute;
 
-template<typename InputT_>
+template<typename InputT_, int HEAD_DIM_K_>
 struct Traits {
     using InputT = InputT_;
-    
+
     static constexpr int BLOCK_SIZE_M = Config::BLOCK_SIZE_M;
     static constexpr int PAGE_BLOCK_SIZE = Config::PAGE_BLOCK_SIZE;
-    static constexpr int HEAD_DIM_K = Config::HEAD_DIM_K;
+    static constexpr int HEAD_DIM_K = HEAD_DIM_K_;
     static constexpr int HEAD_DIM_V = Config::HEAD_DIM_V;
+
+    static constexpr int TILE_SIZE_K = 64;
+    static constexpr int REUSE_ROPE = (TILE_SIZE_K == PAGE_BLOCK_SIZE) \
+                                    && (TILE_SIZE_K == (HEAD_DIM_K - HEAD_DIM_V));
+    static constexpr int Q_BYTES = BLOCK_SIZE_M * HEAD_DIM_K * sizeof(InputT);
+    static constexpr int NUM_TILES_DIM_K = HEAD_DIM_K / TILE_SIZE_K;
 
     static constexpr int NUM_THREADS = 256;
 
@@ -72,13 +78,13 @@ struct Traits {
         cute::array_aligned<InputT, cosize_v<SmemLayoutQ>> smem_sQ;
         cute::array_aligned<InputT, cosize_v<SmemLayoutK>> smem_sK0;
         cute::array_aligned<InputT, cosize_v<SmemLayoutK>> smem_sK1;
-        cute::array_aligned<InputT, cosize_v<SmemLayoutP0>> smem_sP0;
+        cute::array_aligned<InputT, cosize_v<SmemLayoutP0>> smem_sP[REUSE_ROPE ? 1 : 2];
         cute::array_aligned<float, BLOCK_SIZE_M> smem_sM;
         cute::array_aligned<float, 2*BLOCK_SIZE_M> sL_reduction_wksp;
         cute::array_aligned<float, BLOCK_SIZE_M> smem_sScale0;
         cute::array_aligned<float, BLOCK_SIZE_M> smem_sScale1;
-        TMABarrier barriers_K0[HEAD_DIM_K/64];
-        TMABarrier barriers_K1[HEAD_DIM_K/64];
+        TMABarrier barriers_K0[NUM_TILES_DIM_K];
+        TMABarrier barriers_K1[NUM_TILES_DIM_K];
         TMABarrier barrier_Q;
     };
 

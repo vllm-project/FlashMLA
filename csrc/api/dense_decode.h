@@ -184,12 +184,20 @@ dense_attn_decode_interface(
     params.stream = get_current_cuda_stream(q);
 
     if (q_dtype == ScalarType::BFloat16) {
-        sm90::run_flash_splitkv_mla_kernel<cutlass::bfloat16_t>(params);
+        if (head_size_k == 576) {
+            sm90::run_flash_splitkv_mla_kernel<cutlass::bfloat16_t, 576>(params);
+        } else {
+            sm90::run_flash_splitkv_mla_kernel<cutlass::bfloat16_t, 512>(params);
+        }
     } else if (q_dtype == ScalarType::Half) {
 #ifdef FLASH_MLA_DISABLE_FP16
         STD_TORCH_CHECK(false, "FlashMLA is compiled with -DFLASH_MLA_DISABLE_FP16. Please remove this flag from your environment and re-compile FlashMLA.");
 #else
-        sm90::run_flash_splitkv_mla_kernel<cutlass::half_t>(params);
+        if (head_size_k == 576) {
+            sm90::run_flash_splitkv_mla_kernel<cutlass::half_t, 576>(params);
+        } else {
+            sm90::run_flash_splitkv_mla_kernel<cutlass::half_t, 512>(params);
+        }
 #endif
     } else {
         STD_TORCH_CHECK(false, "Unsupported dtype for dense MLA on SM90");
