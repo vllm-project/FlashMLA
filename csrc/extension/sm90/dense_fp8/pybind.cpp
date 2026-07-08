@@ -206,7 +206,7 @@ get_mla_decoding_metadata_dense_fp8(
     auto options = seqlens_k.options();
     auto dprops = at::cuda::getCurrentDeviceProperties();
     int sm_count = dprops->multiProcessorCount;
-    int num_sm_parts = sm_count / num_heads_k / cutlass::ceil_div(num_heads_per_head_k, block_size_m);
+    int num_sm_parts = std::max(sm_count / num_heads_k / cutlass::ceil_div(num_heads_per_head_k, block_size_m), 1);
     auto tile_scheduler_metadata = torch::empty({num_sm_parts, TileSchedulerMetaDataSize}, options);
     auto num_splits = torch::empty({batch_size + 1}, options);
     int *tile_scheduler_metadata_ptr = tile_scheduler_metadata.data_ptr<int>();
