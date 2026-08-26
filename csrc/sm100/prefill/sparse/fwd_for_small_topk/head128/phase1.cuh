@@ -1045,15 +1045,17 @@ void KernelTemplate<FWD_MODE, D_QK>::run(const ArgT& params) {
 
     CUtensorMap tensor_map_o_accum = {};
     if constexpr (FWD_MODE == FwdMode::DecodeWithSplitKV) {
-        tensor_map_o_accum = ku::make_tensor_map(
-            {32, H_Q, D_V/32, (unsigned long)params.s_q, (unsigned long)params.num_sm_parts + params.b},
-            ku::make_stride_helper<int>({params.stride_o_accum_h_q, 32, params.stride_o_accum_s_q, params.stride_o_accum_split}, sizeof(float)),
-            {32, H_Q/2, B_EPI_SPLITKV/32, 1, 1},
-            params.o_accum,
-            CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
-            CU_TENSOR_MAP_SWIZZLE_128B,
-            CU_TENSOR_MAP_L2_PROMOTION_L2_256B
-        );
+        if (params.o_accum != nullptr) {
+            tensor_map_o_accum = ku::make_tensor_map(
+                {32, H_Q, D_V/32, (unsigned long)params.s_q, (unsigned long)params.num_sm_parts + params.b},
+                ku::make_stride_helper<int>({params.stride_o_accum_h_q, 32, params.stride_o_accum_s_q, params.stride_o_accum_split}, sizeof(float)),
+                {32, H_Q/2, B_EPI_SPLITKV/32, 1, 1},
+                params.o_accum,
+                CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+                CU_TENSOR_MAP_SWIZZLE_128B,
+                CU_TENSOR_MAP_L2_PROMOTION_L2_256B
+            );
+        }
     }
 
     TmaParams tma_params;

@@ -233,6 +233,51 @@ def test_flash_mla(p: TestParam) -> Result:
     return performance_result
 
 
+@torch.inference_mode()
+def test_no_split_workspace_allocation():
+    """No-split sparse decode must not allocate split-KV accumulators.
+
+    A query length equal to the SM count uses one scheduler partition. The
+    kernel writes directly to the output in this case, so allocating split-KV
+    scratch only increases peak memory and can cause runtime OOMs.
+    """
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    p = RawTestParam(
+        b=1,
+        h_q=64,
+        s_q=num_sms,
+        h_kv=1,
+        s_kv=512,
+        is_varlen=False,
+        topk=64,
+        d_qk=576,
+        check_correctness=False,
+        num_runs=0,
+        seed=1,
+    ).to_test_param()
+    t = lib.generate_testcase_for_decode(p)
+    tile_scheduler_metadata, _ = flash_mla.get_mla_metadata()
+
+    def run_decode():
+        return lib.run_flash_mla_decode(p, t, tile_scheduler_metadata, None)
+
+    out, lse = run_decode()
+    torch.cuda.synchronize()
+    del out, lse
+    torch.cuda.empty_cache()
+
+    memory_before = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    out, lse = run_decode()
+    torch.cuda.synchronize()
+    peak_memory = torch.cuda.max_memory_allocated() - memory_before
+    output_memory = out.nbytes + lse.nbytes
+    assert peak_memory <= output_memory + 1024**2, (
+        f"No-split decode allocated {peak_memory / 1024**2:.2f} MiB for "
+        f"{output_memory / 1024**2:.2f} MiB of outputs"
+    )
+
+
 def main():
     dtype = torch.bfloat16
     device = torch.device("cuda:0")
@@ -241,6 +286,8 @@ def main():
     torch.cuda.set_device(device)
     torch.set_float32_matmul_precision('high')
     torch.set_num_threads(32)
+
+    test_no_split_workspace_allocation()
 
     raw_testcases = gen_testcase()
     testcases = [t.to_test_param() for t in raw_testcases]

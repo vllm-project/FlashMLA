@@ -143,8 +143,12 @@ protected:
                 }
                 cur_params.lse += start_head_idx;
                 cur_params.out += start_head_idx * params.stride_o_h_q;
-                cur_params.lse_accum += start_head_idx;
-                cur_params.o_accum += start_head_idx * params.stride_o_accum_h_q;
+                if (cur_params.lse_accum) {
+                    cur_params.lse_accum += start_head_idx;
+                }
+                if (cur_params.o_accum) {
+                    cur_params.o_accum += start_head_idx * params.stride_o_accum_h_q;
+                }
                 cur_params.h_q = 64;
                 sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE>(cur_params);
             }
@@ -460,21 +464,28 @@ sparse_attn_decode_interface(
     params.num_splits_ptr = num_splits->mutable_data_ptr<int>();
     params.num_sm_parts = impl_meta.num_sm_parts;
 
-    // Allocate intermediate buffers for split-KV
-    const int total_num_splits = b + impl_meta.num_sm_parts;
-    lse_accum = torch::stable::new_empty(q, {total_num_splits, s_q, h_q}, ScalarType::Float);
-    o_accum = torch::stable::new_empty(q, {total_num_splits, s_q, h_q, d_v}, ScalarType::Float);
-    KU_CHECK_CONTIGUOUS(lse_accum);
-    KU_CHECK_CONTIGUOUS(o_accum);
-    params.lse_accum = lse_accum.mutable_data_ptr<float>();
-    params.o_accum = o_accum.mutable_data_ptr<float>();
-    params.stride_lse_accum_split = int64_stride_to_int(lse_accum.stride(0));
-    params.stride_lse_accum_s_q = int64_stride_to_int(lse_accum.stride(1));
-    params.stride_o_accum_split = int64_stride_to_int(o_accum.stride(0));
-    params.stride_o_accum_s_q = int64_stride_to_int(o_accum.stride(1));
-    params.stride_o_accum_h_q = int64_stride_to_int(o_accum.stride(2));
+    const bool needs_split_workspace = impl_meta.num_sm_parts > 1;
+    if (needs_split_workspace) {
+        const int total_num_splits = b + impl_meta.num_sm_parts;
+        lse_accum = torch::stable::new_empty(q, {total_num_splits, s_q, h_q}, ScalarType::Float);
+        o_accum = torch::stable::new_empty(q, {total_num_splits, s_q, h_q, d_v}, ScalarType::Float);
+        KU_CHECK_CONTIGUOUS(lse_accum);
+        KU_CHECK_CONTIGUOUS(o_accum);
+        params.lse_accum = lse_accum.mutable_data_ptr<float>();
+        params.o_accum = o_accum.mutable_data_ptr<float>();
+        params.stride_lse_accum_split = int64_stride_to_int(lse_accum.stride(0));
+        params.stride_lse_accum_s_q = int64_stride_to_int(lse_accum.stride(1));
+        params.stride_o_accum_split = int64_stride_to_int(o_accum.stride(0));
+        params.stride_o_accum_s_q = int64_stride_to_int(o_accum.stride(1));
+        params.stride_o_accum_h_q = int64_stride_to_int(o_accum.stride(2));
+    }
 
     impl->run(params, features);
+
+    if (!needs_split_workspace) {
+        delete impl;
+        return {out, torch::stable::transpose(lse, 1, 2), tile_scheduler_metadata, num_splits};
+    }
     
     CombineParams combine_params = {
         b, s_q, h_q, d_v,
