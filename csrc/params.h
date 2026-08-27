@@ -4,7 +4,10 @@
 
 enum class ModelType {
     V32,
-    MODEL1
+    MODEL1,
+    // V3.2 geometry (d_qk=576) with NVFP4 (e2m1, per-16 e4m3 scales) NoPE and
+    // e4m3 RoPE. SM100-only. See csrc/sm100/decode/head64/config.h for the layout.
+    V32_NVFP4_FP8ROPE
 };
 
 struct __align__(4*8) DecodingSchedMeta {

@@ -41,6 +41,7 @@ class TestParam:
     have_attn_sink: bool = False
     have_topk_length: bool = False
     decode: Optional[ExtraTestParamForDecode] = None
+    kv_format: str = "fp8"  # "fp8" | "nvfp4.fp8rope" (decode only)
 
 @dataclasses.dataclass
 class RawTestParamForDecode:
@@ -70,6 +71,7 @@ class RawTestParamForDecode:
     check_correctness: bool = True
     num_runs: int = 10
     seed: int = -1
+    kv_format: str = "fp8"  # "fp8" | "nvfp4.fp8rope"
 
     def to_test_param(self) -> TestParam:
         return TestParam(
@@ -83,7 +85,8 @@ class RawTestParamForDecode:
                 self.b, self.is_varlen, self.have_zero_seqlen_k,
                 self.extra_s_k, self.extra_topk,
                 self.block_size, self.extra_block_size, self.have_extra_topk_length
-            )
+            ),
+            kv_format = self.kv_format
         )
     
 @dataclasses.dataclass
@@ -181,7 +184,10 @@ class KVScope:
         Besides, the quantization error may be too large to be distinguished from wrong kernels, so we de-quantize kvcache here to mitigate quantization error
         """
         fp8_kvcache_layout = None
-        if self.t.d_qk == 576:
+        if self.t.kv_format == "nvfp4.fp8rope":
+            assert self.t.d_qk == 576
+            fp8_kvcache_layout = quant.FP8KVCacheLayout.NVFP4_FP8Rope
+        elif self.t.d_qk == 576:
             fp8_kvcache_layout = quant.FP8KVCacheLayout.V32_FP8Sparse
         elif self.t.d_qk == 512:
             assert self.abs_indices is not None
@@ -330,7 +336,7 @@ def run_flash_mla_decode(p: TestParam, t: TestcaseForDecode, tile_scheduler_meta
         t.extra_kv_scope.get_kvcache_for_flash_mla() if t.extra_kv_scope is not None else None,
         t.extra_kv_scope.indices_in_kvcache if t.extra_kv_scope is not None else None,
         t.kv_scope.topk_length,
-        t.extra_kv_scope.topk_length if t.extra_kv_scope is not None and t.extra_kv_scope.topk_length is not None else None
+        t.extra_kv_scope.topk_length if t.extra_kv_scope is not None and t.extra_kv_scope.topk_length is not None else None,
     )
 
 
@@ -390,7 +396,10 @@ def count_flop_and_mem_vol_for_decode(p: TestParam, t: TestcaseForDecode) -> Flo
     num_retrieved_tokens = get_num_retrieved_tokens(t.kv_scope) + (get_num_retrieved_tokens(t.extra_kv_scope) if t.extra_kv_scope is not None else 0)
 
     compute_flop = 2 * p.h_q * num_attended_tokens * (p.d_qk + p.d_v)
-    kv_token_size = 656 if p.d_qk == 576 else 576   # Assume FP8 KV Cache
+    kv_token_size = {
+        "fp8": 656 if p.d_qk == 576 else 576,
+        "nvfp4.fp8rope": 352,
+    }[p.kv_format]
     mem_vol = sum([
         2 * b * p.s_q * p.h_q * p.d_qk, # Q
         num_retrieved_tokens * kv_token_size,   # K

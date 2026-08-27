@@ -101,6 +101,11 @@ def flash_mla_with_kvcache(
             - First 512 bytes: The "quantized NoPE" part, containing 512 float8_e4m3 values.
             - Next 16 bytes: Scale factors, containing 4 float32 values. The first float32 is the scale for the first 128 float8_e4m3 values, the second for the next 128, and so on.
             - Last 128 bytes: The "RoPE" part, containing 64 bfloat16 values. This part is not quantized for accuracy.
+        The quantized KV cache format is inferred from `head_dim` and the number of bytes per token, i.e. `k_cache.shape[-1]`.
+        Besides the 656-byte layout above, head_dim == 576 also accepts a 352-byte NVFP4 layout (SM100 only):
+            - First 256 bytes: The "quantized NoPE" part, containing 512 float4_e2m1 values.
+            - Next 64 bytes: The "RoPE" part, containing 64 float8_e4m3 values. This part is not scaled.
+            - Last 32 bytes: Scale factors for the NoPE part, containing 32 float8_e4m3 values, one per 16 float4_e2m1 values.
 
     Return:
         out: (batch_size, seq_len_q, num_heads_q, head_dim_v).
@@ -121,7 +126,7 @@ def flash_mla_with_kvcache(
         # Sanity check. We only perform sanity check during the first invocation to save CPU time.
         if indices_in_kvcache is not None:
             assert not causal, "causal must be False when indices_in_kvcache is not None (i.e. sparse attention is enabled)"
-            
+
         # Initialize the tile scheduler metadata during the first invocation.
         sched_meta.have_initialized = True
         sched_meta.config = FlashMLASchedMeta.Config(

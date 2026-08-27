@@ -99,9 +99,52 @@ def gen_testcase() -> List[RawTestParam]:
                         ]
                         corner_cases.extend(cur_corner_cases)
 
+    # NVFP4 KV cache format (SM100 only, V3.2 geometry: d_qk = 576)
+    for h_q in [64, 128]:
+        for have_topk_len in [False, True]:
+            correctness_cases.extend([
+                RawTestParam(b, h_q, s_q, 1, s_k, is_varlen, topk,
+                            have_topk_length=have_topk_len,
+                            enable_attn_sink=True,
+                            block_size=block_size,
+                            d_qk=576,
+                            check_correctness=True,
+                            num_runs=0,
+                            kv_format="nvfp4.fp8rope")
+                for (s_k, topk, block_size) in [
+                    (512, 64, 2),
+                    (512, 64, 64),
+                    (512, 64, 69),
+                    (1024, 576, 61),
+                    (2046, 2048, 64),
+                ]
+                for b in [4, 74]
+                for s_q in [1, 3]
+                for is_varlen in ([True, False] if (b == 74 and not have_topk_len) else [True])
+            ])
+        corner_cases.extend([
+            RawTestParam(b, h_q, 3, 1, s_k, True, topk,
+                        is_all_indices_invalid=is_all_indices_invalid,
+                        have_zero_seqlen_k=have_zero_seqlen_k,
+                        enable_attn_sink=enable_attn_sink,
+                        block_size=block_size,
+                        d_qk=576,
+                        check_correctness=True,
+                        num_runs=0,
+                        kv_format="nvfp4.fp8rope")
+            for (s_k, topk, block_size) in [(512, 64, 61), (650, 576, 53)]
+            for b in [4, 74]
+            for is_all_indices_invalid in [True, False]
+            for have_zero_seqlen_k in [True, False]
+            for enable_attn_sink in [True, False]
+            if (is_all_indices_invalid or have_zero_seqlen_k or enable_attn_sink)
+        ])
+
     base_and_bszs = [
         # V3.2
         (RawTestParam(0, 128, 2, 1, 32768, True, topk=2048, d_qk=576), [2, 64, 74, 128]),
+        # V3.2 shape with NVFP4 KV cache
+        (RawTestParam(0, 128, 2, 1, 32768, True, topk=2048, d_qk=576, kv_format="nvfp4.fp8rope"), [64, 128]),
         # MODEL1 CONFIG1
         (RawTestParam(0, 64, 2, 1, 16384, True, topk=128, d_qk=512, extra_s_k=16384, extra_topk=512, block_size=256, extra_block_size=64), [2, 64, 74, 128, 74*2, 256]),
         # MODEL1 CONFIG2
@@ -121,6 +164,10 @@ def gen_testcase() -> List[RawTestParam]:
         RawTestParam(74*2, h_q, 2, 1, 32768, True, topk=16384, d_qk=d_qk)
         for h_q in [64, 128]
         for d_qk in [512, 576]
+    ] + [
+        # Peak perf cases, NVFP4 KV cache
+        RawTestParam(74*2, h_q, 2, 1, 32768, True, topk=16384, d_qk=576, kv_format="nvfp4.fp8rope")
+        for h_q in [64, 128]
     ]
 
     return correctness_cases + corner_cases + performance_cases

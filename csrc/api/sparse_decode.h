@@ -24,7 +24,10 @@ enum class DecodeFeatures : int {
     ATTN_SINK,
     TOPK_LENGTH,
     EXTRA_KVCACHE,
-    EXTRA_TOPK_LENGTH
+    EXTRA_TOPK_LENGTH,
+
+    // NVFP4 (e2m1 + per-16 e4m3 scales) NoPE with e4m3 RoPE. SM100-only.
+    NVFP4_FP8ROPE_KVCACHE_FORMAT
 };
 
 struct DecodeImplMeta {
@@ -82,6 +85,7 @@ class Decode_Sm100_Head64_Impl : public DecodeImplBase {
         DecodeFeatures::HEAD_DIM_576,
         DecodeFeatures::V32_KVCACHE_FORMAT,
         DecodeFeatures::MODEL1_KVCACHE_FORMAT,
+        DecodeFeatures::NVFP4_FP8ROPE_KVCACHE_FORMAT,
         DecodeFeatures::ATTN_SINK,
         DecodeFeatures::TOPK_LENGTH,
         DecodeFeatures::EXTRA_KVCACHE,
@@ -100,7 +104,7 @@ public:
 
 protected:
     void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
-        DISPATCH_MODEL_TYPE(params.model_type, MODEL_TYPE, [&]() {
+        DISPATCH_MODEL_TYPE_SM100(params.model_type, MODEL_TYPE, [&]() {
             sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE>(params);
         });
     }
@@ -116,6 +120,7 @@ class Decode_Sm100_Head64x2_Impl : public DecodeImplBase {
         DecodeFeatures::HEAD_DIM_576,
         DecodeFeatures::V32_KVCACHE_FORMAT,
         DecodeFeatures::MODEL1_KVCACHE_FORMAT,
+        DecodeFeatures::NVFP4_FP8ROPE_KVCACHE_FORMAT,
         DecodeFeatures::ATTN_SINK,
         DecodeFeatures::TOPK_LENGTH,
         DecodeFeatures::EXTRA_KVCACHE,
@@ -134,7 +139,7 @@ public:
 
 protected:
     void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
-        DISPATCH_MODEL_TYPE(params.model_type, MODEL_TYPE, [&]() {
+        DISPATCH_MODEL_TYPE_SM100(params.model_type, MODEL_TYPE, [&]() {
             for (int start_head_idx = 0; start_head_idx < 128; start_head_idx += 64) {
                 SparseAttnDecodeParams cur_params = params;
                 cur_params.q += start_head_idx * params.stride_q_h_q;
@@ -290,18 +295,34 @@ sparse_attn_decode_interface(
     
     // Check shape
     KU_CHECK_SHAPE(q, b, s_q, h_q, d_qk);
+    ModelType model_type;
     {
-        int bytes_per_token;
+        // Infer the quantized KV cache format from the KV cache's bytes-per-token
+        // (i.e. its last dim)
+        const int bytes_per_token = static_cast<int>(kv.size(3));
         if (d_qk == 576 && d_v == 512) {
-            // V3.2 style
-            bytes_per_token = 512 + 64*2 + (512/128)*4;
+            if (bytes_per_token == 512 + 64*2 + (512/128)*4) {
+                // V3.2 style, 656B/token: 512B e4m3 NoPE | 128B bf16 RoPE | 16B fp32 NoPE SF
+                model_type = ModelType::V32;
+            } else if (bytes_per_token == 352) {
+                // NVFP4 NoPE + FP8 RoPE, 352B/token: 256B e2m1 NoPE | 64B e4m3 RoPE (unscaled) | 32B e4m3 NoPE SF
+                // Must match KernelTemplate<V32_NVFP4_FP8ROPE>::BYTES_PER_TOKEN
+                model_type = ModelType::V32_NVFP4_FP8ROPE;
+            } else {
+                STD_TORCH_CHECK(false, "Cannot infer the sparse KV cache format: with d_qk == ", d_qk, " and d_v == ", d_v,
+                    ", kv.size(-1) (bytes per token) must be 656 (fp8) or 352 (nvfp4 nope + fp8 rope), but got ", bytes_per_token);
+            }
         } else if (d_qk == 512 && d_v == 512) {
-            // MODEL1 style
-            bytes_per_token = 448 + 64*2 + (448/64)*1 + 1;
+            if (bytes_per_token == 448 + 64*2 + (448/64)*1 + 1) {
+                // MODEL1 style, 584B/token
+                model_type = ModelType::MODEL1;
+            } else {
+                STD_TORCH_CHECK(false, "Cannot infer the sparse KV cache format: with d_qk == ", d_qk, " and d_v == ", d_v,
+                    ", kv.size(-1) (bytes per token) must be 584 (fp8), but got ", bytes_per_token);
+            }
         } else {
-            STD_TORCH_CHECK(false, "Unsupported head sizes for is_fp8_kvcache == True");
+            STD_TORCH_CHECK(false, "Unsupported head sizes for sparse decoding: d_qk == ", d_qk, ", d_v == ", d_v);
         }
-        KU_CHECK_SHAPE(kv, num_blocks, page_block_size, h_kv, bytes_per_token);
         KU_CHECK_SHAPE(extra_kv, extra_num_blocks, extra_page_block_size, h_kv, bytes_per_token);
         STD_TORCH_CHECK(kv.stride(1) == bytes_per_token, "The whole block must be contiguous when is_fp8_cache is True for kv cache");
         if (extra_kv.has_value()) {
@@ -328,15 +349,6 @@ sparse_attn_decode_interface(
     }
     Tensor lse = torch::stable::new_empty(q, {b, s_q, h_q}, ScalarType::Float);
 
-    ModelType model_type;
-    if (d_qk == 576) {
-        model_type = ModelType::V32;
-    } else if (d_qk == 512) {
-        model_type = ModelType::MODEL1;
-    } else {
-        STD_TORCH_CHECK(false, "Unsupported d_qk: ", d_qk);
-    }
-
     std::vector<DecodeFeatures> features;
     if (h_q == 64) {
         features.push_back(DecodeFeatures::HEAD_64);
@@ -356,6 +368,8 @@ sparse_attn_decode_interface(
         features.push_back(DecodeFeatures::V32_KVCACHE_FORMAT);
     } else if (model_type == ModelType::MODEL1) {
         features.push_back(DecodeFeatures::MODEL1_KVCACHE_FORMAT);
+    } else if (model_type == ModelType::V32_NVFP4_FP8ROPE) {
+        features.push_back(DecodeFeatures::NVFP4_FP8ROPE_KVCACHE_FORMAT);
     } else {
         STD_TORCH_CHECK(false, "Unsupported model type: ", (int)model_type);
     }

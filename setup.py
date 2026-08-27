@@ -111,6 +111,7 @@ ext_modules.append(
             # sm100 sparse decode
             "csrc/sm100/decode/head64/instantiations/v32.cu",
             "csrc/sm100/decode/head64/instantiations/model1.cu",
+            "csrc/sm100/decode/head64/instantiations/v32_nvfp4_fp8rope.cu",
             "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu",
         ],
         extra_compile_args={
@@ -139,7 +140,13 @@ ext_modules.append(
             Path(this_dir) / "csrc" / "sm90",
             Path(this_dir) / "csrc" / "cutlass" / "include",
             Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
-        ],
+        ] + (
+            # CUDA 13 relocated the CCCL headers (cuda/std/...) under
+            # include/cccl; nvcc injects this path itself but the host C++
+            # compiler does not get it.
+            [Path(CUDA_HOME) / "include" / "cccl"]
+            if (Path(CUDA_HOME) / "include" / "cccl").exists() else []
+        ),
         # Build against CPython's Limited API (abi3) so one wheel works across
         # multiple CPython versions, which is possible now that pybind11 is gone
         py_limited_api=True,

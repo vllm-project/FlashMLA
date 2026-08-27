@@ -111,6 +111,18 @@ inline int int64_stride_to_int(int64_t orig_stride) {
     } \
 } ();
 
+// Like DISPATCH_MODEL_TYPE, but also covers the NVFP4 format (SM100-only kernel).
+// Kept separate so that SM90 kernel templates are never instantiated for NVFP4.
+#define DISPATCH_MODEL_TYPE_SM100(MODEL_TYPE, CONSTEXPR_NAME, ...) \
+[&] () { \
+    if (MODEL_TYPE == ModelType::V32_NVFP4_FP8ROPE) { \
+        static constexpr ModelType CONSTEXPR_NAME = ModelType::V32_NVFP4_FP8ROPE; \
+        return __VA_ARGS__(); \
+    } else { \
+        return DISPATCH_MODEL_TYPE(MODEL_TYPE, CONSTEXPR_NAME, __VA_ARGS__); \
+    } \
+} ();
+
 // The following code is adapted from https://ykiko.me/en/articles/680412313/, which converts enum values to string names.
 template<auto value>
 constexpr auto get_static_enum_name(){
