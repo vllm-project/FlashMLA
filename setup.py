@@ -17,7 +17,17 @@ def is_flag_set(flag: str) -> bool:
     return os.getenv(flag, "FALSE").lower() in ["true", "1", "y", "yes"]
 
 def get_features_args():
-    features_args = []
+    # ABI-stable flags (always on): TORCH_TARGET_VERSION pins the minimum runtime
+    # PyTorch version and bans unstable ATen/c10/torch headers at compile time;
+    # USE_CUDA exposes aoti_torch_get_current_cuda_stream from the shim.
+    # FLASH_MLA_ENABLE_DENSE_BWD registers dense_prefill_bwd (for when we build
+    # the extension directly in the fork); vLLM's integrated build will omit it as
+    # it is inference-only.
+    features_args = [
+        "-DTORCH_TARGET_VERSION=0x020a000000000000",  # PyTorch >= 2.10 at runtime
+        "-DUSE_CUDA",
+        "-DFLASH_MLA_ENABLE_DENSE_BWD",
+    ]
     if is_flag_set("FLASH_MLA_DISABLE_FP16"):
         features_args.append("-DFLASH_MLA_DISABLE_FP16")
     return features_args
@@ -63,14 +73,12 @@ else:
 ext_modules = []
 ext_modules.append(
     CUDAExtension(
-        name="flash_mla.cuda",
+        name="flash_mla._flashmla_C",
         sources=[
             # API
             "csrc/api/api.cpp",
             "csrc/api/sparse_prefill.cpp",
             "csrc/api/sparse_decode.cpp",
-            "csrc/api/dense_fwd.cpp",
-            "csrc/api/dense_bwd.cpp",
             "csrc/api/dense_decode.cpp",
             "csrc/api/fused_norm_rope_attn_rope_cast_fwd.cpp",
 
@@ -169,6 +177,9 @@ ext_modules.append(
             Path(CUDA_HOME) / "targets" / "x86_64-linux" / "include" / "cccl",   # for cuda/std headers in CUDA 13+
             Path(CUDA_HOME) / "targets" / "sbsa-linux" / "include" / "cccl",
         ],
+        # Build against CPython's Limited API (abi3) so one wheel works across
+        # multiple CPython versions, which is possible now that pybind11 is gone
+        py_limited_api=True,
     )
 )
 
@@ -187,4 +198,5 @@ setup(
     packages=find_packages(include=['flash_mla']),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
+    options={"bdist_wheel": {"py_limited_api": "cp310"}},
 )

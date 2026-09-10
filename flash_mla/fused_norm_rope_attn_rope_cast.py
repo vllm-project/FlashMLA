@@ -2,7 +2,9 @@ from typing import Optional, Tuple
 
 import torch
 
-import flash_mla.cuda as flash_mla_cuda
+# The ABI-stable extension registers operators with torch.ops instead of
+# exposing a pybind module.
+flash_mla_cuda = torch.ops._flashmla_C
 
 
 def prefill(

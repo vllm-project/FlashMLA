@@ -3,7 +3,10 @@ import dataclasses
 
 import torch
 
-import flash_mla.cuda as flash_mla_cuda
+# torch.ops._flashmla_C is the op namespace registered by the compiled extension
+# (loaded in __init__.py). Alias it to the old module name so the call sites below
+# are unchanged.
+flash_mla_cuda = torch.ops._flashmla_C
 
 @dataclasses.dataclass
 class FlashMLASchedMeta:
