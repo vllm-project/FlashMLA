@@ -14,6 +14,9 @@ STABLE_TORCH_LIBRARY(_flashmla_C, m) {
     m.def("permute_q_b_proj(Tensor q_b_proj, Tensor scale_factors, int h_q, int d_q) -> Tensor[]");
     m.def("permute_wv_proj(Tensor wv_proj, Tensor scale_factors, int wv_group_size, int d_o) -> Tensor[]");
 #ifdef FLASH_MLA_ENABLE_DENSE_BWD
+    // Dense prefill backward is only registered when its kernel is compiled
+    // (standalone setup.py). vLLM's integrated build is inference-only and does
+    // not compile fmha_cutlass_bwd_sm100.cu, matching the original 4-op library.
     m.def("dense_prefill_bwd(Tensor(a!) workspace_buffer, Tensor d_o, Tensor q, Tensor k, Tensor v, Tensor o, Tensor lse, Tensor cumulative_seqlen_q, Tensor cumulative_seqlen_kv, Tensor(b!) dq, Tensor(c!) dk, Tensor(d!) dv, int mask_mode_code, float softmax_scale, int max_seqlen_q, int max_seqlen_kv, bool is_varlen) -> ()");
 #endif
 }
@@ -32,6 +35,7 @@ STABLE_TORCH_LIBRARY_IMPL(_flashmla_C, CUDA, m) {
 #endif
 }
 
+// To enable vLLM to import vllm._flashmla_C as a python module
 PyMODINIT_FUNC PyInit__flashmla_C() {
     static struct PyModuleDef module = {
         PyModuleDef_HEAD_INIT, "_flashmla_C", nullptr, 0, nullptr};
