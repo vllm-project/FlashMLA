@@ -84,6 +84,14 @@ ku::nvbf16x2 fp8x2_to_bf16x2_with_scale(ku::nve4m3x2 data, __nv_fp8_e8m0 scale_e
     return __hmul2(fp8x2_to_bf16x2(data), ue8m0_to_bf16x2(scale_e8m0));
 }
 
+// Compatibility overload for kernels that have already converted their
+// cache scale to bf16 before dequantizing the fp8 pair.
+CUTE_DEVICE
+ku::nvbf16x2 fp8x2_to_bf16x2_with_scale(ku::nve4m3x2 data, ku::nvbf16 scale) {
+    const ku::nvbf16x2 scale2 = {scale, scale};
+    return __hmul2(fp8x2_to_bf16x2(data), scale2);
+}
+
 // 8x fp4_e2m1 (packed in 32 bits, 2 per byte) -> 4x bf16x2
 // Written as one asm block so that ptxas selects the source byte with the .B0-.B3 operand selector of F2FP instead of emitting PRMTs
 CUTE_DEVICE

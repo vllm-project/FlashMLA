@@ -11,6 +11,7 @@ class KVCacheLayout(enum.Enum):
     V4_FP8Sparse = 2
     V41_FP8Sparse = 3
     V41_FP4 = 4
+    V32_NVFP4_FP8ROPE = 5
 
     def get_meta(self) -> Tuple[int, int, int, int, int]:
         # Return: (d, d_nope, d_rope, tile_size, num_tiles)
@@ -20,6 +21,7 @@ class KVCacheLayout(enum.Enum):
             KVCacheLayout.V4_FP8Sparse: (512, 448, 64, 64, 7),
             KVCacheLayout.V41_FP8Sparse: (512, 448, 64, 32, 16),  # 14 NoPE + 2 RoPE tiles
             KVCacheLayout.V41_FP4: (512, 448, 64, 16, 32),  # 28 NoPE + 4 RoPE tiles, all fp4
+            KVCacheLayout.V32_NVFP4_FP8ROPE: (576, 512, 64, 16, 32),
         }[self]
 
     def get_bytes_per_token(self) -> int:
@@ -30,6 +32,7 @@ class KVCacheLayout(enum.Enum):
             KVCacheLayout.V4_FP8Sparse: d_nope + 2*d_rope + num_tiles + 1,
             KVCacheLayout.V41_FP8Sparse: d_nope + d_rope + num_tiles,
             KVCacheLayout.V41_FP4: d // 2 + num_tiles,
+            KVCacheLayout.V32_NVFP4_FP8ROPE: d_nope // 2 + d_rope + num_tiles,
         }[self]
 
 def _cast_scale_inv_to_ue8m0(scales_inv: torch.Tensor, out_dtype = torch.float32) -> torch.Tensor:
@@ -63,6 +66,33 @@ def _dequantize_e2m1(codes: torch.Tensor) -> torch.Tensor:
     mags = _E2M1_MAGNITUDES.to(codes.device)
     val = mags[(codes & 7).long()]
     return torch.where((codes & 8) != 0, -val, val)
+
+
+def _nvfp4_permute_scales(scales: torch.Tensor) -> torch.Tensor:
+    """Convert 32 scales from element-block order to the kernel's on-wire order."""
+    return scales.unflatten(-1, (8, 4)).transpose(-1, -2).flatten(-2)
+
+
+def _nvfp4_unpermute_scales(scales: torch.Tensor) -> torch.Tensor:
+    """Inverse of _nvfp4_permute_scales."""
+    return scales.unflatten(-1, (4, 8)).transpose(-1, -2).flatten(-2)
+
+
+def _quantize_tiles_with_e4m3_scales(
+    x: torch.Tensor, tile_size: int, max_value: float
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Scale fixed-size tiles, rounding each positive e4m3 scale upward."""
+    tiles = x.float().unflatten(-1, (-1, tile_size))
+    amax = tiles.abs().amax(dim=-1)
+    scale_target = torch.clamp(amax / max_value, 2.0**-9, 448.0)
+    scale = scale_target.to(torch.float8_e4m3fn)
+
+    # Positive e4m3 bit patterns are monotonic. Bump a rounded-down scale so
+    # the largest value in a tile cannot saturate during e2m1 conversion.
+    scale_bits = scale.view(torch.uint8)
+    bump = (scale.float() < scale_target) & (scale_bits < 0x7E)
+    scale = torch.where(bump, (scale_bits + 1).view(torch.float8_e4m3fn), scale)
+    return (tiles / scale.float().unsqueeze(-1)).flatten(-2), scale
 
 def quantize_k_cache(
     input_k_cache: torch.Tensor,    # (num_blocks, block_size, h_k, d)
@@ -181,6 +211,31 @@ def quantize_k_cache(
         result = result.view(num_blocks, block_size, 1, -1)
         return result
 
+    elif kvcache_layout == KVCacheLayout.V32_NVFP4_FP8ROPE:
+        # Token record: 256 B packed e2m1 NoPE, 64 B unscaled e4m3 RoPE,
+        # then 32 B permuted e4m3 NoPE scales.
+        bytes_per_token = kvcache_layout.get_bytes_per_token()
+        result = torch.zeros(
+            (num_blocks, block_size + 1, bytes_per_token),
+            dtype=torch.uint8,
+            device=input_k_cache.device,
+        )[:, :block_size, :]
+
+        nope_scaled, nope_scales = _quantize_tiles_with_e4m3_scales(
+            input_k_cache[..., :d_nope], tile_size, 6.0
+        )
+        nope_codes = _quantize_to_e2m1(nope_scaled)
+        result[..., : d_nope // 2] = (
+            nope_codes[..., 0::2] | (nope_codes[..., 1::2] << 4)
+        )
+        result[..., d_nope // 2 : d_nope // 2 + d_rope] = (
+            input_k_cache[..., d_nope:].to(torch.float8_e4m3fn).view(torch.uint8)
+        )
+        result[..., -num_tiles:] = _nvfp4_permute_scales(
+            nope_scales.view(torch.uint8)
+        )
+        return result.view(num_blocks, block_size, 1, -1)
+
     else:
         raise NotImplementedError(f"Unsupported kvcache_layout: {kvcache_layout}")
     
@@ -261,6 +316,27 @@ def dequantize_k_cache(
             values = _dequantize_e2m1(codes).view(b1 - b0, block_size, num_tiles, tile_size)
             # e2m1 x e4m3 has at most 2 + 4 significant bits, so the product is exact in bf16, as in the kernel
             result[b0:b1] = (values * input_scale[b0:b1].float().unsqueeze(-1)).view(b1 - b0, block_size, d).to(torch.bfloat16)
+
+    elif kvcache_layout == KVCacheLayout.V32_NVFP4_FP8ROPE:
+        raw = quant_k_cache.view(torch.uint8).view(num_blocks, block_size, -1)
+        packed_nope = raw[..., : d_nope // 2]
+        codes = torch.empty(
+            (num_blocks, block_size, d_nope), dtype=torch.uint8, device=raw.device
+        )
+        codes[..., 0::2] = packed_nope & 0xF
+        codes[..., 1::2] = packed_nope >> 4
+
+        scales = _nvfp4_unpermute_scales(raw[..., -num_tiles:])
+        scales = scales.view(torch.float8_e4m3fn).float()
+        values = _dequantize_e2m1(codes).unflatten(-1, (num_tiles, tile_size))
+        result[..., :d_nope] = (
+            values * scales.unsqueeze(-1)
+        ).flatten(-2).to(torch.bfloat16)
+
+        rope_begin = d_nope // 2
+        result[..., d_nope:] = raw[..., rope_begin : rope_begin + d_rope].view(
+            torch.float8_e4m3fn
+        ).to(torch.bfloat16)
 
     else:
         raise NotImplementedError(f"Unsupported kvcache_layout: {kvcache_layout}")

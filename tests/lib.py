@@ -406,13 +406,17 @@ def count_flop_and_mem_vol_for_decode(p: TestParam, t: TestcaseForDecode) -> Flo
         return num_unique_tokens
 
     num_attended_tokens = get_num_attended_tokens(t.kv_scope) + (get_num_attended_tokens(t.extra_kv_scope) if t.extra_kv_scope is not None else 0)
-    num_retrieved_tokens = get_num_retrieved_tokens(t.kv_scope) + (get_num_retrieved_tokens(t.extra_kv_scope) if t.extra_kv_scope is not None else 0)
+    num_retrieved_tokens = get_num_retrieved_tokens(t.kv_scope)
+    num_extra_retrieved_tokens = get_num_retrieved_tokens(t.extra_kv_scope) if t.extra_kv_scope is not None else 0
 
     compute_flop = 2 * p.h_q * num_attended_tokens * (p.d_qk + p.d_v)
-    kv_token_size = 656 if p.d_qk == 576 else 576   # Assume FP8 KV Cache
+    default_layout = quant.KVCacheLayout.V32_FP8Sparse if p.d_qk == 576 else quant.KVCacheLayout.V4_FP8Sparse
+    kv_layout = p.decode.kvcache_layout or default_layout
+    extra_kv_layout = p.decode.extra_kvcache_layout or kv_layout
     mem_vol = sum([
         2 * b * p.s_q * p.h_q * p.d_qk, # Q
-        num_retrieved_tokens * kv_token_size,   # K
+        num_retrieved_tokens * kv_layout.get_bytes_per_token(),
+        num_extra_retrieved_tokens * extra_kv_layout.get_bytes_per_token(),
         2 * b * p.s_q * p.h_q * p.d_v, # O
     ])
     return FlopsAndMemVolStatisticsForDecode(

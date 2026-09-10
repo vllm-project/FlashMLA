@@ -142,6 +142,7 @@ ext_modules.append(
             "csrc/kernels/sm100/decode/sparse/head64/instantiations/v41_h64_no_split.cu",
             "csrc/kernels/sm100/decode/sparse/head64/instantiations/v41fp4_h64.cu",
             "csrc/kernels/sm100/decode/sparse/head64/instantiations/v41fp4_h64_no_split.cu",
+            "csrc/kernels/sm100/decode/sparse/nvfp4_head64/instantiations/v32_nvfp4_fp8rope.cu",
             "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu",
             "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_splitkv.cu",
             "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41.cu",

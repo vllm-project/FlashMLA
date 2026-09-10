@@ -6,7 +6,10 @@ enum class ModelType {
     V32,        // DeepSeek V3.2 (d_qk=576)
     V4,         // DeepSeek V4 (d_qk=512)
     V41,        // DeepSeek V4.1 (d_qk=512, RoPE fp8, quant tile size 32)
-    V41_FP4     // DeepSeek V4.1 (d_qk=512, fp4 e2m1, quant tile size 16, e4m3 scales)
+    V41_FP4,    // DeepSeek V4.1 (d_qk=512, fp4 e2m1, quant tile size 16, e4m3 scales)
+    // V3.2 geometry with fp4 e2m1 NoPE, per-16 e4m3 scales, and
+    // unscaled fp8 e4m3 RoPE. Supported by the SM100 head64 kernel.
+    V32_NVFP4_FP8ROPE
 };
 
 struct __align__(4*8) DecodingSchedMeta {

@@ -4,6 +4,7 @@
 
 #include "kernels/sm90/decode/sparse/splitkv_mla.h"
 #include "kernels/sm100/decode/sparse/head64/kernel.h"
+#include "kernels/sm100/decode/sparse/nvfp4_head64/kernel.h"
 #include "kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
 #include "kernels/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
 #include "kernels/smxx/decode/combine/combine.h"
@@ -29,6 +30,7 @@ enum class DecodeFeatures : int {
     V4_KVCACHE_FORMAT,
     V41_KVCACHE_FORMAT,
     V41_FP4_KVCACHE_FORMAT,
+    NVFP4_FP8ROPE_KVCACHE_FORMAT,
 
     ATTN_SINK,
     TOPK_LENGTH,
@@ -93,6 +95,7 @@ class Decode_Sm100_Head64_Impl : public DecodeImplBase {
         DecodeFeatures::V4_KVCACHE_FORMAT,
         DecodeFeatures::V41_KVCACHE_FORMAT,
         DecodeFeatures::V41_FP4_KVCACHE_FORMAT,
+        DecodeFeatures::NVFP4_FP8ROPE_KVCACHE_FORMAT,
         DecodeFeatures::ATTN_SINK,
         DecodeFeatures::TOPK_LENGTH,
         DecodeFeatures::EXTRA_KVCACHE,
@@ -113,6 +116,13 @@ public:
 
 protected:
     void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
+        if (params.model_type == ModelType::V32_NVFP4_FP8ROPE) {
+            STD_TORCH_CHECK(params.extra_model_type == ModelType::V32_NVFP4_FP8ROPE,
+                            "NVFP4 does not support a mixed extra KV-cache format");
+            STD_TORCH_CHECK(params.enable_split_kv, "NVFP4 requires split-KV scheduling");
+            sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32_NVFP4_FP8ROPE>(params);
+            return;
+        }
         dispatch_kv_formats(SupportedKVFormats{}, params.model_type, params.extra_model_type, [&]<ModelType MODEL_TYPE, ModelType EXTRA_MODEL_TYPE>() {
             DISPATCH_BOOLEAN_FLAG(params.enable_split_kv, ENABLE_SPLIT_KV, ([&]() {
                 STD_TORCH_CHECK(params.h_q == 64, "Unsupported h_q: ", params.h_q);
@@ -133,6 +143,7 @@ class Decode_Sm100_Head64x2_Impl : public DecodeImplBase {
         DecodeFeatures::HEAD_DIM_576,
         DecodeFeatures::V32_KVCACHE_FORMAT,
         DecodeFeatures::V4_KVCACHE_FORMAT,
+        DecodeFeatures::NVFP4_FP8ROPE_KVCACHE_FORMAT,
         DecodeFeatures::ATTN_SINK,
         DecodeFeatures::TOPK_LENGTH,
         DecodeFeatures::EXTRA_KVCACHE,
@@ -152,6 +163,25 @@ public:
 
 protected:
     void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
+        if (params.model_type == ModelType::V32_NVFP4_FP8ROPE) {
+            STD_TORCH_CHECK(params.extra_model_type == ModelType::V32_NVFP4_FP8ROPE,
+                            "NVFP4 does not support a mixed extra KV-cache format");
+            STD_TORCH_CHECK(params.enable_split_kv, "NVFP4 requires split-KV scheduling");
+            for (int start_head_idx = 0; start_head_idx < 128; start_head_idx += 64) {
+                SparseAttnDecodeParams cur_params = params;
+                cur_params.q += start_head_idx * params.stride_q_h_q;
+                if (cur_params.attn_sink) {
+                    cur_params.attn_sink += start_head_idx;
+                }
+                cur_params.lse += start_head_idx;
+                cur_params.out += start_head_idx * params.stride_o_h_q;
+                cur_params.lse_accum += start_head_idx;
+                cur_params.o_accum += start_head_idx * params.stride_o_accum_h_q;
+                cur_params.h_q = 64;
+                sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32_NVFP4_FP8ROPE>(cur_params);
+            }
+            return;
+        }
         dispatch_kv_formats(SupportedKVFormats{}, params.model_type, params.extra_model_type, [&]<ModelType MODEL_TYPE, ModelType EXTRA_MODEL_TYPE>() {
             DISPATCH_BOOLEAN_FLAG(params.enable_split_kv, ENABLE_SPLIT_KV, ([&]() {
                 for (int start_head_idx = 0; start_head_idx < 128; start_head_idx += 64) {
@@ -328,7 +358,8 @@ sparse_attn_decode_interface(
     // The formats of `kv` and `extra_kv`
     ModelType model_type, extra_model_type;
     if (d_qk == 576 && d_v == 512) {
-        model_type = extra_model_type = ModelType::V32;
+        model_type = detect_kv_cache_format_for_headdim_576(kv.size(3));
+        extra_model_type = have_extra_kcache ? detect_kv_cache_format_for_headdim_576(extra_kv->size(3)) : model_type;
     } else if (d_qk == 512 && d_v == 512) {
         model_type = detect_kv_cache_format_for_headdim_512(kv.size(3));
         extra_model_type = have_extra_kcache ? detect_kv_cache_format_for_headdim_512(extra_kv->size(3)) : model_type;
@@ -337,6 +368,9 @@ sparse_attn_decode_interface(
     }
     STD_TORCH_CHECK(model_type != ModelType::V41_FP4, "The fp4 KV cache is only supported as extra_kv");
     STD_TORCH_CHECK(is_valid_kv_format_pair(model_type, extra_model_type), "invalid kv format pair, ", get_dynamic_enum_name(model_type), " and ", get_dynamic_enum_name(extra_model_type));
+    // The preserved NVFP4 kernel predates the no-split path and consumes the
+    // split scheduler metadata even for small top-k values.
+    enable_split_kv = enable_split_kv || model_type == ModelType::V32_NVFP4_FP8ROPE;
     KU_CHECK_SHAPE(kv, num_blocks, page_block_size, h_kv, kv_cache_bytes_per_token(model_type));
     KU_CHECK_SHAPE(extra_kv, extra_num_blocks, extra_page_block_size, h_kv, kv_cache_bytes_per_token(extra_model_type));
     STD_TORCH_CHECK(kv.stride(1) == kv_cache_bytes_per_token(model_type), "The whole block must be contiguous when is_fp8_cache is True for kv cache");
@@ -398,6 +432,8 @@ sparse_attn_decode_interface(
             features.push_back(DecodeFeatures::V41_KVCACHE_FORMAT);
         } else if (mt == ModelType::V41_FP4) {
             features.push_back(DecodeFeatures::V41_FP4_KVCACHE_FORMAT);
+        } else if (mt == ModelType::V32_NVFP4_FP8ROPE) {
+            features.push_back(DecodeFeatures::NVFP4_FP8ROPE_KVCACHE_FORMAT);
         } else {
             STD_TORCH_CHECK(false, "Unsupported model type: ", (int)mt);
         }

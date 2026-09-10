@@ -159,6 +159,19 @@ static constexpr std::string get_dynamic_enum_name(T value){
 // Paged quantized KV cache formats (decoding)
 // =============================================
 
+// V3.2 geometry has either the original 656-byte fp8/bf16 record or the
+// SM100-only 352-byte NVFP4-NoPE/fp8-RoPE record.
+inline ModelType detect_kv_cache_format_for_headdim_576(int bytes_per_token) {
+    for (ModelType mt : {ModelType::V32, ModelType::V32_NVFP4_FP8ROPE}) {
+        if (bytes_per_token == kv_cache_bytes_per_token(mt)) {
+            return mt;
+        }
+    }
+    STD_TORCH_CHECK(false, "Unsupported bytes_per_token for d_qk=576: ", bytes_per_token, ". Expected ",
+        kv_cache_bytes_per_token(ModelType::V32), " (V3.2 fp8) or ",
+        kv_cache_bytes_per_token(ModelType::V32_NVFP4_FP8ROPE), " (V3.2 NVFP4 NoPE + fp8 RoPE)");
+}
+
 // The format of a paged quantized KV cache with d_qk = 512 (V4 / V4.1 / V4.1 fp4), detected by bytes_per_token (kv.size(3))
 inline ModelType detect_kv_cache_format_for_headdim_512(int bytes_per_token) {
     for (ModelType mt : {ModelType::V4, ModelType::V41, ModelType::V41_FP4}) {
