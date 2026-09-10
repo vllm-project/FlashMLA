@@ -28,6 +28,79 @@ This repository is [vLLM](https://github.com/vllm-project/vllm)'s fork of [deeps
 - **Robustness fixes.** Thread-safe cached device properties and stable-ABI stream and tensor helpers in `csrc/kerutils/include/kerutils/supplemental/`, plus fixes to the dense FP8 decoding metadata (for example `num_sm_parts` is clamped to at least 1).
 - **Tests.** `tests/test_api_registration.py`, `tests/test_output_buffer_api.py` and `tests/test_nvfp4_quant.py`, plus NVFP4 cases in `tests/test_flash_mla_sparse_decoding.py`.
 
+### Detailed diff against upstream
+
+Everything below is the complete set of files that differ from upstream; regenerate it with `git diff --stat 07a1089857b63e74e3133630c02b083b75e8d4b2 HEAD -- . ':!README.md'`. Files that are not listed are identical to upstream.
+
+| Area | Files | Difference from upstream |
+| :--- | :--- | :--- |
+| Operator registration | `csrc/api/api.cpp`, `csrc/api/interfaces.h` (new), `csrc/api/dense_fwd.cpp` and `csrc/api/dense_bwd.cpp` (removed) | The pybind11 `PYBIND11_MODULE` and per-file `register_*` shims are replaced by `STABLE_TORCH_LIBRARY` / `STABLE_TORCH_LIBRARY_IMPL` with explicit operator schemas. All interface functions are declared once in `interfaces.h`. `dense_prefill_bwd` is only registered under `FLASH_MLA_ENABLE_DENSE_BWD`, and `PyInit__flashmla_C` lets vLLM import the library as a Python module. |
+| API implementations | `csrc/api/sparse_decode.cpp`, `csrc/api/dense_decode.cpp`, `csrc/api/sparse_prefill.cpp`, `csrc/api/fused_norm_rope_attn_rope_cast_fwd.cpp`, `csrc/api/common.h` | `at::Tensor`, `TORCH_CHECK`, `torch::empty`, `at::cuda::CUDAGuard` and `at::cuda::getCurrentCUDAStream` are replaced by `torch::stable::Tensor`, `STD_TORCH_CHECK`, `torch::stable::new_empty`, `torch::stable::accelerator::DeviceGuard` and the stable stream helper. Scalar arguments are widened to `int64_t` / `double` as stable schemas require. Sparse decode, dense decode and sparse prefill take an optional `out_` buffer. `Arch` reads the cached device properties. Sparse decode detects the NVFP4 layout from bytes per token (`detect_kv_cache_format_for_headdim_576`), advertises `NVFP4_FP8ROPE_KVCACHE_FORMAT` on the SM100 head-64 and head-64x2 implementations, and always uses split-KV scheduling for it. |
+| Dense MHA prefill entry points | `csrc/kernels/sm100/prefill/dense/interface.h`, `fmha_cutlass_fwd_sm100.cu` / `.cuh`, `fmha_cutlass_bwd_sm100.cu` / `.cuh`, `common/utils.hpp` | `FMHACutlassSM100FwdRun` and `FMHACutlassSM100BwdRun` take `torch::stable::Tensor` and `int64_t` / `double` scalars so they can be registered directly as stable operators. |
+| Stable-ABI helpers | `csrc/kerutils/include/kerutils/supplemental/cuda_stream.h`, `device_prop.h`, `torch_tensors.h` | `get_current_cuda_stream(tensor)` through the AOTI shim, a thread-safe per-device `cudaDeviceProp` cache (`std::once_flag`) replacing `at::cuda::getCurrentDeviceProperties()`, and the `KU_CHECK_*` / `get_optional_tensor_ptr` helpers rewritten over `torch::stable::Tensor`. |
+| NVFP4 KV cache (SM100 sparse decode) | `csrc/kernels/params.h`, `csrc/kernels/kv_cache_format.h`, `csrc/kernels/sm100/decode/sparse/nvfp4_head64/config.h`, `kernel.cuh`, `kernel.h`, `instantiations/v32_nvfp4_fp8rope.cu`, `csrc/kernels/sm100/helpers.h` | New `ModelType::V32_NVFP4_FP8ROPE`; `KVCacheFormat` describes the 352-byte record (256 B e2m1 NoPE, 64 B e4m3 RoPE, 32 B e4m3 scales) and `kv_cache_bytes_per_token` returns it. The kernel is a dedicated head-64 decode kernel, derived from the pre-V4.1 SM100 head-64 kernel and extended with e2m1 dequantization; `helpers.h` gains a bf16-scale overload of `fp8x2_to_bf16x2_with_scale` that it uses. |
+| SM90 dense FP8 decoding extension | `csrc/extension/torch_api.cpp`, `csrc/extension/sm90/dense_fp8/*` | vLLM-only sources for the `_flashmla_extension_C` module (`fwd_kvcache_mla_fp8`, `get_mla_decoding_metadata_dense_fp8`), already ported to the stable ABI. Not compiled by `setup.py`; vLLM's CMake builds them. |
+| Python package | `flash_mla/__init__.py`, `flash_mla/flash_mla_interface.py`, `flash_mla/fused_norm_rope_attn_rope_cast.py` | `__init__` loads `_flashmla_C*.so` with `torch.ops.load_library`; call sites use `torch.ops._flashmla_C` instead of the `flash_mla.cuda` pybind module; `flash_mla_with_kvcache` and `flash_mla_sparse_fwd` accept `out=` and document the NVFP4 layout. |
+| Build | `setup.py`, `.gitignore` | The extension is named `flash_mla._flashmla_C`; it is compiled with `-DTORCH_TARGET_VERSION=0x020a000000000000 -DUSE_CUDA -DFLASH_MLA_ENABLE_DENSE_BWD`, `py_limited_api=True` and `bdist_wheel.py_limited_api = cp310`; the NVFP4 instantiation is added and the removed `dense_fwd.cpp` / `dense_bwd.cpp` are dropped from the source list; `.venv/` is ignored. |
+| Tests | `tests/lib.py`, `tests/quant.py`, `tests/test_flash_mla_sparse_decoding.py`, `tests/test_api_registration.py`, `tests/test_output_buffer_api.py`, `tests/test_nvfp4_quant.py` | `KVCacheLayout.V32_NVFP4_FP8ROPE` quantization and dequantization (including the scale-byte permutation) and per-layout byte accounting for the bandwidth numbers; NVFP4 correctness, corner and performance cases; new tests for operator registration, `out=` forwarding and the NVFP4 wire format. |
+
+<details>
+<summary>File-level diffstat against deepseek-ai/FlashMLA@07a1089</summary>
+
+```text
+ .gitignore                                                                        |    1 +
+ csrc/api/api.cpp                                                                  |   55 ++++--
+ csrc/api/common.h                                                                 |   69 ++++---
+ csrc/api/dense_bwd.cpp                                                            |    9 -
+ csrc/api/dense_decode.cpp                                                         |  151 ++++++++-------
+ csrc/api/dense_fwd.cpp                                                            |    9 -
+ csrc/api/fused_norm_rope_attn_rope_cast_fwd.cpp                                   |  281 ++++++++++++++--------------
+ csrc/api/interfaces.h                                                             |  102 ++++++++++
+ csrc/api/sparse_decode.cpp                                                        |  183 ++++++++++--------
+ csrc/api/sparse_prefill.cpp                                                       |   71 +++----
+ csrc/extension/sm90/dense_fp8/flash_fwd_mla_fp8_sm90.cu                           |   10 +
+ csrc/extension/sm90/dense_fp8/flash_fwd_mla_kernel.h                              |  709 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ csrc/extension/sm90/dense_fp8/flash_fwd_mla_metadata.cu                           |   77 ++++++++
+ csrc/extension/sm90/dense_fp8/flash_mla.h                                         |   85 +++++++++
+ csrc/extension/sm90/dense_fp8/fp8_transpose_v.h                                   |   89 +++++++++
+ csrc/extension/sm90/dense_fp8/named_barrier.h                                     |   21 +++
+ csrc/extension/sm90/dense_fp8/pybind.cpp                                          |  246 +++++++++++++++++++++++++
+ csrc/extension/sm90/dense_fp8/softmax.h                                           |  202 ++++++++++++++++++++
+ csrc/extension/sm90/dense_fp8/static_switch.h                                     |   70 +++++++
+ csrc/extension/sm90/dense_fp8/utils.h                                             |  279 ++++++++++++++++++++++++++++
+ csrc/extension/torch_api.cpp                                                      |   47 +++++
+ csrc/kernels/kv_cache_format.h                                                    |   19 +-
+ csrc/kernels/params.h                                                             |    5 +-
+ csrc/kernels/sm100/decode/sparse/head64/config.h                                  |    2 +-
+ csrc/kernels/sm100/decode/sparse/nvfp4_head64/config.h                            |  270 +++++++++++++++++++++++++++
+ csrc/kernels/sm100/decode/sparse/nvfp4_head64/instantiations/v32_nvfp4_fp8rope.cu |    8 +
+ csrc/kernels/sm100/decode/sparse/nvfp4_head64/kernel.cuh                          | 1103 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ csrc/kernels/sm100/decode/sparse/nvfp4_head64/kernel.h                            |   10 +
+ csrc/kernels/sm100/helpers.h                                                      |    8 +
+ csrc/kernels/sm100/prefill/dense/common/utils.hpp                                 |    1 -
+ csrc/kernels/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu                        |   27 +--
+ csrc/kernels/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cuh                       |   50 ++---
+ csrc/kernels/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu                        |   29 +--
+ csrc/kernels/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cuh                       |   39 ++--
+ csrc/kernels/sm100/prefill/dense/interface.h                                      |   20 +-
+ csrc/kerutils/include/kerutils/supplemental/cuda_stream.h                         |   19 ++
+ csrc/kerutils/include/kerutils/supplemental/device_prop.h                         |   56 ++++++
+ csrc/kerutils/include/kerutils/supplemental/torch_tensors.h                       |   29 +--
+ flash_mla/__init__.py                                                             |   10 +
+ flash_mla/flash_mla_interface.py                                                  |   25 ++-
+ flash_mla/fused_norm_rope_attn_rope_cast.py                                       |    4 +-
+ setup.py                                                                          |   21 ++-
+ tests/lib.py                                                                      |   10 +-
+ tests/quant.py                                                                    |   78 +++++++-
+ tests/test_api_registration.py                                                    |   24 +++
+ tests/test_flash_mla_sparse_decoding.py                                           |   49 +++++
+ tests/test_nvfp4_quant.py                                                         |   28 +++
+ tests/test_output_buffer_api.py                                                   |   87 +++++++++
+ 48 files changed, 4306 insertions(+), 491 deletions(-)
+```
+
+</details>
+
 ## News
 
 - **2026.09.10 Release of DeepSeek v4.1's Attention Kernels**: We've released attention kernels for [DeepSeek-V4.1](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash), including both prefill and decoding (with FP8 or FP4 KV cache). We've also released a [fused-norm-rope-attn-rope-cast kernel](#fused-norm--rope--attn--rope--cast-kernel) which fuses Q-norm (only used in V4, not V4.1), Q-RoPE, core attention, O-RoPE (conjugate), and cast-to-fp8, while retaining the same performance.
