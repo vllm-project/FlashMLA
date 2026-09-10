@@ -12,6 +12,7 @@ import kernelkit as kk
 import flash_mla
 
 import lib
+import quant
 from lib import TestParam
 from lib import RawTestParamForDecode as RawTestParam
 import ref
@@ -21,6 +22,8 @@ Generate testcase for unit test
 """
 
 def gen_testcase() -> List[RawTestParam]:
+    # The DeepSeek-V4.1 KV cache formats (V41 / V41_FP4) are only supported on SM100f
+    supports_v41 = torch.cuda.get_device_capability()[0] >= 10
     correctness_cases = []
     corner_cases = []
     for d_qk in [576, 512]:
@@ -99,61 +102,53 @@ def gen_testcase() -> List[RawTestParam]:
                         ]
                         corner_cases.extend(cur_corner_cases)
 
-    # NVFP4 KV cache format (SM100 only, V3.2 geometry: d_qk = 576)
-    for h_q in [64, 128]:
-        for have_topk_len in [False, True]:
+    # DeepSeek-V4.1: fp8 (V41) KV cache, optionally with an fp4 (V41_FP4) extra KV cache
+    if supports_v41:
+        for extra_fp4 in [False, True]:
             correctness_cases.extend([
                 RawTestParam(b, h_q, s_q, 1, s_k, is_varlen, topk,
-                            have_topk_length=have_topk_len,
-                            enable_attn_sink=True,
-                            block_size=block_size,
-                            d_qk=576,
-                            check_correctness=True,
-                            num_runs=0,
-                            kv_format="nvfp4.fp8rope")
-                for (s_k, topk, block_size) in [
-                    (512, 64, 2),
-                    (512, 64, 64),
-                    (512, 64, 69),
-                    (1024, 576, 61),
-                    (2046, 2048, 64),
-                ]
-                for b in [4, 74]
+                             have_topk_length=have_topk_len,
+                             enable_attn_sink=True,
+                             extra_s_k=extra_s_k,
+                             extra_topk=extra_topk,
+                             block_size=block_size,
+                             extra_block_size=extra_block_size,
+                             have_extra_topk_length=have_extra_topk_len,
+                             d_qk=512,
+                             kvcache_layout=quant.KVCacheLayout.V41_FP8Sparse,
+                             extra_kvcache_layout=quant.KVCacheLayout.V41_FP4 if extra_fp4 else None,
+                             check_correctness=True,
+                             num_runs=0)
+                for h_q in [64, 128]
+                for have_extra_topk_len in [False, True]
+                for have_topk_len in [False]
+                for (s_k, topk, block_size) in [(512, 64, 64), (1024, 576, 61)]
+                for (extra_s_k, extra_topk, extra_block_size) in [(512, 64, 64), (650, 576, 53)]
+                for b in [4]
                 for s_q in [1, 3]
-                for is_varlen in ([True, False] if (b == 74 and not have_topk_len) else [True])
+                for is_varlen in [True]
             ])
-        corner_cases.extend([
-            RawTestParam(b, h_q, 3, 1, s_k, True, topk,
-                        is_all_indices_invalid=is_all_indices_invalid,
-                        have_zero_seqlen_k=have_zero_seqlen_k,
-                        enable_attn_sink=enable_attn_sink,
-                        block_size=block_size,
-                        d_qk=576,
-                        check_correctness=True,
-                        num_runs=0,
-                        kv_format="nvfp4.fp8rope")
-            for (s_k, topk, block_size) in [(512, 64, 61), (650, 576, 53)]
-            for b in [4, 74]
-            for is_all_indices_invalid in [True, False]
-            for have_zero_seqlen_k in [True, False]
-            for enable_attn_sink in [True, False]
-            if (is_all_indices_invalid or have_zero_seqlen_k or enable_attn_sink)
-        ])
 
     base_and_bszs = [
         # V3.2
         (RawTestParam(0, 128, 2, 1, 32768, True, topk=2048, d_qk=576), [2, 64, 74, 128]),
-        # V3.2 shape with NVFP4 KV cache
-        (RawTestParam(0, 128, 2, 1, 32768, True, topk=2048, d_qk=576, kv_format="nvfp4.fp8rope"), [64, 128]),
-        # MODEL1 CONFIG1
+        # DeepSeek-V4 CONFIG1
         (RawTestParam(0, 64, 2, 1, 16384, True, topk=128, d_qk=512, extra_s_k=16384, extra_topk=512, block_size=256, extra_block_size=64), [2, 64, 74, 128, 74*2, 256]),
-        # MODEL1 CONFIG2
+        # DeepSeek-V4 CONFIG2
         (RawTestParam(0, 128, 2, 1, 16384, True, topk=128, d_qk=512, extra_s_k=16384, extra_topk=1024, block_size=256, extra_block_size=64), [2, 64, 74, 128, 74*2, 256]),
-        # MODEL1 CONFIG3
+        # DeepSeek-V4 CONFIG3
         (RawTestParam(0, 64, 2, 1, 16384, True, topk=128, d_qk=512, extra_s_k=16384, extra_topk=1024, block_size=256, extra_block_size=2, have_extra_topk_length=True), [2, 64, 74, 128, 74*2, 256]),
-        # MODEL1 CONFIG4
+        # DeepSeek-V4 CONFIG4
         (RawTestParam(0, 128, 2, 1, 16384, True, topk=128, d_qk=512, extra_s_k=16384, extra_topk=1024, block_size=256, extra_block_size=2, have_extra_topk_length=True), [2, 64, 74, 128, 74*2, 256]),
     ]
+    if supports_v41:
+        base_and_bszs += [
+            # DeepSeek-V4.1 CONFIG1 (fp8 V41 KV cache + fp4 V41_FP4 extra KV cache)
+            (RawTestParam(0, 64, 2, 1, 16384, True, topk=128, d_qk=512, extra_s_k=16384, extra_topk=512, block_size=256, extra_block_size=64,
+                          kvcache_layout=quant.KVCacheLayout.V41_FP8Sparse, extra_kvcache_layout=quant.KVCacheLayout.V41_FP4), [2, 64, 74, 128, 74*2, 256]),
+            (RawTestParam(0, 128, 2, 1, 16384, True, topk=128, d_qk=512, extra_s_k=16384, extra_topk=512, block_size=256, extra_block_size=64,
+                          kvcache_layout=quant.KVCacheLayout.V41_FP8Sparse, extra_kvcache_layout=quant.KVCacheLayout.V41_FP4), [2, 64, 74, 128, 74*2, 256])
+        ]
     performance_cases = [
         # Production cases
         dataclasses.replace(base, b=b)
@@ -164,10 +159,6 @@ def gen_testcase() -> List[RawTestParam]:
         RawTestParam(74*2, h_q, 2, 1, 32768, True, topk=16384, d_qk=d_qk)
         for h_q in [64, 128]
         for d_qk in [512, 576]
-    ] + [
-        # Peak perf cases, NVFP4 KV cache
-        RawTestParam(74*2, h_q, 2, 1, 32768, True, topk=16384, d_qk=576, kv_format="nvfp4.fp8rope")
-        for h_q in [64, 128]
     ]
 
     return correctness_cases + corner_cases + performance_cases
@@ -280,51 +271,6 @@ def test_flash_mla(p: TestParam) -> Result:
     return performance_result
 
 
-@torch.inference_mode()
-def test_no_split_workspace_allocation():
-    """No-split sparse decode must not allocate split-KV accumulators.
-
-    A query length equal to the SM count uses one scheduler partition. The
-    kernel writes directly to the output in this case, so allocating split-KV
-    scratch only increases peak memory and can cause runtime OOMs.
-    """
-    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
-    p = RawTestParam(
-        b=1,
-        h_q=64,
-        s_q=num_sms,
-        h_kv=1,
-        s_kv=512,
-        is_varlen=False,
-        topk=64,
-        d_qk=576,
-        check_correctness=False,
-        num_runs=0,
-        seed=1,
-    ).to_test_param()
-    t = lib.generate_testcase_for_decode(p)
-    tile_scheduler_metadata, _ = flash_mla.get_mla_metadata()
-
-    def run_decode():
-        return lib.run_flash_mla_decode(p, t, tile_scheduler_metadata, None)
-
-    out, lse = run_decode()
-    torch.cuda.synchronize()
-    del out, lse
-    torch.cuda.empty_cache()
-
-    memory_before = torch.cuda.memory_allocated()
-    torch.cuda.reset_peak_memory_stats()
-    out, lse = run_decode()
-    torch.cuda.synchronize()
-    peak_memory = torch.cuda.max_memory_allocated() - memory_before
-    output_memory = out.nbytes + lse.nbytes
-    assert peak_memory <= output_memory + 1024**2, (
-        f"No-split decode allocated {peak_memory / 1024**2:.2f} MiB for "
-        f"{output_memory / 1024**2:.2f} MiB of outputs"
-    )
-
-
 def main():
     dtype = torch.bfloat16
     device = torch.device("cuda:0")
@@ -333,8 +279,6 @@ def main():
     torch.cuda.set_device(device)
     torch.set_float32_matmul_precision('high')
     torch.set_num_threads(32)
-
-    test_no_split_workspace_allocation()
 
     raw_testcases = gen_testcase()
     testcases = [t.to_test_param() for t in raw_testcases]

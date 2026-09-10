@@ -1,38 +1,18 @@
-#include <Python.h>
+#include <pybind11/pybind11.h>
 
-#include <torch/csrc/stable/library.h>
+void register_sparse_prefill(pybind11::module_& m);
+void register_sparse_decode(pybind11::module_& m);
+void register_dense_fwd(pybind11::module_& m);
+void register_dense_bwd(pybind11::module_& m);
+void register_dense_decode(pybind11::module_& m);
+void register_fused_norm_rope_attn_rope_cast_fwd(pybind11::module_& m);
 
-#include "sparse_fwd.h"
-#include "sparse_decode.h"
-#include "dense_decode.h"
-#include "dense_fwd.h"
-
-STABLE_TORCH_LIBRARY(_flashmla_C, m) {
-    m.def("sparse_decode_fwd(Tensor q, Tensor kv, Tensor indices, Tensor? topk_length, Tensor? attn_sink, Tensor(a)? tile_scheduler_metadata, Tensor(b)? num_splits, Tensor? extra_kv, Tensor? extra_indices, Tensor? extra_topk_length, int d_v, float sm_scale, Tensor(c!)? out_) -> (Tensor(c!), Tensor, Tensor(a)?, Tensor(b)?)");
-    m.def("dense_decode_fwd(Tensor q, Tensor kcache, int head_size_v, Tensor seqlens_k, Tensor block_table, float softmax_scale, bool is_causal, Tensor(a)? tile_scheduler_metadata, Tensor(b)? num_splits, Tensor(c!)? out_) -> (Tensor(c!), Tensor, Tensor(a)?, Tensor(b)?)");
-    m.def("sparse_prefill_fwd(Tensor q, Tensor kv, Tensor indices, float sm_scale, int d_v, Tensor? attn_sink, Tensor? topk_length, Tensor(a!)? out_) -> Tensor[]");
-    m.def("dense_prefill_fwd(Tensor workspace_buffer, Tensor q, Tensor k, Tensor v, Tensor cumulative_seqlen_q, Tensor cumulative_seqlen_kv, Tensor(a!) o, Tensor(b!) lse, int mask_mode_code, float softmax_scale, int max_seqlen_q, int max_seqlen_kv, bool is_varlen) -> ()");
-#ifdef FLASH_MLA_ENABLE_DENSE_BWD
-    // Dense prefill backward is only registered when its kernel is compiled
-    // (standalone setup.py). vLLM's integrated build is inference-only and does
-    // not compile fmha_cutlass_bwd_sm100.cu, matching the original 4-op library.
-    m.def("dense_prefill_bwd(Tensor(a!) workspace_buffer, Tensor d_o, Tensor q, Tensor k, Tensor v, Tensor o, Tensor lse, Tensor cumulative_seqlen_q, Tensor cumulative_seqlen_kv, Tensor(b!) dq, Tensor(c!) dk, Tensor(d!) dv, int mask_mode_code, float softmax_scale, int max_seqlen_q, int max_seqlen_kv, bool is_varlen) -> ()");
-#endif
-}
-
-STABLE_TORCH_LIBRARY_IMPL(_flashmla_C, CUDA, m) {
-    m.impl("sparse_decode_fwd", TORCH_BOX(&sparse_attn_decode_interface));
-    m.impl("dense_decode_fwd", TORCH_BOX(&dense_attn_decode_interface));
-    m.impl("sparse_prefill_fwd", TORCH_BOX(&sparse_attn_prefill_interface));
-    m.impl("dense_prefill_fwd", TORCH_BOX(&FMHACutlassSM100FwdRun));
-#ifdef FLASH_MLA_ENABLE_DENSE_BWD
-    m.impl("dense_prefill_bwd", TORCH_BOX(&FMHACutlassSM100BwdRun));
-#endif
-}
-
-// To enable vLLM to import vllm._flashmla_C as a python module
-PyMODINIT_FUNC PyInit__flashmla_C() {
-    static struct PyModuleDef module = {
-        PyModuleDef_HEAD_INIT, "_flashmla_C", nullptr, 0, nullptr};
-    return PyModule_Create(&module);
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.doc() = "FlashMLA";
+    register_sparse_prefill(m);
+    register_sparse_decode(m);
+    register_dense_fwd(m);
+    register_dense_bwd(m);
+    register_dense_decode(m);
+    register_fused_norm_rope_attn_rope_cast_fwd(m);
 }
