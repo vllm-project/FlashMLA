@@ -183,14 +183,17 @@ def test_fused_output_reuse_under_cuda_graph(mode):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         fn(**kwargs, out_fp8=out, out_sf=sf)
+    previous = out.view(torch.uint8).clone()
     for _ in range(2):
-        kwargs["q"].mul_(0.5)
+        kwargs["q"].add_(0.125)
         graph.replay()
         reference = fn(**kwargs)
         torch.testing.assert_close(
             out.view(torch.uint8), reference[0].view(torch.uint8), rtol=0, atol=0
         )
         torch.testing.assert_close(sf, reference[1], rtol=0, atol=0)
+        assert not torch.equal(out.view(torch.uint8), previous)
+        previous.copy_(out.view(torch.uint8))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires SM100")
