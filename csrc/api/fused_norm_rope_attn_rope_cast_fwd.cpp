@@ -39,6 +39,34 @@ static Tensor allocate_scale_factor(
     return sf;
 }
 
+static std::pair<Tensor, Tensor> prepare_fused_outputs(
+    const Tensor &q, int64_t s_q, int64_t n_wv_group, int64_t group_dim,
+    const std::optional<Tensor> &out_fp8_, const std::optional<Tensor> &out_sf_) {
+    Tensor out_fp8 = out_fp8_.has_value() ? out_fp8_.value() :
+        torch::stable::new_empty(q, {s_q, n_wv_group, group_dim}, ScalarType::Float8_e4m3fn);
+    Tensor out_sf = out_sf_.has_value() ? out_sf_.value() :
+        torch::stable::transpose(allocate_scale_factor(s_q, group_dim, 32, q, n_wv_group), 0, 1);
+    if (out_fp8_.has_value()) {
+        KU_CHECK_DEVICE(out_fp8);
+        STD_TORCH_CHECK(out_fp8.device() == q.device(), "out_fp8 must be on the same device as q");
+        KU_CHECK_DTYPE(out_fp8, ScalarType::Float8_e4m3fn);
+        KU_CHECK_SHAPE(out_fp8, s_q, n_wv_group, group_dim);
+        KU_CHECK_CONTIGUOUS(out_fp8);
+    }
+    if (out_sf_.has_value()) {
+        KU_CHECK_DEVICE(out_sf);
+        STD_TORCH_CHECK(out_sf.device() == q.device(), "out_sf must be on the same device as q");
+        KU_CHECK_DTYPE(out_sf, ScalarType::Int);
+        KU_CHECK_SHAPE(out_sf, s_q, n_wv_group, group_dim / 128);
+        STD_TORCH_CHECK(out_sf.stride(0) == 1, "out_sf must have stride(0) == 1");
+        STD_TORCH_CHECK(out_sf.stride(2) >= ((s_q + 3) / 4) * 4 && out_sf.stride(2) % 4 == 0,
+                        "out_sf columns must have a non-overlapping, 4-aligned stride");
+        STD_TORCH_CHECK(out_sf.stride(1) >= out_sf.stride(2) * (group_dim / 128),
+                        "out_sf groups must not overlap");
+    }
+    return {out_fp8, out_sf};
+}
+
 std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     const Tensor &q,
     const Tensor &kv,
@@ -58,7 +86,9 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     int64_t num_per_channels,
     bool use_tma_aligned_col_major_sf,
     bool round_sf,
-    bool use_packed_ue8m0
+    bool use_packed_ue8m0,
+    const std::optional<Tensor> &out_fp8_,
+    const std::optional<Tensor> &out_sf_
 ) {
     Arch arch = Arch();
     bool is_sm100f = arch.is_sm100f();
@@ -125,10 +155,7 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     torch::stable::accelerator::DeviceGuard device_guard(q.get_device_index());
     
     STD_TORCH_CHECK(d_v % (num_per_channels * 4) == 0); // 4 is the number of uint8 in uint32, since `use_packed_ue8m0` is `True`
-    Tensor out_fp8 = torch::stable::new_empty(q, {s_q, n_wv_group, wv_group_size * d_v}, ScalarType::Float8_e4m3fn);
-    uint32_t out_sf_scale_gran = 32; // Since the weight is per-32 scaled and deep_gemm.einsum requires A and B to have the same scale granularity, the output sf is always stored in a per-32 scaled format, although it will be actually per-128 scaled when num_per_channels is 128
-    Tensor out_sf = allocate_scale_factor(s_q, wv_group_size * d_v, out_sf_scale_gran, q, n_wv_group);
-    out_sf = torch::stable::transpose(out_sf, 0, 1);   // [s_q, n_wv_group, wv_group_size * d_v / (out_sf_scale_gran*4)]
+    auto [out_fp8, out_sf] = prepare_fused_outputs(q, s_q, n_wv_group, wv_group_size * d_v, out_fp8_, out_sf_);
     Tensor max_logits = torch::stable::new_empty(q, {s_q, h_q}, ScalarType::Float);
     Tensor lse = torch::stable::new_empty(q, {s_q, h_q}, ScalarType::Float);
     KU_CHECK_CONTIGUOUS(out_fp8);
@@ -210,7 +237,9 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
     int64_t num_per_channels,
     bool use_tma_aligned_col_major_sf,
     bool round_sf,
-    bool use_packed_ue8m0
+    bool use_packed_ue8m0,
+    const std::optional<Tensor> &out_fp8_,
+    const std::optional<Tensor> &out_sf_
 ) {
     Arch arch = Arch();
     STD_TORCH_CHECK(arch.is_sm100f(), "Fused Norm + RoPE + Core Attn + RoPE + Cast (fused_norm_rope_attn_rope_cast_decode) is only supported on SM100f architectures.");
@@ -334,10 +363,7 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
     torch::stable::accelerator::DeviceGuard device_guard(q.get_device_index());
 
     STD_TORCH_CHECK(d_v % (num_per_channels * 4) == 0); // 4 is the number of uint8 in uint32, since `use_packed_ue8m0` is `True`
-    Tensor out_fp8 = torch::stable::new_empty(q, {s_q, n_wv_group, wv_group_size * d_v}, ScalarType::Float8_e4m3fn);
-    uint32_t out_sf_scale_gran = 32; // Since the weight is per-32 scaled and deep_gemm.einsum requires A and B to have the same scale granularity, the output sf is always stored in a per-32 scaled format, although it will be actually per-128 scaled when num_per_channels is 128
-    Tensor out_sf = allocate_scale_factor(s_q, wv_group_size * d_v, out_sf_scale_gran, q, n_wv_group);
-    out_sf = torch::stable::transpose(out_sf, 0, 1);   // [s_q, n_wv_group, wv_group_size * d_v / (out_sf_scale_gran*4)]
+    auto [out_fp8, out_sf] = prepare_fused_outputs(q, s_q, n_wv_group, wv_group_size * d_v, out_fp8_, out_sf_);
     Tensor lse = torch::stable::new_empty(q, {s_q, h_q}, ScalarType::Float);
     KU_CHECK_CONTIGUOUS(out_fp8);
     STD_TORCH_CHECK(out_sf.stride(0) == 1);

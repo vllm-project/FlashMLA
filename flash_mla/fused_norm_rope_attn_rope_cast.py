@@ -29,6 +29,9 @@ def prefill(
     d_v: int = 512,
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
+    *,
+    out_fp8: Optional[torch.Tensor] = None,
+    out_sf: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     A fused kernel for Q Norm + Q RoPE + Core Attn (sparse attention) + O RoPE + O cast to FP8, for DeepSeek-V4 & DeepSeek-V4.1
@@ -63,6 +66,15 @@ def prefill(
         topk_length: optional, [s_q], int32. If provided, the i-th q token will only attend to k tokens specified by indices[i, :, :topk_length[i]], ignoring later k tokens (even if provided in indices). This parameter is mainly used for variable-length topk attention scenarios, such as using sparse attention to simulate causal attention.
             In extremely rare cases (topk_length provided, there is a valid topk index between topk_length[i] ~ s_kv, and that topk index points to a k token containing NaN), operator output will contain NaN, so please avoid this situation.
 
+    Optional output buffers:
+        out_fp8: Caller-owned contiguous output with the returned shape/dtype.
+        out_sf: Caller-owned packed UE8M0 scales with the returned shape/dtype.
+            Its token stride must be 1, column stride a multiple of 4 at least
+            ceil(s_q / 4) * 4, and group stride must keep groups disjoint.
+            Token slices of a larger scale buffer are supported.
+        Supplied buffers must share q's device and not overlap inputs or each
+        other. Omitted outputs are allocated normally.
+
     Returns:
         - out_fp8: [s_q, n_wv_group, wv_group_size * d_v], fp8_e4m3, quantized attention result
         - out_sf: [s_q, n_wv_group, wv_group_size * d_v / (32*4)], int32_t, scaling factor. This scaling factor is ALWAYS stored in the per-32 scaled format, even if num_per_channels is 128
@@ -75,7 +87,8 @@ def prefill(
 
         enable_q_norm, rms_norm_eps, token_positions, is_rope_neox_style, rope_dim, cos_sin_cache,
 
-        n_wv_group, num_per_channels, use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0
+        n_wv_group, num_per_channels, use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0,
+        out_fp8, out_sf,
     )
     out_fp8, out_sf, max_logits, lse = results
     return out_fp8, out_sf, max_logits, lse
@@ -106,6 +119,9 @@ def decode(
     extra_k_cache: Optional[torch.Tensor] = None,
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    *,
+    out_fp8: Optional[torch.Tensor] = None,
+    out_sf: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Fused Decoding kernel: Q Norm + Q RoPE + Core Attn (decode, with paged FP8 KV cache) + O RoPE + O cast to FP8, for DeepSeek-V4 & DeepSeek-V4.1
@@ -143,6 +159,15 @@ def decode(
         extra_indices_in_kvcache: optional, [s_q, extra_topk], int32. Indices into the extra KV cache
         extra_topk_length: optional, [s_q], int32. Actual valid extra topk count of the request
 
+    Optional output buffers:
+        out_fp8: Caller-owned contiguous output with the returned shape/dtype.
+        out_sf: Caller-owned packed UE8M0 scales with the returned shape/dtype.
+            Its token stride must be 1, column stride a multiple of 4 at least
+            ceil(s_q / 4) * 4, and group stride must keep groups disjoint.
+            Token slices of a larger scale buffer are supported.
+        Supplied buffers must share q's device and not overlap inputs or each
+        other. Omitted outputs are allocated normally.
+
     Returns:
         - out_fp8: [s_q, n_wv_group, wv_group_size * d_v], fp8_e4m3, quantized attention result
         - out_sf: [s_q, n_wv_group, wv_group_size * d_v / (32*4)], int32, scaling factor
@@ -153,7 +178,8 @@ def decode(
         attn_sink, topk_length,
         extra_k_cache, extra_indices_in_kvcache, extra_topk_length,
         enable_q_norm, rms_norm_eps, token_positions, is_rope_neox_style, rope_dim, cos_sin_cache,
-        n_wv_group, num_per_channels, use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0
+        n_wv_group, num_per_channels, use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0,
+        out_fp8, out_sf,
     )
     return out_fp8, out_sf, lse
 
