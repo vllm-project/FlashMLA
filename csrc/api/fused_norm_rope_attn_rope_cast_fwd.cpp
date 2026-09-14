@@ -39,6 +39,69 @@ static Tensor allocate_scale_factor(
     return sf;
 }
 
+// Resolve the FP8 output pair (activation + packed ue8m0 scales) of the fused kernel: validate the caller-provided
+// buffers, or allocate fresh ones. Both must be given or both omitted.
+//
+// Caller-provided buffers let several launches (e.g. the prefill and decode segments of one mixed step) write disjoint
+// token ranges of one shared buffer, so that a single wv_proj einsum can consume the whole step without a concat copy.
+// The checks below are exactly what the kernel needs, not what DeepGEMM needs:
+//   - out_fp8: [s_q, n_wv_group, wv_group_size*d_v], e4m3, contiguous. The kernel hard-codes the token stride to
+//     n_wv_group*wv_group_size*d_v, so a token range of a larger contiguous [N, n_wv_group, wv_group_size*d_v] buffer
+//     is accepted, and nothing else. 32 B aligned since the epilogue uses 256-bit stores.
+//   - out_sf: [s_q, n_wv_group, wv_group_size*d_v/(32*4)], int32, with stride 1 along the token dim (MN-major). The
+//     group / head-dim strides are passed through to the kernel, so a token range of a shared scale buffer allocated for
+//     N >= s_q tokens (head-dim stride == align(N, 4), see allocate_scale_factor) is accepted. DeepGEMM additionally
+//     requires stride(2) == align(mn, 4) for the `mn` it is finally called with; that is the caller's responsibility.
+static std::pair<Tensor, Tensor> resolve_fp8_outputs(
+    const std::optional<Tensor> &out_fp8_,
+    const std::optional<Tensor> &out_sf_,
+    const Tensor &like,
+    int64_t s_q,
+    int64_t n_wv_group,
+    int64_t wv_group_size,
+    int64_t d_v,
+    uint32_t out_sf_scale_gran
+) {
+    STD_TORCH_CHECK(out_fp8_.has_value() == out_sf_.has_value(), "out_fp8 and out_sf must be provided together (or both omitted)");
+    const int64_t row_elems = wv_group_size * d_v;
+    const int64_t num_sf_int32 = row_elems / (out_sf_scale_gran * 4);
+
+    Tensor out_fp8, out_sf;
+    if (out_fp8_.has_value()) {
+        out_fp8 = out_fp8_.value();
+        out_sf = out_sf_.value();
+
+        KU_CHECK_DEVICE(out_fp8);
+        KU_CHECK_DEVICE(out_sf);
+        KU_CHECK_DTYPE(out_fp8, ScalarType::Float8_e4m3fn);
+        KU_CHECK_DTYPE(out_sf, ScalarType::Int);
+        KU_CHECK_NDIM(out_fp8, 3);
+        KU_CHECK_NDIM(out_sf, 3);
+        KU_CHECK_SHAPE(out_fp8, s_q, n_wv_group, row_elems);
+        KU_CHECK_SHAPE(out_sf, s_q, n_wv_group, num_sf_int32);
+
+        KU_CHECK_CONTIGUOUS(out_fp8);
+        STD_TORCH_CHECK(reinterpret_cast<uintptr_t>(out_fp8.data_ptr()) % 32 == 0,
+            "out_fp8 must be 32-byte aligned (the epilogue uses 256-bit stores)");
+
+        // Token dim must be the unit-stride dim. PyTorch normalizes the stride of a size-1 dim, so skip the check when s_q == 1.
+        STD_TORCH_CHECK(s_q == 1 || out_sf.stride(0) == 1,
+            "out_sf must have stride 1 along the token dimension (TMA-aligned MN-major layout), got stride(0) = ", out_sf.stride(0));
+        // The remaining strides only need to keep the s_q tokens of the different (group, head-dim block) columns from overlapping.
+        STD_TORCH_CHECK(num_sf_int32 == 1 || out_sf.stride(2) >= s_q,
+            "out_sf.stride(2) (", out_sf.stride(2), ") must be >= s_q (", s_q, "): the head-dim blocks of one token range must not overlap");
+        STD_TORCH_CHECK(n_wv_group == 1 || out_sf.stride(1) >= num_sf_int32 * out_sf.stride(2),
+            "out_sf.stride(1) (", out_sf.stride(1), ") must be >= size(2) * stride(2) (", num_sf_int32 * out_sf.stride(2), "): the wv groups must not overlap");
+    } else {
+        out_fp8 = torch::stable::new_empty(like, {s_q, n_wv_group, row_elems}, ScalarType::Float8_e4m3fn);
+        out_sf = allocate_scale_factor(s_q, row_elems, out_sf_scale_gran, like, n_wv_group);
+        out_sf = torch::stable::transpose(out_sf, 0, 1);   // [s_q, n_wv_group, wv_group_size * d_v / (out_sf_scale_gran*4)]
+        KU_CHECK_CONTIGUOUS(out_fp8);
+        STD_TORCH_CHECK(out_sf.stride(0) == 1);
+    }
+    return {out_fp8, out_sf};
+}
+
 std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     const Tensor &q,
     const Tensor &kv,
@@ -58,7 +121,9 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     int64_t num_per_channels,
     bool use_tma_aligned_col_major_sf,
     bool round_sf,
-    bool use_packed_ue8m0
+    bool use_packed_ue8m0,
+    const std::optional<Tensor> &out_fp8_,
+    const std::optional<Tensor> &out_sf_
 ) {
     Arch arch = Arch();
     bool is_sm100f = arch.is_sm100f();
@@ -125,14 +190,10 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     torch::stable::accelerator::DeviceGuard device_guard(q.get_device_index());
     
     STD_TORCH_CHECK(d_v % (num_per_channels * 4) == 0); // 4 is the number of uint8 in uint32, since `use_packed_ue8m0` is `True`
-    Tensor out_fp8 = torch::stable::new_empty(q, {s_q, n_wv_group, wv_group_size * d_v}, ScalarType::Float8_e4m3fn);
     uint32_t out_sf_scale_gran = 32; // Since the weight is per-32 scaled and deep_gemm.einsum requires A and B to have the same scale granularity, the output sf is always stored in a per-32 scaled format, although it will be actually per-128 scaled when num_per_channels is 128
-    Tensor out_sf = allocate_scale_factor(s_q, wv_group_size * d_v, out_sf_scale_gran, q, n_wv_group);
-    out_sf = torch::stable::transpose(out_sf, 0, 1);   // [s_q, n_wv_group, wv_group_size * d_v / (out_sf_scale_gran*4)]
+    auto [out_fp8, out_sf] = resolve_fp8_outputs(out_fp8_, out_sf_, q, s_q, n_wv_group, wv_group_size, d_v, out_sf_scale_gran);
     Tensor max_logits = torch::stable::new_empty(q, {s_q, h_q}, ScalarType::Float);
     Tensor lse = torch::stable::new_empty(q, {s_q, h_q}, ScalarType::Float);
-    KU_CHECK_CONTIGUOUS(out_fp8);
-    STD_TORCH_CHECK(out_sf.stride(0) == 1);
     KU_CHECK_CONTIGUOUS(max_logits);
     KU_CHECK_CONTIGUOUS(lse);
 
@@ -210,7 +271,9 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
     int64_t num_per_channels,
     bool use_tma_aligned_col_major_sf,
     bool round_sf,
-    bool use_packed_ue8m0
+    bool use_packed_ue8m0,
+    const std::optional<Tensor> &out_fp8_,
+    const std::optional<Tensor> &out_sf_
 ) {
     Arch arch = Arch();
     STD_TORCH_CHECK(arch.is_sm100f(), "Fused Norm + RoPE + Core Attn + RoPE + Cast (fused_norm_rope_attn_rope_cast_decode) is only supported on SM100f architectures.");
@@ -334,13 +397,9 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
     torch::stable::accelerator::DeviceGuard device_guard(q.get_device_index());
 
     STD_TORCH_CHECK(d_v % (num_per_channels * 4) == 0); // 4 is the number of uint8 in uint32, since `use_packed_ue8m0` is `True`
-    Tensor out_fp8 = torch::stable::new_empty(q, {s_q, n_wv_group, wv_group_size * d_v}, ScalarType::Float8_e4m3fn);
     uint32_t out_sf_scale_gran = 32; // Since the weight is per-32 scaled and deep_gemm.einsum requires A and B to have the same scale granularity, the output sf is always stored in a per-32 scaled format, although it will be actually per-128 scaled when num_per_channels is 128
-    Tensor out_sf = allocate_scale_factor(s_q, wv_group_size * d_v, out_sf_scale_gran, q, n_wv_group);
-    out_sf = torch::stable::transpose(out_sf, 0, 1);   // [s_q, n_wv_group, wv_group_size * d_v / (out_sf_scale_gran*4)]
+    auto [out_fp8, out_sf] = resolve_fp8_outputs(out_fp8_, out_sf_, q, s_q, n_wv_group, wv_group_size, d_v, out_sf_scale_gran);
     Tensor lse = torch::stable::new_empty(q, {s_q, h_q}, ScalarType::Float);
-    KU_CHECK_CONTIGUOUS(out_fp8);
-    STD_TORCH_CHECK(out_sf.stride(0) == 1);
     KU_CHECK_CONTIGUOUS(lse);
 
     SparseAttnDecodeParams base_params = {

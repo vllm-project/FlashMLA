@@ -64,7 +64,9 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     int64_t num_per_channels,
     bool use_tma_aligned_col_major_sf,
     bool round_sf,
-    bool use_packed_ue8m0);
+    bool use_packed_ue8m0,
+    const std::optional<Tensor> &out_fp8_,
+    const std::optional<Tensor> &out_sf_);
 
 std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
     const Tensor &q,
@@ -87,7 +89,9 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
     int64_t num_per_channels,
     bool use_tma_aligned_col_major_sf,
     bool round_sf,
-    bool use_packed_ue8m0);
+    bool use_packed_ue8m0,
+    const std::optional<Tensor> &out_fp8_,
+    const std::optional<Tensor> &out_sf_);
 
 std::vector<Tensor> permute_q_b_proj(
     const Tensor &q_b_proj,

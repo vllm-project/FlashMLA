@@ -29,6 +29,7 @@ def prefill(
     d_v: int = 512,
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
+    out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     A fused kernel for Q Norm + Q RoPE + Core Attn (sparse attention) + O RoPE + O cast to FP8, for DeepSeek-V4 & DeepSeek-V4.1
@@ -63,19 +64,34 @@ def prefill(
         topk_length: optional, [s_q], int32. If provided, the i-th q token will only attend to k tokens specified by indices[i, :, :topk_length[i]], ignoring later k tokens (even if provided in indices). This parameter is mainly used for variable-length topk attention scenarios, such as using sparse attention to simulate causal attention.
             In extremely rare cases (topk_length provided, there is a valid topk index between topk_length[i] ~ s_kv, and that topk index points to a k token containing NaN), operator output will contain NaN, so please avoid this situation.
 
+    Args (Output buffers):
+        out: optional (out_fp8, out_sf) pair to write the quantized result into instead of allocating it. Both or neither.
+            - out_fp8: [s_q, n_wv_group, wv_group_size * d_v], fp8_e4m3, contiguous. A token range of a larger contiguous
+              [N, n_wv_group, wv_group_size * d_v] buffer is accepted (the kernel's token stride is fixed to n_wv_group * wv_group_size * d_v).
+            - out_sf: [s_q, n_wv_group, wv_group_size * d_v / (32*4)], int32, with stride 1 along the token dim (MN-major). The other two
+              strides are passed through, so a token range of a shared scale buffer allocated for N >= s_q tokens is accepted, e.g.
+              `torch.empty((n_wv_group, wv_group_size*d_v // 128, ceil4(N)), dtype=torch.int32).permute(2, 0, 1)[start:end]`.
+            This lets the prefill and decode segments of one mixed step write disjoint token ranges of a single buffer pair, which one
+            deep_gemm.fp8_einsum call over all N tokens can consume. DeepGEMM requires the scale buffer's head-dim stride to equal ceil4(N)
+            for the N it is finally called with; the fused kernel does not check that, only that the s_q tokens do not overlap.
+
     Returns:
         - out_fp8: [s_q, n_wv_group, wv_group_size * d_v], fp8_e4m3, quantized attention result
         - out_sf: [s_q, n_wv_group, wv_group_size * d_v / (32*4)], int32_t, scaling factor. This scaling factor is ALWAYS stored in the per-32 scaled format, even if num_per_channels is 128
         - max_logits:  [s_q, h_q], float
         - lse: [s_q, h_q], float
         If a q token does not attend to any k token, then max_logits is -inf, lse is +inf, out is all zeros.
+        When `out` is given, the returned out_fp8 / out_sf are the provided tensors.
     """
+    out_fp8_buf, out_sf_buf = out if out is not None else (None, None)
     results = flash_mla_cuda.fused_norm_rope_attn_rope_cast_fwd(
         q, kv, indices, sm_scale, d_v, attn_sink, topk_length,
 
         enable_q_norm, rms_norm_eps, token_positions, is_rope_neox_style, rope_dim, cos_sin_cache,
 
-        n_wv_group, num_per_channels, use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0
+        n_wv_group, num_per_channels, use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0,
+
+        out_fp8_buf, out_sf_buf
     )
     out_fp8, out_sf, max_logits, lse = results
     return out_fp8, out_sf, max_logits, lse
@@ -106,6 +122,7 @@ def decode(
     extra_k_cache: Optional[torch.Tensor] = None,
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Fused Decoding kernel: Q Norm + Q RoPE + Core Attn (decode, with paged FP8 KV cache) + O RoPE + O cast to FP8, for DeepSeek-V4 & DeepSeek-V4.1
@@ -143,17 +160,26 @@ def decode(
         extra_indices_in_kvcache: optional, [s_q, extra_topk], int32. Indices into the extra KV cache
         extra_topk_length: optional, [s_q], int32. Actual valid extra topk count of the request
 
+    Args (Output buffers):
+        out: optional (out_fp8, out_sf) pair to write the quantized result into instead of allocating it. Same requirements
+            as in `prefill`: out_fp8 contiguous fp8_e4m3 [s_q, n_wv_group, wv_group_size * d_v] (a token range of a larger contiguous
+            buffer is fine); out_sf int32 [s_q, n_wv_group, wv_group_size * d_v / (32*4)] with stride 1 along the token dim (a token
+            range of a shared scale buffer allocated for N >= s_q tokens is fine).
+
     Returns:
         - out_fp8: [s_q, n_wv_group, wv_group_size * d_v], fp8_e4m3, quantized attention result
         - out_sf: [s_q, n_wv_group, wv_group_size * d_v / (32*4)], int32, scaling factor
         - lse: [s_q, h_q], float
+        When `out` is given, the returned out_fp8 / out_sf are the provided tensors.
     """
+    out_fp8_buf, out_sf_buf = out if out is not None else (None, None)
     out_fp8, out_sf, lse = flash_mla_cuda.fused_norm_rope_attn_rope_cast_decode(
         q, k_cache, indices_in_kvcache, sm_scale, d_v,
         attn_sink, topk_length,
         extra_k_cache, extra_indices_in_kvcache, extra_topk_length,
         enable_q_norm, rms_norm_eps, token_positions, is_rope_neox_style, rope_dim, cos_sin_cache,
-        n_wv_group, num_per_channels, use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0
+        n_wv_group, num_per_channels, use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0,
+        out_fp8_buf, out_sf_buf
     )
     return out_fp8, out_sf, lse
 
