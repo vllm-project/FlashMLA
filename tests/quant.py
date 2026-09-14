@@ -81,17 +81,10 @@ def _nvfp4_unpermute_scales(scales: torch.Tensor) -> torch.Tensor:
 def _quantize_tiles_with_e4m3_scales(
     x: torch.Tensor, tile_size: int, max_value: float
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Scale fixed-size tiles, rounding each positive e4m3 scale upward."""
+    """Scale fixed-size tiles by a round-to-nearest e4m3 scale."""
     tiles = x.float().unflatten(-1, (-1, tile_size))
     amax = tiles.abs().amax(dim=-1)
-    scale_target = torch.clamp(amax / max_value, 2.0**-9, 448.0)
-    scale = scale_target.to(torch.float8_e4m3fn)
-
-    # Positive e4m3 bit patterns are monotonic. Bump a rounded-down scale so
-    # the largest value in a tile cannot saturate during e2m1 conversion.
-    scale_bits = scale.view(torch.uint8)
-    bump = (scale.float() < scale_target) & (scale_bits < 0x7E)
-    scale = torch.where(bump, (scale_bits + 1).view(torch.float8_e4m3fn), scale)
+    scale = torch.clamp(amax / max_value, 2.0**-9, 448.0).to(torch.float8_e4m3fn)
     return (tiles / scale.float().unsqueeze(-1)).flatten(-2), scale
 
 def quantize_k_cache(
