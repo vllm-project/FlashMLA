@@ -319,17 +319,9 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
         }; 
         auto store_o = [&](const OuterloopArgs &cur_job, const bool &is_last_job) { 
             smem.bar_li_mi_full.wait(cur_job.job_idx_mod_2);
-            float li = 0.0f;
+            static_assert(FOLD_FACTOR == 2);
+            float li = smem.rowwise_li_buf[idx_in_warpgroup] + smem.rowwise_li_buf[idx_in_warpgroup^64];
             float mi = smem.rowwise_mi_buf[idx_in_warpgroup % H_Q_PER_CTA];
-            if constexpr (FOLD_FACTOR == 2) {
-                li = smem.rowwise_li_buf[idx_in_warpgroup] + smem.rowwise_li_buf[idx_in_warpgroup^64];
-            } else {
-                static_assert(FOLD_FACTOR == 4);
-                li = __fadd_rn(
-                    __fadd_rn(smem.rowwise_li_buf[idx_in_warpgroup], smem.rowwise_li_buf[idx_in_warpgroup^64]),
-                    __fadd_rn(smem.rowwise_li_buf[idx_in_warpgroup^32], smem.rowwise_li_buf[idx_in_warpgroup^96])
-                );
-            }
             smem.bar_li_mi_empty.arrive();
 
             if (idx_in_warpgroup < H_Q_PER_CTA) {
@@ -530,15 +522,8 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                     smem.bar_tQ_full.wait(cur_job.job_idx_mod_2);
                 }
 
-                if constexpr (H_Q_PER_CTA == 64) {
-                    score_multiplier = smem.q_sqr_sum_buf[cur_job.job_idx_mod_2][idx_in_warpgroup] + smem.q_sqr_sum_buf[cur_job.job_idx_mod_2][idx_in_warpgroup^64];
-                } else {
-                    static_assert(H_Q_PER_CTA == 32);
-                    score_multiplier = __fadd_rn(
-                        __fadd_rn(smem.q_sqr_sum_buf[cur_job.job_idx_mod_2][idx_in_warpgroup], smem.q_sqr_sum_buf[cur_job.job_idx_mod_2][idx_in_warpgroup^64]),
-                        __fadd_rn(smem.q_sqr_sum_buf[cur_job.job_idx_mod_2][idx_in_warpgroup^32], smem.q_sqr_sum_buf[cur_job.job_idx_mod_2][idx_in_warpgroup^96])
-                    );
-                }
+                static_assert(H_Q_PER_CTA == 64);
+                score_multiplier = smem.q_sqr_sum_buf[cur_job.job_idx_mod_2][idx_in_warpgroup] + smem.q_sqr_sum_buf[cur_job.job_idx_mod_2][idx_in_warpgroup^64];
                 score_multiplier = params.sm_scale_div_log2 * rsqrtf(score_multiplier / D_QK + params.rms_norm_eps);    // rsqrt is translated to `MUFU.RSQ`
             } else {
                 score_multiplier = params.sm_scale_div_log2;
