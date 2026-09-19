@@ -273,7 +273,10 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
     bool round_sf,
     bool use_packed_ue8m0,
     const std::optional<Tensor> &out_fp8_,
-    const std::optional<Tensor> &out_sf_
+    const std::optional<Tensor> &out_sf_,
+    int64_t mega_num_splits,
+    const std::optional<Tensor> &mega_o_accum_,
+    const std::optional<Tensor> &mega_lse_accum_
 ) {
     Arch arch = Arch();
     STD_TORCH_CHECK(arch.is_sm100f(), "Fused Norm + RoPE + Core Attn + RoPE + Cast (fused_norm_rope_attn_rope_cast_decode) is only supported on SM100f architectures.");
@@ -457,8 +460,21 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
         (fp8_e4m3*)out_fp8.data_ptr(),
         (uint32_t*)out_sf.data_ptr(),
         (uint32_t)int64_stride_to_int(out_sf.stride(1)),
-        (uint32_t)int64_stride_to_int(out_sf.stride(2))
+        (uint32_t)int64_stride_to_int(out_sf.stride(2)),
+
+        (uint32_t)mega_num_splits,
+        mega_o_accum_.has_value() ? (float*)mega_o_accum_.value().data_ptr() : nullptr,
+        mega_lse_accum_.has_value() ? (float*)mega_lse_accum_.value().data_ptr() : nullptr,
+        mega_o_accum_.has_value() ? (uint32_t)int64_stride_to_int(mega_o_accum_.value().stride(0)) : 0u,
+        mega_lse_accum_.has_value() ? (uint32_t)int64_stride_to_int(mega_lse_accum_.value().stride(0)) : 0u
     };
+    if (mega_o_accum_.has_value() || mega_lse_accum_.has_value()) {
+        STD_TORCH_CHECK(h_q == 64, "the fp32-partial mega decode path currently requires h_q == 64");
+        STD_TORCH_CHECK(mega_o_accum_.has_value() && mega_lse_accum_.has_value(),
+            "mega_o_accum and mega_lse_accum must be given together");
+    }
+    STD_TORCH_CHECK(mega_num_splits == 1 || mega_o_accum_.has_value(),
+        "mega_num_splits > 1 requires the fp32 partial buffers");
 
     DISPATCH_NUM_HEADS(h_q, H_Q, ([&]() {
         DISPATCH_BOOLEAN_FLAG(enable_q_norm, ENABLE_Q_NORM, ([&]() {

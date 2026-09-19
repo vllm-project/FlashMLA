@@ -123,6 +123,9 @@ def decode(
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
     out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    mega_num_splits: int = 1,
+    mega_o_accum: Optional[torch.Tensor] = None,
+    mega_lse_accum: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Fused Decoding kernel: Q Norm + Q RoPE + Core Attn (decode, with paged FP8 KV cache) + O RoPE + O cast to FP8, for DeepSeek-V4 & DeepSeek-V4.1
@@ -160,6 +163,16 @@ def decode(
         extra_indices_in_kvcache: optional, [s_q, extra_topk], int32. Indices into the extra KV cache
         extra_topk_length: optional, [s_q], int32. Actual valid extra topk count of the request
 
+    Args (Split-KV, optional):
+        mega_num_splits: number of KV splits per query token. 1 (default) keeps the fused epilogue and writes
+            out_fp8 / out_sf. Requires h_q == 64.
+        mega_o_accum: [mega_num_splits, s_q, h_q, d_v], float32. When given (with mega_lse_accum), every job writes
+            its partial attention output here -- already inverse-RoPEd and normalised by that split's l_i -- and the
+            fused FP8 epilogue is skipped. A combine kernel must merge the splits and run the cast.
+        mega_lse_accum: [mega_num_splits, s_q, h_q], float32. Per-split log2-space LSE (m_i + log2(l_i)), -inf for a
+            split with no valid tokens. The attention sink is NOT applied here; the combine applies it once, matching
+            the protocol of the existing `smxx/decode/combine` kernel.
+
     Args (Output buffers):
         out: optional (out_fp8, out_sf) pair to write the quantized result into instead of allocating it. Same requirements
             as in `prefill`: out_fp8 contiguous fp8_e4m3 [s_q, n_wv_group, wv_group_size * d_v] (a token range of a larger contiguous
@@ -179,7 +192,8 @@ def decode(
         extra_k_cache, extra_indices_in_kvcache, extra_topk_length,
         enable_q_norm, rms_norm_eps, token_positions, is_rope_neox_style, rope_dim, cos_sin_cache,
         n_wv_group, num_per_channels, use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0,
-        out_fp8_buf, out_sf_buf
+        out_fp8_buf, out_sf_buf,
+        mega_num_splits, mega_o_accum, mega_lse_accum
     )
     return out_fp8, out_sf, lse
 

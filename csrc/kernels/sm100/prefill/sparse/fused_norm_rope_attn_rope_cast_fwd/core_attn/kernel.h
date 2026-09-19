@@ -48,6 +48,16 @@ struct ParamsTemplate : Base {
     fp8_e4m3* __restrict__ out_fp8; // [s_q, n_wv_group, wv_group_size * d_v]
     uint32_t* __restrict__ out_sf;   // [s_q, n_wv_group, (wv_group_size*d_v) / 32 / 4], contiguous on the first (s_q) dim
     uint32_t stride_out_sf_wv_group, stride_out_sf_head_dim;
+
+    // Split-KV (decode only). num_splits == 1 keeps the fused epilogue and the
+    // fp8 output below; num_splits > 1 makes every job write an fp32 partial
+    // (normalised by its own l_i) plus a log2-space LSE, for the mega combine
+    // kernel to merge and run the epilogue on.
+    uint32_t mega_num_splits;
+    float* __restrict__ mega_o_accum;    // [num_splits, s_q, h_q, d_v]
+    float* __restrict__ mega_lse_accum;  // [num_splits, s_q, h_q], log2 space
+    uint32_t stride_mega_o_accum_split;
+    uint32_t stride_mega_lse_accum_split;
 };
 
 template<SparseAttnFwdMode FWD_MODE>

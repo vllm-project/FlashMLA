@@ -91,7 +91,10 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
     bool round_sf,
     bool use_packed_ue8m0,
     const std::optional<Tensor> &out_fp8_,
-    const std::optional<Tensor> &out_sf_);
+    const std::optional<Tensor> &out_sf_,
+    int64_t mega_num_splits,
+    const std::optional<Tensor> &mega_o_accum_,
+    const std::optional<Tensor> &mega_lse_accum_);
 
 std::vector<Tensor> permute_q_b_proj(
     const Tensor &q_b_proj,
