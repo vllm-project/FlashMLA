@@ -134,10 +134,22 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
         // Decoding only:
         uint32_t extra_topk_length;     // Number of valid extra-topk entries of the current request
         uint32_t num_orig_slots;        // Number of slots occupied by the orig KV in the unified slot space, i.e. slots < num_orig_slots come from `kv`/`indices` (will be set to -1 if we don't have so many valid indices) while the others come from `extra_kv`/`extra_indices`. 0xFFFFFFFF when there is no extra KV (so that every slot belongs to the orig KV)
+        // Split-KV: this job owns the absolute KV block range [kv_block_begin,
+        // kv_block_end). Without splitting that is [0, num_kv_blocks).
+        // `contributes` is false for a degenerate split (more splits than
+        // blocks): it re-runs the last block so the pipeline stays uniform,
+        // and the epilogue throws the result away.
+        uint32_t split_idx;
+        uint32_t kv_block_begin;
+        uint32_t kv_block_end;
+        bool contributes;
     };
 
     auto _make_outer_loop_args = [&](uint32_t job_idx_mod_2, uint32_t cta_x_idx) -> OuterloopArgs {
-        uint32_t s_q_idx = cta_x_idx / CLUSTER_SIZE;
+        uint32_t job_idx = cta_x_idx / CLUSTER_SIZE;
+        uint32_t mega_num_splits = params.mega_num_splits < 1u ? 1u : params.mega_num_splits;
+        uint32_t s_q_idx = mega_num_splits > 1u ? job_idx / mega_num_splits : job_idx;
+        uint32_t split_idx = mega_num_splits > 1u ? job_idx % mega_num_splits : 0u;
         if constexpr (IS_DECODE) {
             uint32_t topk_length = params.topk_length ? (uint32_t)__ldg(params.topk_length + s_q_idx) : (uint32_t)params.topk;
             uint32_t extra_topk_length = params.extra_topk_length ? (uint32_t)__ldg(params.extra_topk_length + s_q_idx) : (uint32_t)params.extra_topk;
@@ -151,6 +163,19 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 num_kv_blocks = ku::ceil_div(topk_length, (uint32_t)B_TOPK);
             }
             num_kv_blocks = std::max(num_kv_blocks, 1u);
+            uint32_t kv_block_begin = 0u, kv_block_end = num_kv_blocks;
+            bool contributes = true;
+            if (mega_num_splits > 1u) {
+                uint32_t per_split = ku::ceil_div(num_kv_blocks, mega_num_splits);
+                kv_block_begin = split_idx * per_split;
+                if (kv_block_begin >= num_kv_blocks) {
+                    kv_block_begin = num_kv_blocks - 1u;
+                    kv_block_end = num_kv_blocks;
+                    contributes = false;
+                } else {
+                    kv_block_end = std::min(kv_block_begin + per_split, num_kv_blocks);
+                }
+            }
             return {
                 true,
                 s_q_idx,
@@ -158,7 +183,11 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 topk_length,
                 num_kv_blocks,
                 extra_topk_length,
-                num_orig_slots
+                num_orig_slots,
+                split_idx,
+                kv_block_begin,
+                kv_block_end,
+                contributes
             };
         } else {
             uint32_t topk_length = params.topk_length ? __ldg(params.topk_length + s_q_idx) : params.topk;
@@ -168,7 +197,13 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 s_q_idx,
                 job_idx_mod_2,
                 topk_length,
-                num_kv_blocks
+                num_kv_blocks,
+                0u,
+                0u,
+                0u,
+                0u,
+                num_kv_blocks,
+                true
             };
         }
     };
@@ -179,17 +214,18 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
     // one) block straddling the orig/extra boundary is invoked with ORIG_AND_EXTRA, so that ORIG-only
     // and EXTRA-only blocks stay on branch-free fast paths
     auto run_along_kv_blocks = [&](const OuterloopArgs &cur_args, auto callable) {
+        uint32_t lo = cur_args.kv_block_begin, hi = cur_args.kv_block_end;
         uint32_t num_full_orig_blocks = std::min(cur_args.num_kv_blocks, cur_args.num_orig_slots / B_TOPK);
         bool has_mixed_block = num_full_orig_blocks < cur_args.num_kv_blocks && cur_args.num_orig_slots % B_TOPK != 0;
         CUTE_NO_UNROLL
-        for (uint32_t kv_block_idx = 0; kv_block_idx < num_full_orig_blocks; ++kv_block_idx) {
+        for (uint32_t kv_block_idx = lo; kv_block_idx < std::min(num_full_orig_blocks, hi); ++kv_block_idx) {
             callable.template operator()<KVLocation::ORIG>(kv_block_idx);
         }
-        if (has_mixed_block) {
+        if (has_mixed_block && num_full_orig_blocks >= lo && num_full_orig_blocks < hi) {
             callable.template operator()<KVLocation::ORIG_AND_EXTRA>(num_full_orig_blocks);
         }
         CUTE_NO_UNROLL
-        for (uint32_t kv_block_idx = num_full_orig_blocks + has_mixed_block; kv_block_idx < cur_args.num_kv_blocks; ++kv_block_idx) {
+        for (uint32_t kv_block_idx = std::max(lo, num_full_orig_blocks + (uint32_t)has_mixed_block); kv_block_idx < hi; ++kv_block_idx) {
             callable.template operator()<KVLocation::EXTRA>(kv_block_idx);
         }
     };
@@ -333,13 +369,30 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
 
             if (idx_in_warpgroup < H_Q_PER_CTA) {
                 uint32_t global_index = cur_job.s_q_idx * H_Q + cta_idx * H_Q_PER_CTA + idx_in_warpgroup;
-                float cur_lse = fmaf(mi, CUDART_LN2_F, logf(li));
-                cur_lse = cur_lse == -CUDART_INF_F ? +CUDART_INF_F : cur_lse;
-                params.lse[global_index] = cur_lse;
+                if (params.mega_o_accum != nullptr) {
+                    // Split-KV: log2-space LSE per split, -inf for an empty one.
+                    float lse2 = (li == 0.0f || !cur_job.contributes)
+                               ? -CUDART_INF_F : (mi + __log2f(li));
+                    params.mega_lse_accum[
+                        (uint64_t)cur_job.split_idx * params.stride_mega_lse_accum_split
+                        + global_index] = lse2;
+                } else {
+                    float cur_lse = fmaf(mi, CUDART_LN2_F, logf(li));
+                    cur_lse = cur_lse == -CUDART_INF_F ? +CUDART_INF_F : cur_lse;
+                    params.lse[global_index] = cur_lse;
+                }
             }
 
             float attn_sink = params.attn_sink == nullptr ? -CUDART_INF_F : __ldg(params.attn_sink + cta_idx * H_Q_PER_CTA + idx_in_warpgroup % H_Q_PER_CTA) * CUDART_L2E_F;
-            float output_scale = li == 0.0f ? 0.0f : __fdividef(1.0f, li + exp2f(attn_sink - mi));
+            float output_scale;
+            if (params.mega_o_accum != nullptr) {
+                // The combine kernel applies the attention sink and the
+                // cross-split renormalisation, so normalise by l_i only.
+                output_scale = (li == 0.0f || !cur_job.contributes)
+                             ? 0.0f : __fdividef(1.0f, li);
+            } else {
+                output_scale = li == 0.0f ? 0.0f : __fdividef(1.0f, li + exp2f(attn_sink - mi));
+            }
 
             smem.bar_tO_full.wait(cur_job.job_idx_mod_2);
             ku::tcgen05_after_thread_sync();
@@ -399,6 +452,32 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                         }
                     }
 
+                    // Split-KV: write this split's fp32 partial (RoPE already
+                    // applied, and RoPE commutes with the cross-split weighted
+                    // sum since every split shares the query position) and skip
+                    // the FP8 cast entirely.
+                    if constexpr (CLUSTER_SIZE == 1) {
+                        if (params.mega_o_accum != nullptr) {
+                            uint32_t hdb = mma_atom_idx * MMA_ATOM_N
+                                         + (warp_idx/(H_Q_PER_CTA/32)) * (MMA_ATOM_N/FOLD_FACTOR)
+                                         + epilogue_tile_idx_in_atom * EPILOGUE_TILE_SIZE;
+                            uint32_t head_idx_p = cta_idx*H_Q_PER_CTA + idx_in_warpgroup%H_Q_PER_CTA;
+                            float *dst = params.mega_o_accum
+                                       + (uint64_t)cur_job.split_idx * params.stride_mega_o_accum_split
+                                       + ((uint64_t)cur_job.s_q_idx * H_Q + head_idx_p) * D_VO
+                                       + hdb;
+                            CUTE_UNROLL
+                            for (uint32_t j = 0; j < EPILOGUE_TILE_SIZE; j += 4) {
+                                float4 v;
+                                v.x = output[j+0]*output_scale;
+                                v.y = output[j+1]*output_scale;
+                                v.z = output[j+2]*output_scale;
+                                v.w = output[j+3]*output_scale;
+                                *(float4*)(dst + j) = v;
+                            }
+                        }
+                    }
+
                     // Cast to FP8, and save to global memory
                     float output_abs_max;
                     if (!IS_TMEM_LD_WITH_RED_AVAILABLE || should_perform_rope) {
@@ -429,6 +508,11 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 }
             }
 
+            if (params.mega_o_accum != nullptr) {
+                // Split-KV wrote fp32 partials above; the mega combine kernel
+                // owns the FP8 cast and the packed-scale store.
+                return;
+            }
             uint32_t head_idx = cta_idx*H_Q_PER_CTA + idx_in_warpgroup%H_Q_PER_CTA;
             uint32_t wv_group_idx = head_idx / WV_GROUP_SIZE;
             uint32_t head_idx_in_wv_group = head_idx % WV_GROUP_SIZE;
@@ -545,7 +629,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
             smem.bar_tQ_empty.arrive(); // Must arrive on the empty barrier here, to prevent smem.bar_tQ_full being phase-skipped
 
             CUTE_NO_UNROLL
-            for (uint32_t kv_block_idx = 0; kv_block_idx < cur_job.num_kv_blocks; ++kv_block_idx) {
+            for (uint32_t kv_block_idx = cur_job.kv_block_begin; kv_block_idx < cur_job.kv_block_end; ++kv_block_idx) {
                 auto [indices_buf_idx, indices_bar_phase] = rs.get<NUM_INDICES_BUFS>();
                 auto [p_buf_idx, p_bar_phase] = rs.get<NUM_P_BUFS>();
                 smem.bar_tP_full[p_buf_idx].wait(p_bar_phase);
@@ -606,7 +690,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 }
 
                 // Rescale O
-                if (kv_block_idx > 0 && should_scale_o) {
+                if (kv_block_idx > cur_job.kv_block_begin && should_scale_o) {
                     ku::tcgen05_after_thread_sync();
                     rescale_O<D_VO / FOLD_FACTOR, 32, tmem_cols::O>(scale_for_old);
                     ku::tcgen05_before_thread_sync();
@@ -659,7 +743,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
 
             RingBufferState rs_qk, rs_sv;
             auto run_qk_gemm = [&](const OuterloopArgs &job, uint32_t kv_block_idx) {
-                if (kv_block_idx == 0) {
+                if (kv_block_idx == job.kv_block_begin) {
                     smem.bar_tQ_full.wait(job.job_idx_mod_2);
                 }
                 auto [kv_slot_idx, kv_bar_phase] = rs_qk.get<NUM_KV_SLOTS>();
@@ -686,14 +770,14 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 ku::utcmma_ts(tiled_mma_qk, tQ, sK, tP, true);
                 umma_arrive_on_every_cta(smem.bar_tP_full[p_buf_idx]);
 
-                if (kv_block_idx == job.num_kv_blocks-1) {
+                if (kv_block_idx == job.kv_block_end-1) {
                     umma_arrive_on_every_cta(smem.bar_tQ_empty);
                 }
                 rs_qk.update();
             };
 
             auto run_sv_gemm = [&](const OuterloopArgs &job, uint32_t kv_block_idx) {
-                if (kv_block_idx == 0) {
+                if (kv_block_idx == job.kv_block_begin) {
                     smem.bar_tO_empty.wait(job.job_idx_mod_2^1);
                 }
                 auto [kv_slot_idx, _] = rs_sv.get<NUM_KV_SLOTS>();
@@ -703,29 +787,29 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                     ku::make_umma_canonical_mn_major_layout<D_VO / CLUSTER_SIZE, B_TOPK, 128>()
                 );
                 ku::tcgen05_after_thread_sync();
-                ku::utcmma_ss(tiled_mma_sv, sS, sV, tO, kv_block_idx == 0);
+                ku::utcmma_ss(tiled_mma_sv, sS, sV, tO, kv_block_idx == job.kv_block_begin);
                 umma_arrive_on_every_cta(smem.bar_kv_slot_empty[kv_slot_idx]);
                 umma_arrive_on_every_cta(smem.bar_SO_empty);
-                if (kv_block_idx == job.num_kv_blocks-1) {
+                if (kv_block_idx == job.kv_block_end-1) {
                     umma_arrive_on_every_cta(smem.bar_tO_full);
                 }
                 rs_sv.update();
             };
 
             OuterloopArgs cur_job = get_first_job();
-            run_qk_gemm(cur_job, 0);
+            run_qk_gemm(cur_job, cur_job.kv_block_begin);
             do {
                 CUTE_NO_UNROLL
-                for (uint32_t kv_block_idx = 1; kv_block_idx < cur_job.num_kv_blocks; ++kv_block_idx) {
+                for (uint32_t kv_block_idx = cur_job.kv_block_begin+1; kv_block_idx < cur_job.kv_block_end; ++kv_block_idx) {
                     run_qk_gemm(cur_job, kv_block_idx);
                     run_sv_gemm(cur_job, kv_block_idx-1);
                 }
 
                 OuterloopArgs next_job = get_next_job(cur_job);
                 if (next_job.is_valid) {
-                    run_qk_gemm(next_job, 0);
+                    run_qk_gemm(next_job, next_job.kv_block_begin);
                 }
-                run_sv_gemm(cur_job, cur_job.num_kv_blocks-1);
+                run_sv_gemm(cur_job, cur_job.kv_block_end-1);
                 
                 cur_job = next_job;
             } while (cur_job.is_valid);
@@ -767,7 +851,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 if constexpr (!IS_DECODE) {
                     auto body = [&]<bool CHECK_TOPK_SUBSCRIPT>() {
                         CUTE_NO_UNROLL
-                        for (uint32_t kv_block_idx = 0; kv_block_idx < cur_job.num_kv_blocks; ++kv_block_idx) {
+                        for (uint32_t kv_block_idx = cur_job.kv_block_begin; kv_block_idx < cur_job.kv_block_end; ++kv_block_idx) {
                             auto [indices_buf_idx, indices_bar_phase] = rs.get<NUM_INDICES_BUFS>();
                             smem.bar_indices_empty[indices_buf_idx].wait(indices_bar_phase^1);
 
@@ -1394,7 +1478,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 RingBufferState rs;
                 uint32_t local_warp_idx = warp_idx - 4;
                 do {
-                    for (uint32_t i = 0; i < cur_job.num_kv_blocks; ++i) {
+                    for (uint32_t i = cur_job.kv_block_begin; i < cur_job.kv_block_end; ++i) {
                         static_assert(B_TOPK % (4*4) == 0);
                         static constexpr uint32_t NUM_ROW_PER_WARP = B_TOPK / 4;
                         int4 topk_idxs[NUM_ROW_PER_WARP / 4];
@@ -1600,7 +1684,7 @@ void Kernel<CONFIG>::run(const Params &params) {
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
     cutlass::ClusterLaunchParams launch_params = {
-        dim3(params.s_q * CLUSTER_SIZE, 1, 1),
+        dim3(params.s_q * (params.mega_num_splits < 1u ? 1u : params.mega_num_splits) * CLUSTER_SIZE, 1, 1),
         dim3(NUM_THREADS, 1, 1),
         dim3(CLUSTER_SIZE, 1, 1),
         smem_size,
