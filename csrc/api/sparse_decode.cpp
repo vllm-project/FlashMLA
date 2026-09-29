@@ -175,8 +175,10 @@ protected:
                 }
                 cur_params.lse += start_head_idx;
                 cur_params.out += start_head_idx * params.stride_o_h_q;
-                cur_params.lse_accum += start_head_idx;
-                cur_params.o_accum += start_head_idx * params.stride_o_accum_h_q;
+                if (cur_params.o_accum) {
+                    cur_params.lse_accum += start_head_idx;
+                    cur_params.o_accum += start_head_idx * params.stride_o_accum_h_q;
+                }
                 cur_params.h_q = 64;
                 sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32_NVFP4_FP8ROPE>(cur_params);
             }
@@ -192,7 +194,7 @@ protected:
                     }
                     cur_params.lse += start_head_idx;
                     cur_params.out += start_head_idx * params.stride_o_h_q;
-                    if (cur_params.enable_split_kv) {
+                    if (cur_params.o_accum) {
                         cur_params.lse_accum += start_head_idx;
                         cur_params.o_accum += start_head_idx * params.stride_o_accum_h_q;
                     }
@@ -294,7 +296,8 @@ sparse_attn_decode_interface(
         extra_topk = extra_indices->size(-1);
     }
 
-    // Split-KV only pays off when a request has enough work. The sm90 kernel always splits.
+    // Split-KV only pays off when a request has enough work. The sm90 kernel only
+    // comes in the split-KV flavour (it always consumes the scheduler metadata).
     bool enable_split_kv = arch.is_sm90a() || !(topk + extra_topk <= 640);
 
     // metadata sanity check
@@ -533,6 +536,13 @@ sparse_attn_decode_interface(
         params.tile_scheduler_metadata_ptr = (DecodingSchedMeta*)tile_scheduler_metadata->data_ptr();
         params.num_splits_ptr = num_splits->mutable_data_ptr<int>();
         params.num_sm_parts = impl_meta.num_sm_parts;
+    }
+
+    // With a single scheduler partition no request is split: the kernels write
+    // `out` / `lse` directly and the combine kernel would be a no-op, so the
+    // fp32 accumulators ((b + num_sm_parts) * s_q * h_q * d_v) are not needed.
+    const bool needs_split_workspace = enable_split_kv && impl_meta.num_sm_parts > 1;
+    if (needs_split_workspace) {
         // Allocate intermediate buffers for split-KV
         const int total_num_splits = b + params.num_sm_parts;
         lse_accum = torch::stable::new_empty(q, {total_num_splits, s_q, h_q}, ScalarType::Float);
@@ -549,7 +559,7 @@ sparse_attn_decode_interface(
     }
 
     impl->run(params, features);
-    if (enable_split_kv) {
+    if (needs_split_workspace) {
         CombineParams combine_params = {
             b, s_q, h_q, d_v,
 
