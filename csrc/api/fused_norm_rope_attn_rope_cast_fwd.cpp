@@ -1,19 +1,20 @@
 #include "common.h"
 
-#include "kernels/params.h"
+#include "params.h"
 
-#include "kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.h"
-#include "kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_q_b_proj/kernel.h"
-#include "kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_wv_proj/kernel.h"
+#include "cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.h"
+#include "cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_q_b_proj/kernel.h"
+#include "cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_wv_proj/kernel.h"
 
-// Local aliases: `kernels/defines.h` declares this type as `fp8`, and the fused kernel headers declare
-// it inside their own namespace, so this translation unit needs the explicit name at file scope.
+// The V4 decode kernel, which upstream dropped in the 2026.09.30 release
+#include "cuda_kernels/legacy/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.h"
+
 using bf16 = cutlass::bfloat16_t;
-using fp8_e4m3 = cutlass::float_e4m3_t;
 
 using Params = sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::ParamT<SparseAttnFwdMode::Prefill>;
 using DecodeParams = sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::ParamT<SparseAttnFwdMode::Decode>;
 using Config = sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::Config;
+using LegacyConfig = legacy::sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::Config;
 
 static Tensor allocate_scale_factor(
     uint32_t batch_size,
@@ -215,6 +216,7 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
         (float*)max_logits.data_ptr(),
         (float*)lse.data_ptr(),
 
+        SparseAttnFwdMode::Prefill,
         arch.num_sms,
         get_current_cuda_stream(q),
 
@@ -241,7 +243,8 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     STD_TORCH_CHECK(h_q == 64 || h_q == 128, "Only h_q == 64 or 128 is supported for fused_norm_rope_attn_rope_cast_fwd, got ", h_q);
     DISPATCH_NUM_HEADS(h_q, H_Q, ([&]() {
         DISPATCH_BOOLEAN_FLAG(enable_q_norm, ENABLE_Q_NORM, ([&]() {
-            sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Prefill, ModelType::V4, ModelType::V4, H_Q, ENABLE_Q_NORM}>(params);
+            // The KV of a prefill is bf16, so the KV cache format is inert and V4 uses this kernel too
+            sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Prefill, ModelType::V41, ModelType::V41, H_Q, ENABLE_Q_NORM}>(params);
         }));
     }));
 
@@ -431,6 +434,8 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
         have_extra_kvcache ? int64_stride_to_int(extra_kv->stride(1)) : 0,
         0,                                              // stride_extra_indices_b is unused since b == 1
         have_extra_kvcache ? int64_stride_to_int(extra_indices->stride(0)) : 0,
+
+        arch.num_sms,
         get_current_cuda_stream(q),
 
         false,      // enable_split_kv: split-KV is not supported by this kernel
@@ -465,7 +470,7 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
             if (extra_model_type == ModelType::V41_FP4) {
                 sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Decode, ModelType::V41, ModelType::V41_FP4, H_Q, ENABLE_Q_NORM}>(params);
             } else if (model_type == ModelType::V4) {
-                sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Decode, ModelType::V4, ModelType::V4, H_Q, ENABLE_Q_NORM}>(params);
+                legacy::sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<LegacyConfig{SparseAttnFwdMode::Decode, ModelType::V4, ModelType::V4, H_Q, ENABLE_Q_NORM}>(params);
             } else if (model_type == ModelType::V41) {
                 sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Decode, ModelType::V41, ModelType::V41, H_Q, ENABLE_Q_NORM}>(params);
             } else {

@@ -49,29 +49,41 @@ def alloc_outputs(n_tokens: int, n_wv_group: int):
     return out_fp8, out_sf
 
 
-# bytes/token, data row width (TMA_K_STRIDE), scale row width, fp8 bytes in the data row, scale bytes in use
+# bytes/token, data row width (TMA_K_STRIDE), scale row width, fp8 bytes in the data row, scale bytes in use.
+# `interleaved` is the V4.1 layout introduced upstream on 2026.09.30, where a token's scales follow
+# its own data; V4 keeps all the data rows of a page block ahead of all its scale rows.
 KV_FORMATS = {
-    "v4": dict(bpt=584, T=576, S=8, fp8_bytes=448, n_scales=7),
-    "v41": dict(bpt=528, T=512, S=16, fp8_bytes=512, n_scales=16),
+    "v4": dict(bpt=584, T=576, S=8, fp8_bytes=448, n_scales=7, interleaved=False),
+    "v41": dict(bpt=528, T=512, S=16, fp8_bytes=512, n_scales=16, interleaved=True),
 }
 
 
 def make_kv_cache(fmt: str, num_blocks: int, block_size: int, gen: torch.Generator) -> torch.Tensor:
-    """A paged cache with random but finite contents in the block layout the kernels expect
-    ([block_size data rows][block_size scale rows][pad to a multiple of TMA_K_STRIDE])."""
+    """A paged cache with random but finite contents, in the layout the kernels expect: either
+    [token data][token scales] per token, or [block_size data rows][block_size scale rows]
+    [pad to a multiple of TMA_K_STRIDE] per page block."""
     f = KV_FORMATS[fmt]
+    # e4m3 codes 0x00..0x7E are finite non-negative values (0x7F is NaN)
+    def rand_data(width):
+        return torch.randint(0, 0x7F, (num_blocks, block_size, width), dtype=torch.uint8, device=DEV, generator=gen)
+    def rand_scales(width):  # ue8m0 exponents for 2^-3 .. 2^3
+        return torch.randint(124, 131, (num_blocks, block_size, width), dtype=torch.uint8, device=DEV, generator=gen)
+
+    if f["interleaved"]:
+        buf = torch.zeros((num_blocks, block_size, f["bpt"]), dtype=torch.uint8, device=DEV)
+        buf[..., : f["fp8_bytes"]] = rand_data(f["fp8_bytes"])
+        buf[..., f["T"]: f["T"] + f["n_scales"]] = rand_scales(f["n_scales"])
+        return buf.view(num_blocks, block_size, 1, f["bpt"])
+
     stride0 = -(-block_size * f["bpt"] // f["T"]) * f["T"]
     buf = torch.zeros((num_blocks, stride0), dtype=torch.uint8, device=DEV)
     data = buf[:, : block_size * f["T"]].view(num_blocks, block_size, f["T"])
-    # e4m3 codes 0x00..0x7E are finite non-negative values (0x7F is NaN)
-    data[..., : f["fp8_bytes"]] = torch.randint(
-        0, 0x7F, (num_blocks, block_size, f["fp8_bytes"]), dtype=torch.uint8, device=DEV, generator=gen)
+    data[..., : f["fp8_bytes"]] = rand_data(f["fp8_bytes"])
     if f["T"] > f["fp8_bytes"]:  # V4: unquantized bf16 RoPE tail
         tail = torch.randn((num_blocks, block_size, (f["T"] - f["fp8_bytes"]) // 2), device=DEV, generator=gen)
         data[..., f["fp8_bytes"]:] = tail.to(torch.bfloat16).view(torch.uint8)
     scales = buf[:, block_size * f["T"]: block_size * f["bpt"]].view(num_blocks, block_size, f["S"])
-    scales[..., : f["n_scales"]] = torch.randint(  # ue8m0 exponents for 2^-3 .. 2^3
-        124, 131, (num_blocks, block_size, f["n_scales"]), dtype=torch.uint8, device=DEV, generator=gen)
+    scales[..., : f["n_scales"]] = rand_scales(f["n_scales"])
     return buf[:, : block_size * f["bpt"]].view(num_blocks, block_size, 1, f["bpt"])
 
 

@@ -166,16 +166,25 @@ def quantize_k_cache(
         return result
 
     elif kvcache_layout == KVCacheLayout.V41_FP8Sparse:
-        bytes_per_token = d_nope + d_rope + num_tiles
-        size_per_block_padded = (block_size*bytes_per_token + 512-1) // 512 * 512
-        result = torch.empty((num_blocks, size_per_block_padded), dtype=torch.float8_e4m3fn, device=input_k_cache.device)[:, :block_size*bytes_per_token]
-        result_k_nope_rope_part = result[:, :block_size*(d_nope+d_rope)].view(num_blocks, block_size, d_nope + d_rope)
-        result_k_scale_factor = result[:, block_size*(d_nope+d_rope):].view(num_blocks, block_size, num_tiles).view(torch.float8_e8m0fnu)  # [num_blocks, block_size, 16]
+        # Token layout: [512 B fp8 data, 16 B ue8m0 scales]. Interleaved as of the 2026.09.30
+        # upstream release: the scales of a token follow that token's own data.
+        bytes_per_token = kvcache_layout.get_bytes_per_token()
+        result = torch.empty((num_blocks, block_size, bytes_per_token), dtype=torch.float8_e4m3fn, device=input_k_cache.device)
+        result_k_nope_rope_part = result[..., :d_nope+d_rope]
+        result_k_scale_factor_view_as_dtype = torch.int8 if kk.is_on_ascend_platform() else torch.float8_e8m0fnu    # torch_npu has bug when copying from/to `torch.float8_e8m0fnu`
+        result_k_scale_factor = result[..., d_nope+d_rope:].view(result_k_scale_factor_view_as_dtype)  # [num_blocks, block_size, 16]
 
+        is_ascend = kk.is_on_ascend_platform()
         for tile_idx in range(0, 16):
             cur_scale_factors_inv = torch.abs(input_k_cache[..., tile_idx*tile_size:(tile_idx+1)*tile_size]).max(dim=-1).values.float() / 448.0
             cur_scale_factors_inv = _cast_scale_inv_to_ue8m0(cur_scale_factors_inv)
-            result_k_scale_factor[:, :, tile_idx] = cur_scale_factors_inv.to(torch.float8_e8m0fnu)
+            if is_ascend:
+                # torch_npu can not copy from float32 to float8_e8m0fnu while preserving the bit pattern,
+                # so compute the e8m0 byte pattern (= bf16 bits >> 7) and write it as int8 bits.
+                scale_bits = cur_scale_factors_inv.view(torch.int32) // 2**23
+                result_k_scale_factor[:, :, tile_idx] = scale_bits.to(torch.int8)
+            else:
+                result_k_scale_factor[:, :, tile_idx] = cur_scale_factors_inv.to(torch.float8_e8m0fnu)
             cur_scale_factors_inv = cur_scale_factors_inv.view(num_blocks, block_size, 1)
             cur_quantized_nope = (input_k_cache[..., tile_idx*tile_size:(tile_idx+1)*tile_size].float() / cur_scale_factors_inv.float()).to(torch.float8_e4m3fn)
             result_k_nope_rope_part[:, :, tile_idx*tile_size:(tile_idx+1)*tile_size] = cur_quantized_nope
@@ -184,22 +193,27 @@ def quantize_k_cache(
         return result
 
     elif kvcache_layout == KVCacheLayout.V41_FP4:
-        # Block layout: [block_size x 256 B fp4 rows][block_size x 32 B e4m3 scale rows]. Element i of a row is in byte i//2, even
+        # Token layout: [256 B fp4 data, 32 B e4m3 scales]. Element i of a row is in byte i//2, even
         # elements in the low nibble. The scale is amax / 6 (6 = max magnitude of e2m1) rounded to e4m3, without a per-tensor scale
-        bytes_per_token = d // 2 + num_tiles
-        size_per_block_padded = (block_size*bytes_per_token + 512-1) // 512 * 512
-        result = torch.empty((num_blocks, size_per_block_padded), dtype=torch.float8_e4m3fn, device=input_k_cache.device)[:, :block_size*bytes_per_token]
-        result_k_data = result[:, :block_size*(d//2)].view(torch.uint8).view(num_blocks, block_size, d//2)
-        result_k_scale = result[:, block_size*(d//2):].view(num_blocks, block_size, num_tiles)
+        bytes_per_token = kvcache_layout.get_bytes_per_token()
+        result = torch.empty((num_blocks, block_size, bytes_per_token), dtype=torch.float8_e4m3fn, device=input_k_cache.device)
+        result_k_data = result[..., :d//2].view(torch.uint8)
+        result_k_scale = result[..., d//2:]
 
-        x = input_k_cache.float()
-        amax = torch.nan_to_num(x.abs(), nan=float("inf")).view(num_blocks, block_size, num_tiles, tile_size).amax(dim=-1)   # A NaN element poisons the whole tile
-        scale = torch.clamp(amax / 6.0, 2.0**-9, 448.0).to(torch.float8_e4m3fn)     # Clamp to the e4m3 range first: torch maps overflow to NaN
-        scale = torch.where(torch.isinf(amax), torch.full_like(scale, float("nan")), scale)
-        codes = _quantize_to_e2m1(x.view(num_blocks, block_size, num_tiles, tile_size) / scale.float().unsqueeze(-1))
-        codes = codes.view(num_blocks, block_size, d)
-        result_k_data[:] = codes[..., 0::2] | (codes[..., 1::2] << 4)
-        result_k_scale[:] = scale
+        # Chunk along blocks: the fp32 intermediates below are 4x the size of the (bf16) cache, and a
+        # whole-cache version would need several of them alive at once (e.g. 3 x 30.7GB for a 15GB cache)
+        blocks_per_chunk = max(1, (1 << 26) // (block_size * d))
+        for b0 in range(0, num_blocks, blocks_per_chunk):
+            b1 = min(b0 + blocks_per_chunk, num_blocks)
+            n = b1 - b0
+            x = input_k_cache[b0: b1].float()
+            amax = torch.nan_to_num(x.abs(), nan=float("inf")).view(n, block_size, num_tiles, tile_size).amax(dim=-1)   # A NaN element poisons the whole tile
+            scale = torch.clamp(amax / 6.0, 2.0**-9, 448.0).to(torch.float8_e4m3fn)     # Clamp to the e4m3 range first: torch maps overflow to NaN
+            scale = torch.where(torch.isinf(amax), torch.full_like(scale, float("nan")), scale)
+            normalized = x.view(n, block_size, num_tiles, tile_size) / scale.float().unsqueeze(-1)
+            codes = _quantize_to_e2m1(normalized).view(n, block_size, d)
+            result_k_data[b0: b1] = codes[..., 0::2] | (codes[..., 1::2] << 4)
+            result_k_scale[b0: b1] = scale
 
         result = result.view(num_blocks, block_size, 1, -1)
         return result
@@ -284,20 +298,25 @@ def dequantize_k_cache(
             result[..., tile_idx*tile_size: (tile_idx+1)*tile_size] = cur_nope * cur_scales
 
     elif kvcache_layout == KVCacheLayout.V41_FP8Sparse:
-        quant_k_cache = quant_k_cache.view(num_blocks, -1)  # [num_blocks, ...]
-        input_nope_rope = quant_k_cache[:, :block_size*(d_nope+d_rope)].view(num_blocks, block_size, d_nope + d_rope)
-        input_scale = quant_k_cache[:, block_size*(d_nope+d_rope):].view(num_blocks, block_size, num_tiles).view(torch.float8_e8m0fnu)  # [num_blocks, block_size, 16]
+        quant_k_cache = quant_k_cache.view(num_blocks, block_size, -1)
+        input_nope_rope = quant_k_cache[..., :d_nope+d_rope]
+        input_scale = quant_k_cache[..., d_nope+d_rope:].view(torch.float8_e8m0fnu)  # [num_blocks, block_size, 16]
 
         # Dequant NoPE (tiles 0-13, each tile size 32)
+        is_ascend = kk.is_on_ascend_platform()
         for tile_idx in range(0, 16):
             cur_nope_rope = input_nope_rope[..., tile_idx*tile_size:(tile_idx+1)*tile_size].to(torch.bfloat16)
-            cur_scales = input_scale[:, :, tile_idx].to(torch.bfloat16).unsqueeze(-1)
+            if is_ascend:
+                cur_scales = (input_scale[:, :, tile_idx].view(torch.int8).to(torch.int16) * 2**7).view(torch.bfloat16) # torch_npu can not cast float8_e8m0 to bf16 on NPU
+            else:
+                cur_scales = input_scale[:, :, tile_idx].to(torch.bfloat16)
+            cur_scales = cur_scales.unsqueeze(-1)
             result[..., tile_idx*tile_size:(tile_idx+1)*tile_size] = cur_nope_rope * cur_scales
             
     elif kvcache_layout == KVCacheLayout.V41_FP4:
-        quant_k_cache = quant_k_cache.view(num_blocks, -1)
-        input_data = quant_k_cache[:, :block_size*(d//2)].view(torch.uint8).view(num_blocks, block_size, d//2)
-        input_scale = quant_k_cache[:, block_size*(d//2):block_size*(d//2 + num_tiles)].view(torch.float8_e4m3fn).view(num_blocks, block_size, num_tiles)
+        quant_k_cache = quant_k_cache.view(num_blocks, block_size, -1)
+        input_data = quant_k_cache[..., :d//2].view(torch.uint8)
+        input_scale = quant_k_cache[..., d//2:].view(torch.float8_e4m3fn)
 
         # Chunked along the blocks: the fp32 intermediates are ~12x the size of the cache
         blocks_per_chunk = max(1, (1 << 26) // (block_size * d))

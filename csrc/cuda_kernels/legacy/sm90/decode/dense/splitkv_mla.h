@@ -1,0 +1,10 @@
+#pragma once
+
+#include "params.h"
+
+namespace legacy::sm90::decode::dense {
+
+template<typename InputT, int HEAD_DIM_K>
+void run_flash_splitkv_mla_kernel(DenseAttnDecodeParams &params);
+
+}

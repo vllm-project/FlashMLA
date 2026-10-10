@@ -5,7 +5,7 @@
 #include <vector>
 
 #include "common.h"
-#include "kernels/sm100/prefill/dense/interface.h"
+#include "cuda_kernels/sm100/prefill/dense/interface.h"
 
 std::vector<Tensor> sparse_attn_prefill_interface(
     const Tensor &q,
@@ -31,7 +31,8 @@ sparse_attn_decode_interface(
     const std::optional<Tensor> &extra_topk_length,
     int64_t d_v,
     double sm_scale,
-    const std::optional<Tensor> &out_);
+    const std::optional<Tensor> &out_,
+    bool enable_batch_invariant);
 
 std::tuple<Tensor, Tensor, std::optional<Tensor>, std::optional<Tensor>>
 dense_attn_decode_interface(
