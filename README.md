@@ -36,13 +36,12 @@ This repository is [vLLM](https://github.com/vllm-project/vllm)'s fork of [deeps
 | :--- | :--- | :--- |
 | `csrc/cuda_kernels/` | `sm100::`, `smxx::` | Upstream's current kernels, byte-identical to the 2026.09.30 release apart from the files listed in the table below: sparse prefill and decode for DeepSeek V4.1 (fp8 and fp4), and the fused norm + RoPE + attn + RoPE + cast kernel. |
 | `csrc/cuda_kernels/legacy/` | `legacy::` | The kernels upstream dropped and this fork keeps: everything on SM90 (dense decode, sparse decode, sparse prefill), SM100 sparse decode and prefill for DeepSeek V3.2 (`d_qk` 576) and V4.0, the V4.0 fused decode kernel, the NVFP4 decode kernel, and the dense decoding scheduler and combine kernels that only dense MLA uses. |
-| `csrc/ascend_kernels/`, `csrc/api_ascend/` | `ascend::` | Upstream's Huawei Ascend 950 kernels and their pybind API, carried over unmodified. **Untested in this fork** — there is no NPU in its CI. `setup.py` builds them when it detects `/dev/davinci_manager` or when `FLASH_MLA_BUILD_TARGET_PLATFORM=ASCEND` is set. The NPU stream is not reachable through libtorch's stable ABI, so Ascend keeps upstream's pybind API instead of sharing `csrc/api/`. |
 
-Both CUDA trees are compiled into one extension, so a single build serves V3.2, V4.0 and V4.1. They share `csrc/params.h` and `csrc/cuda_kernels/kv_cache_format.h`; `KVCacheFormat::IS_INTERLEAVED` is what separates the two KV cache layouts, and `KVCachePart`, which the current kernels use for addressing, static-asserts on it.
+Both trees are compiled into one extension, so a single build serves V3.2, V4.0 and V4.1. They share `csrc/params.h` and `csrc/cuda_kernels/kv_cache_format.h`; `KVCacheFormat::IS_INTERLEAVED` is what separates the two KV cache layouts, and `KVCachePart`, which the current kernels use for addressing, static-asserts on it.
 
 ### Detailed diff against upstream
 
-Everything below is the complete set of files that differ from upstream; regenerate it with `git diff --stat 2e5429fc5653bab6e081f09477126f731882a6a9 HEAD -- . ':!README.md'`. Files that are not listed are identical to upstream. Note that `csrc/cuda_kernels/legacy/**` and `csrc/api_ascend/**` are whole directories that upstream does not have, so they show up as added rather than modified.
+Everything below is the complete set of files that differ from upstream; regenerate it with `git diff --stat 2e5429fc5653bab6e081f09477126f731882a6a9 HEAD -- . ':!README.md'`. Files that are not listed are identical to upstream. Note that `csrc/cuda_kernels/legacy/**` is a whole directory that upstream does not have, so it shows up as added rather than modified, and that upstream's Ascend tree shows up as removed.
 
 | Area | Files | Difference from upstream |
 | :--- | :--- | :--- |
@@ -53,8 +52,8 @@ Everything below is the complete set of files that differ from upstream; regener
 | NVFP4 KV cache (SM100 sparse decode) | `csrc/params.h`, `csrc/cuda_kernels/kv_cache_format.h`, `csrc/cuda_kernels/legacy/sm100/decode/sparse/nvfp4_head64/config.h`, `kernel.cuh`, `kernel.h`, `instantiations/v32_nvfp4_fp8rope.cu`, `csrc/cuda_kernels/legacy/sm100/helpers.h` | New `ModelType::V32_NVFP4_FP8ROPE`; `KVCacheFormat` describes the 352-byte record (256 B e2m1 NoPE, 64 B e4m3 RoPE, 32 B e4m3 scales) and `kv_cache_bytes_per_token` returns it. The kernel is a dedicated head-64 decode kernel, derived from the pre-V4.1 SM100 head-64 kernel and extended with e2m1 dequantization; `helpers.h` gains a bf16-scale overload of `fp8x2_to_bf16x2_with_scale` that it uses. |
 | Kernels kept from before 2026.09.30 | `csrc/cuda_kernels/legacy/**` | The SM90 kernels and the SM100 V3.2 / V4.0 kernels, moved from `csrc/kernels/` with their namespaces prefixed by `legacy::` so they link alongside upstream's current ones, which reuse the same names. The kernel bodies are unchanged; only includes, namespaces and the `block_size_n` -> `block_size_topk` field rename differ. `defines.h` and `utils.h` became thin headers that add the few macros and vector types the current shared headers no longer define. |
 | Shared headers | `csrc/params.h`, `csrc/cuda_kernels/kv_cache_format.h` | `ModelType` keeps `V32`, `V4` and `V32_NVFP4_FP8ROPE`; `KVCacheFormat` describes both the interleaved V4.1 layout and the separated V3.2 / V4.0 one and exposes `IS_INTERLEAVED`, which `KVCachePart` static-asserts on. `GetDecodeSchedMetaParams` keeps `seqlens_k_ptr`, and `DenseAttnDecodeParams` and `CombineParams` are kept, all three for dense MLA decoding. |
-| Split-KV combine | `csrc/cuda_kernels/smxx/decode/combine/combine.cu` | Restores the 192 / 224 / 256 `MLA_NUM_SPLITS_SWITCH` buckets from upstream's #199, which the 2026.09.30 release dropped; without them a GPU with enough SMs trips the `KU_ASSERT` at launch. |
-| Ascend | `csrc/ascend_kernels/**`, `csrc/api_ascend/**`, `scripts/generate_instantiations.py`, `docs/20260930-ascend-prefill-deep-dive*.md` | Carried over from upstream unmodified. `csrc/api_ascend/` is upstream's pybind API, which only the NPU target compiles. |
+| Split-KV combine | `csrc/cuda_kernels/smxx/decode/combine/combine.cu` | Restores the 192 / 224 / 256 `MLA_NUM_SPLITS_SWITCH` buckets from upstream's #199, which the 2026.09.30 release dropped in favour of a `KU_ASSERT` above 160. Every `num_sm_parts` is `arch.num_sms / something`, so this is insurance for a part with more than 160 SMs rather than a fix for today's hardware (GB300 reports 152). |
+| Ascend (removed) | `csrc/ascend_kernels/**`, `csrc/api_ascend/**`, `scripts/generate_instantiations.py`, `docs/20260930-ascend-prefill-deep-dive*.md` | Upstream's Huawei Ascend 950 kernels, their pybind API, their instantiation generator and their design notes are not carried here: this fork targets CUDA only and has no NPU to test them on. `setup.py` builds the one CUDA target with no platform probe. Upstream code that merely mentions Ascend but is inert on CUDA is kept as-is to keep the sync diff small — the `__NPU_DEVICE__` guards in `csrc/params.h`, the vendored `kerutils` Ascend headers, and `kk.is_on_ascend_platform()` in `tests/`. |
 | SM90 dense FP8 decoding extension | `csrc/extension/torch_api.cpp`, `csrc/extension/sm90/dense_fp8/*` | vLLM-only sources for the `_flashmla_extension_C` module (`fwd_kvcache_mla_fp8`, `get_mla_decoding_metadata_dense_fp8`), already ported to the stable ABI. Not compiled by `setup.py`; vLLM's CMake builds them. |
 | Python package | `flash_mla/__init__.py`, `flash_mla/flash_mla_interface.py`, `flash_mla/fused_norm_rope_attn_rope_cast.py` | `__init__` loads `_flashmla_C*.so` with `torch.ops.load_library`; call sites use `torch.ops._flashmla_C` instead of the `flash_mla.cuda` pybind module; `flash_mla_with_kvcache` and `flash_mla_sparse_fwd` accept `out=` and document the NVFP4 layout. |
 | Build | `setup.py`, `.gitignore` | The CUDA extension is named `flash_mla._flashmla_C`; it is compiled with `-DTORCH_TARGET_VERSION=0x020a000000000000 -DUSE_CUDA -DFLASH_MLA_ENABLE_DENSE_BWD -DFLASH_MLA_IS_BUILD_ON_CUDA`, `py_limited_api=True` and `bdist_wheel.py_limited_api = cp310`, and links `-lcuda` (through the toolkit stubs) for the driver calls the kernels make. Its source list adds the `legacy/` tree and the NVFP4 instantiation. The SM100 / SM90 gencode flags stay behind `FLASH_MLA_DISABLE_SM100` / `FLASH_MLA_DISABLE_SM90` and keep the CUDA 12.9 floor for SM100 rather than upstream's 13.1, since nothing in the kernels needs 13.1 (the one version-gated conversion has a 13.1 fallback). `.venv/` is ignored. |
@@ -64,135 +63,143 @@ Everything below is the complete set of files that differ from upstream; regener
 <summary>File-level diffstat against deepseek-ai/FlashMLA@2e5429f</summary>
 
 ```text
- .gitignore                                                                                           |    2 +-
- benchmark/bench_flash_mla.py                                                                         |  520 ++++++++++++++++
- benchmark/visualize.py                                                                               |   29 +
- csrc/3rdparty/kerutils/include/kerutils/supplemental/cuda_stream.h                                   |   19 +
- csrc/3rdparty/kerutils/include/kerutils/supplemental/device_prop.h                                   |   56 ++
- csrc/3rdparty/kerutils/include/kerutils/supplemental/torch_tensors.h                                 |   37 +-
- csrc/api/api.cpp                                                                                     |   53 +-
- csrc/api/common.h                                                                                    |  146 ++---
- csrc/api/dense_decode.cpp                                                                            |  248 ++++++++
- csrc/api/fused_norm_rope_attn_rope_cast_fwd.cpp                                                      |  392 ++++++------
- csrc/api/interfaces.h                                                                                |  107 ++++
- csrc/api/sparse_decode.cpp                                                                           |  583 ++++++++++++------
- csrc/api/sparse_prefill.cpp                                                                          |  266 +++++----
- csrc/api_ascend/api.cpp                                                                              |   16 +
- csrc/api_ascend/common.h                                                                             |  277 +++++++++
- csrc/{api => api_ascend}/dense_bwd.cpp                                                               |    0
- csrc/{api => api_ascend}/dense_fwd.cpp                                                               |    0
- csrc/api_ascend/fused_norm_rope_attn_rope_cast_fwd.cpp                                               |  564 ++++++++++++++++++
- csrc/api_ascend/sparse_decode.cpp                                                                    |  465 +++++++++++++++
- csrc/api_ascend/sparse_prefill.cpp                                                                   |  232 ++++++++
- csrc/cuda_kernels/kv_cache_format.h                                                                  |   45 +-
- csrc/cuda_kernels/legacy/defines.h                                                                   |   25 +
- csrc/cuda_kernels/legacy/sm100/common_subroutine.h                                                   |  242 ++++++++
- csrc/cuda_kernels/legacy/sm100/decode/sparse/head64/config.h                                         |  237 ++++++++
- csrc/cuda_kernels/legacy/sm100/decode/sparse/head64/instantiations/v32_h64.cu                        |    8 +
- csrc/cuda_kernels/legacy/sm100/decode/sparse/head64/instantiations/v32_h64_no_split.cu               |    8 +
- csrc/cuda_kernels/legacy/sm100/decode/sparse/head64/instantiations/v4_h64.cu                         |    8 +
- csrc/cuda_kernels/legacy/sm100/decode/sparse/head64/instantiations/v4_h64_no_split.cu                |    8 +
- csrc/cuda_kernels/legacy/sm100/decode/sparse/head64/kernel.cuh                                       |  908 ++++++++++++++++++++++++++++
- csrc/cuda_kernels/legacy/sm100/decode/sparse/head64/kernel.h                                         |   16 +
- csrc/cuda_kernels/legacy/sm100/decode/sparse/nvfp4_head64/config.h                                   |  270 +++++++++
- csrc/cuda_kernels/legacy/sm100/decode/sparse/nvfp4_head64/instantiations/v32_nvfp4_fp8rope.cu        |    8 +
- csrc/cuda_kernels/legacy/sm100/decode/sparse/nvfp4_head64/kernel.cuh                                 | 1103 ++++++++++++++++++++++++++++++++++
- csrc/cuda_kernels/legacy/sm100/decode/sparse/nvfp4_head64/kernel.h                                   |   10 +
- csrc/cuda_kernels/legacy/sm100/dequant_utils.cuh                                                     |  201 +++++++
- csrc/cuda_kernels/legacy/sm100/helpers.h                                                             |  175 ++++++
- csrc/cuda_kernels/legacy/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/config.h  |  312 ++++++++++
- .../sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h128_decode_nonorm.cu      |    8 +
- .../sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h128_decode_norm.cu        |    8 +
- .../sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h64_decode_nonorm.cu       |    8 +
- .../prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h64_decode_norm.cu |    8 +
- .../cuda_kernels/legacy/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.cuh | 1622 ++++++++++++++++++++++++++++++++++++++++++++++++++
- csrc/cuda_kernels/legacy/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.h  |   30 +
- csrc/cuda_kernels/legacy/sm100/prefill/sparse/fwd/head128/config.h                                   |  134 +++++
- csrc/cuda_kernels/legacy/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k576.cu              |    8 +
- csrc/cuda_kernels/legacy/sm100/prefill/sparse/fwd/head128/phase1.cuh                                 |  716 ++++++++++++++++++++++
- csrc/cuda_kernels/legacy/sm100/prefill/sparse/fwd/head128/phase1.h                                   |   10 +
- csrc/cuda_kernels/legacy/sm100/prefill/sparse/fwd/head64/config.h                                    |  171 ++++++
- csrc/cuda_kernels/legacy/sm100/prefill/sparse/fwd/head64/instantiations/phase1_h64_k576.cu           |    8 +
- csrc/cuda_kernels/legacy/sm100/prefill/sparse/fwd/head64/phase1.cuh                                  |  798 +++++++++++++++++++++++++
- csrc/cuda_kernels/legacy/sm100/prefill/sparse/fwd/head64/phase1.h                                    |   10 +
- csrc/cuda_kernels/legacy/sm100/prefill/sparse/fwd_for_small_topk/head128/config.h                    |  168 ++++++
- .../legacy/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu      |    8 +
- .../sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_splitkv.cu     |    8 +
- csrc/cuda_kernels/legacy/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.cuh                  | 1147 +++++++++++++++++++++++++++++++++++
- csrc/cuda_kernels/legacy/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h                    |   10 +
- csrc/cuda_kernels/legacy/sm90/decode/dense/config.h                                                  |   16 +
- csrc/cuda_kernels/legacy/sm90/decode/dense/instantiations/bf16.cu                                    |    9 +
- csrc/cuda_kernels/legacy/sm90/decode/dense/instantiations/fp16.cu                                    |   11 +
- csrc/cuda_kernels/legacy/sm90/decode/dense/splitkv_mla.cuh                                           | 1373 ++++++++++++++++++++++++++++++++++++++++++
- csrc/cuda_kernels/legacy/sm90/decode/dense/splitkv_mla.h                                             |   10 +
- csrc/cuda_kernels/legacy/sm90/decode/dense/traits.h                                                  |  117 ++++
- csrc/cuda_kernels/legacy/sm90/decode/sparse/components/config.h                                      |   21 +
- csrc/cuda_kernels/legacy/sm90/decode/sparse/components/dequant.h                                     |  127 ++++
- csrc/cuda_kernels/legacy/sm90/decode/sparse/components/helpers.h                                     |  109 ++++
- csrc/cuda_kernels/legacy/sm90/decode/sparse/config.h                                                 |  279 +++++++++
- csrc/cuda_kernels/legacy/sm90/decode/sparse/instantiations/v32_persistent_h128.cu                    |    7 +
- csrc/cuda_kernels/legacy/sm90/decode/sparse/instantiations/v32_persistent_h64.cu                     |    7 +
- csrc/cuda_kernels/legacy/sm90/decode/sparse/instantiations/v4_persistent_h128.cu                     |    7 +
- csrc/cuda_kernels/legacy/sm90/decode/sparse/instantiations/v4_persistent_h64.cu                      |    8 +
- csrc/cuda_kernels/legacy/sm90/decode/sparse/splitkv_mla.cuh                                          |  787 ++++++++++++++++++++++++
- csrc/cuda_kernels/legacy/sm90/decode/sparse/splitkv_mla.h                                            |   11 +
- csrc/cuda_kernels/legacy/sm90/helpers.h                                                              |  170 ++++++
- csrc/cuda_kernels/legacy/sm90/prefill/sparse/config.h                                                |  147 +++++
- csrc/cuda_kernels/legacy/sm90/prefill/sparse/instantiations/phase1_k512.cu                           |   10 +
- csrc/cuda_kernels/legacy/sm90/prefill/sparse/instantiations/phase1_k512_topklen.cu                   |   10 +
- csrc/cuda_kernels/legacy/sm90/prefill/sparse/instantiations/phase1_k576.cu                           |    8 +
- csrc/cuda_kernels/legacy/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu                   |    8 +
- csrc/cuda_kernels/legacy/sm90/prefill/sparse/phase1.cuh                                              |  646 ++++++++++++++++++++
- csrc/cuda_kernels/legacy/sm90/prefill/sparse/phase1.h                                                |   10 +
- csrc/cuda_kernels/legacy/smxx/decode/combine/combine.cu                                              |  230 +++++++
- csrc/cuda_kernels/legacy/smxx/decode/combine/combine.h                                               |   10 +
- csrc/cuda_kernels/legacy/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu              |  116 ++++
- csrc/cuda_kernels/legacy/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h               |    9 +
- csrc/cuda_kernels/legacy/utils.h                                                                     |   39 ++
- csrc/cuda_kernels/sm100/prefill/dense/common/utils.hpp                                               |    1 -
- csrc/cuda_kernels/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu                                      |   33 +-
- csrc/cuda_kernels/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cuh                                     |   50 +-
- csrc/cuda_kernels/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu                                      |   35 +-
- csrc/cuda_kernels/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cuh                                     |   39 +-
- csrc/cuda_kernels/sm100/prefill/dense/interface.h                                                    |   20 +-
- csrc/cuda_kernels/smxx/decode/combine/combine.cu                                                     |   11 +
- csrc/extension/sm90/dense_fp8/flash_fwd_mla_fp8_sm90.cu                                              |   10 +
- csrc/extension/sm90/dense_fp8/flash_fwd_mla_kernel.h                                                 |  709 ++++++++++++++++++++++
- csrc/extension/sm90/dense_fp8/flash_fwd_mla_metadata.cu                                              |   77 +++
- csrc/extension/sm90/dense_fp8/flash_mla.h                                                            |   85 +++
- csrc/extension/sm90/dense_fp8/fp8_transpose_v.h                                                      |   89 +++
- csrc/extension/sm90/dense_fp8/named_barrier.h                                                        |   21 +
- csrc/extension/sm90/dense_fp8/pybind.cpp                                                             |  246 ++++++++
- csrc/extension/sm90/dense_fp8/softmax.h                                                              |  202 +++++++
- csrc/extension/sm90/dense_fp8/static_switch.h                                                        |   70 +++
- csrc/extension/sm90/dense_fp8/utils.h                                                                |  279 +++++++++
- csrc/extension/torch_api.cpp                                                                         |   47 ++
- csrc/params.h                                                                                        |   95 ++-
- docs/20250422-new-kernel-deep-dive.md                                                                |    2 +-
- flash_mla/__init__.py                                                                                |   17 +
- flash_mla/flash_mla_interface.py                                                                     |  297 ++++-----
- flash_mla/fused_norm_rope_attn_rope_cast.py                                                          |   92 +--
- setup.py                                                                                             |  278 +++++----
- tests/__init__.py                                                                                    |    1 -
- tests/kernelkit/__init__.py                                                                          |    4 +-
- tests/kernelkit/bench.py                                                                             |  156 +----
- tests/kernelkit/build.py                                                                             |  117 ----
- tests/kernelkit/compare.py                                                                           |   41 +-
- tests/kernelkit/generate.py                                                                          |    4 +-
- tests/kernelkit/utils.py                                                                             |   28 +-
- tests/lib.py                                                                                         |  256 +++-----
- tests/quant.py                                                                                       |  241 ++++++--
- tests/ref.py                                                                                         |   20 +-
- tests/test-sparse-decode.py                                                                          |  358 -----------
- tests/test_api_registration.py                                                                       |   24 +
- tests/test_flash_mla_dense_decoding.py                                                               |  254 ++++++++
- tests/test_flash_mla_sparse_decoding.py                                                              |  406 +++++++++++++
- tests/{test-sparse-prefill.py => test_flash_mla_sparse_prefill.py}                                   |   91 ++-
- tests/{test-fused-norm-rope-attn-rope-cast.py => test_fused_norm_rope_attn_rope_cast.py}             |   89 +--
- tests/test_fused_optional_out.py                                                                     |  247 ++++++++
- tests/test_nvfp4_quant.py                                                                            |   28 +
- tests/test_output_buffer_api.py                                                                      |   88 +++
- 128 files changed, 20085 insertions(+), 1961 deletions(-)
+ .gitignore                                         |    2 +-
+ benchmark/bench_flash_mla.py                       |  520 ++++++
+ benchmark/visualize.py                             |   29 +
+ .../include/kerutils/supplemental/cuda_stream.h    |   19 +
+ .../include/kerutils/supplemental/device_prop.h    |   56 +
+ .../include/kerutils/supplemental/torch_tensors.h  |   37 +-
+ csrc/api/api.cpp                                   |   53 +-
+ csrc/api/common.h                                  |  146 +-
+ csrc/api/dense_bwd.cpp                             |   15 -
+ csrc/api/dense_decode.cpp                          |  248 +++
+ csrc/api/dense_fwd.cpp                             |   15 -
+ csrc/api/fused_norm_rope_attn_rope_cast_fwd.cpp    |  392 +++--
+ csrc/api/interfaces.h                              |  107 ++
+ csrc/api/sparse_decode.cpp                         |  583 +++++--
+ csrc/api/sparse_prefill.cpp                        |  266 +--
+ csrc/ascend_kernels/prefill/sparse/config.h        |  206 ---
+ csrc/ascend_kernels/prefill/sparse/fast_div_mod.h  |   37 -
+ .../instantiations/v41_h64_decode_nosink.asc       |    9 -
+ .../sparse/instantiations/v41_h64_decode_sink.asc  |    9 -
+ .../instantiations/v41_h64_prefill_nosink.asc      |    9 -
+ .../sparse/instantiations/v41_h64_prefill_sink.asc |    9 -
+ .../instantiations/v41fp4_h64_decode_nosink.asc    |    9 -
+ .../instantiations/v41fp4_h64_decode_sink.asc      |    9 -
+ csrc/ascend_kernels/prefill/sparse/kernel.h        |   22 -
+ csrc/ascend_kernels/prefill/sparse/kernel_body.h   | 1701 --------------------
+ csrc/cuda_kernels/kv_cache_format.h                |   45 +-
+ csrc/cuda_kernels/legacy/defines.h                 |   25 +
+ csrc/cuda_kernels/legacy/sm100/common_subroutine.h |  242 +++
+ .../legacy/sm100/decode/sparse/head64/config.h     |  237 +++
+ .../decode/sparse/head64/instantiations/v32_h64.cu |    8 +
+ .../head64/instantiations/v32_h64_no_split.cu      |    8 +
+ .../decode/sparse/head64/instantiations/v4_h64.cu  |    8 +
+ .../head64/instantiations/v4_h64_no_split.cu       |    8 +
+ .../legacy/sm100/decode/sparse/head64/kernel.cuh   |  908 +++++++++++
+ .../legacy/sm100/decode/sparse/head64/kernel.h     |   16 +
+ .../sm100/decode/sparse/nvfp4_head64/config.h      |  270 ++++
+ .../instantiations/v32_nvfp4_fp8rope.cu            |    8 +
+ .../sm100/decode/sparse/nvfp4_head64/kernel.cuh    | 1103 +++++++++++++
+ .../sm100/decode/sparse/nvfp4_head64/kernel.h      |   10 +
+ csrc/cuda_kernels/legacy/sm100/dequant_utils.cuh   |  201 +++
+ csrc/cuda_kernels/legacy/sm100/helpers.h           |  175 ++
+ .../core_attn/config.h                             |  312 ++++
+ .../instantiations/v4_h128_decode_nonorm.cu        |    8 +
+ .../instantiations/v4_h128_decode_norm.cu          |    8 +
+ .../instantiations/v4_h64_decode_nonorm.cu         |    8 +
+ .../core_attn/instantiations/v4_h64_decode_norm.cu |    8 +
+ .../core_attn/kernel.cuh                           | 1622 +++++++++++++++++++
+ .../core_attn/kernel.h                             |   30 +
+ .../sm100/prefill/sparse/fwd/head128/config.h      |  134 ++
+ .../fwd/head128/instantiations/phase1_k576.cu      |    8 +
+ .../sm100/prefill/sparse/fwd/head128/phase1.cuh    |  716 ++++++++
+ .../sm100/prefill/sparse/fwd/head128/phase1.h      |   10 +
+ .../sm100/prefill/sparse/fwd/head64/config.h       |  171 ++
+ .../fwd/head64/instantiations/phase1_h64_k576.cu   |    8 +
+ .../sm100/prefill/sparse/fwd/head64/phase1.cuh     |  798 +++++++++
+ .../sm100/prefill/sparse/fwd/head64/phase1.h       |   10 +
+ .../sparse/fwd_for_small_topk/head128/config.h     |  168 ++
+ .../head128/instantiations/phase1_decode_k512.cu   |    8 +
+ .../instantiations/phase1_decode_k512_splitkv.cu   |    8 +
+ .../sparse/fwd_for_small_topk/head128/phase1.cuh   | 1147 +++++++++++++
+ .../sparse/fwd_for_small_topk/head128/phase1.h     |   10 +
+ .../cuda_kernels/legacy/sm90/decode/dense/config.h |   16 +
+ .../sm90/decode/dense/instantiations/bf16.cu       |    9 +
+ .../sm90/decode/dense/instantiations/fp16.cu       |   11 +
+ .../legacy/sm90/decode/dense/splitkv_mla.cuh       | 1373 ++++++++++++++++
+ .../legacy/sm90/decode/dense/splitkv_mla.h         |   10 +
+ .../cuda_kernels/legacy/sm90/decode/dense/traits.h |  117 ++
+ .../legacy/sm90/decode/sparse/components/config.h  |   21 +
+ .../legacy/sm90/decode/sparse/components/dequant.h |  127 ++
+ .../legacy/sm90/decode/sparse/components/helpers.h |  109 ++
+ .../legacy/sm90/decode/sparse/config.h             |  279 ++++
+ .../sparse/instantiations/v32_persistent_h128.cu   |    7 +
+ .../sparse/instantiations/v32_persistent_h64.cu    |    7 +
+ .../sparse/instantiations/v4_persistent_h128.cu    |    7 +
+ .../sparse/instantiations/v4_persistent_h64.cu     |    8 +
+ .../legacy/sm90/decode/sparse/splitkv_mla.cuh      |  787 +++++++++
+ .../legacy/sm90/decode/sparse/splitkv_mla.h        |   11 +
+ csrc/cuda_kernels/legacy/sm90/helpers.h            |  170 ++
+ .../legacy/sm90/prefill/sparse/config.h            |  147 ++
+ .../prefill/sparse/instantiations/phase1_k512.cu   |   10 +
+ .../sparse/instantiations/phase1_k512_topklen.cu   |   10 +
+ .../prefill/sparse/instantiations/phase1_k576.cu   |    8 +
+ .../sparse/instantiations/phase1_k576_topklen.cu   |    8 +
+ .../legacy/sm90/prefill/sparse/phase1.cuh          |  646 ++++++++
+ .../legacy/sm90/prefill/sparse/phase1.h            |   10 +
+ .../legacy/smxx/decode/combine/combine.cu          |  230 +++
+ .../legacy/smxx/decode/combine/combine.h           |   10 +
+ .../get_decoding_sched_meta.cu                     |  116 ++
+ .../get_decoding_sched_meta.h                      |    9 +
+ csrc/cuda_kernels/legacy/utils.h                   |   39 +
+ .../sm100/prefill/dense/common/utils.hpp           |    1 -
+ .../sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu  |   33 +-
+ .../sm100/prefill/dense/fmha_cutlass_bwd_sm100.cuh |   50 +-
+ .../sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu  |   35 +-
+ .../sm100/prefill/dense/fmha_cutlass_fwd_sm100.cuh |   39 +-
+ csrc/cuda_kernels/sm100/prefill/dense/interface.h  |   20 +-
+ csrc/cuda_kernels/smxx/decode/combine/combine.cu   |   11 +
+ .../sm90/dense_fp8/flash_fwd_mla_fp8_sm90.cu       |   10 +
+ .../sm90/dense_fp8/flash_fwd_mla_kernel.h          |  709 ++++++++
+ .../sm90/dense_fp8/flash_fwd_mla_metadata.cu       |   77 +
+ csrc/extension/sm90/dense_fp8/flash_mla.h          |   85 +
+ csrc/extension/sm90/dense_fp8/fp8_transpose_v.h    |   89 +
+ csrc/extension/sm90/dense_fp8/named_barrier.h      |   21 +
+ csrc/extension/sm90/dense_fp8/pybind.cpp           |  246 +++
+ csrc/extension/sm90/dense_fp8/softmax.h            |  202 +++
+ csrc/extension/sm90/dense_fp8/static_switch.h      |   70 +
+ csrc/extension/sm90/dense_fp8/utils.h              |  279 ++++
+ csrc/extension/torch_api.cpp                       |   47 +
+ csrc/params.h                                      |   95 +-
+ docs/20250422-new-kernel-deep-dive.md              |    2 +-
+ docs/20260930-ascend-prefill-deep-dive-zh.md       |  255 ---
+ docs/20260930-ascend-prefill-deep-dive.md          |  252 ---
+ flash_mla/__init__.py                              |   10 +
+ flash_mla/flash_mla_interface.py                   |  295 ++--
+ flash_mla/fused_norm_rope_attn_rope_cast.py        |   92 +-
+ scripts/generate_instantiations.py                 |   64 -
+ setup.py                                           |  343 ++--
+ tests/__init__.py                                  |    1 -
+ tests/kernelkit/__init__.py                        |    4 +-
+ tests/kernelkit/bench.py                           |  156 +-
+ tests/kernelkit/build.py                           |  117 --
+ tests/kernelkit/compare.py                         |   41 +-
+ tests/kernelkit/generate.py                        |    4 +-
+ tests/kernelkit/utils.py                           |   28 +-
+ tests/lib.py                                       |  256 ++-
+ tests/quant.py                                     |  241 ++-
+ tests/ref.py                                       |   20 +-
+ tests/test-sparse-decode.py                        |  358 ----
+ tests/test_api_registration.py                     |   24 +
+ tests/test_flash_mla_dense_decoding.py             |  254 +++
+ tests/test_flash_mla_sparse_decoding.py            |  406 +++++
+ ...prefill.py => test_flash_mla_sparse_prefill.py} |   91 +-
+ ...t.py => test_fused_norm_rope_attn_rope_cast.py} |   89 +-
+ tests/test_fused_optional_out.py                   |  247 +++
+ tests/test_nvfp4_quant.py                          |   28 +
+ tests/test_output_buffer_api.py                    |   88 +
+ 136 files changed, 18492 insertions(+), 4677 deletions(-)
 ```
 
 </details>
@@ -249,10 +256,6 @@ This kernel fuses Q-norm (only used in V4, not V4.1), Q-RoPE, core attention, O-
 - CUDA 12.8 and above (CUDA 12.9+ is required for SM100 kernels)
 - PyTorch 2.10 and above (the extension is built against libtorch's stable ABI)
 
-For the Huawei platform, which only the DeepSeek V4.1 sparse kernels support (untested in this fork):
-
-- Huawei Ascend 950 NPU, CANN 9.2.0 and above (for the `bisheng` compiler and the Ascend C headers), and `torch_npu`
-
 Support matrix:
 
 | Kernel | GPU Architecture | MLA Mode [1] | Supported Models |
@@ -262,13 +265,10 @@ Support matrix:
 | Dense Prefill | SM100 | MHA | DeepSeek V3 / V3.1 / V3.2 |
 | Sparse Prefill | SM90 & SM100 | MQA | DeepSeek V3.2 / V4 / V4.1 |
 | Fused Norm RoPE Attn RoPE Cast | SM100 | MQA | DeepSeek V4 / V4.1 |
-| Sparse Prefill & Decoding | Ascend 950 | MQA | DeepSeek V4.1 [3] |
 
 [1]: Here "MLA Mode" refers to the mode used for MLA calculation. MQA stands for Multi-Query Attention mode (i.e. `head_dim_k` = 576 (for DeepSeek V3/V3.1/V3.2) or 512 (for DeepSeek V4/V4.1) with `head_dim_v` = 512), while MHA stands for Multi-Head Attention mode (i.e. `head_dim_k` = 192 / 128 with `head_dim_v` = 128). For a detailed explanation of these modes, please refer to the appendix of [DeepSeek V3.2's Paper](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp).
 
 [2] Sparse Decoding for DeepSeek V4.1 is only available on SM100
-
-[3] The Ascend kernels are carried over from upstream unmodified and are not exercised by this fork's CI
 
 ## Installation
 

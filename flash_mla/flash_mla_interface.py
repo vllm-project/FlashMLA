@@ -1,4 +1,3 @@
-import os
 from typing import Optional, Tuple
 import dataclasses
 
@@ -9,11 +8,6 @@ import torch
 # are unchanged. Keep the assignment below unindented and spelled exactly like this:
 # vLLM's cmake rewrites this line when it vendors this file.
 flash_mla_cuda = torch.ops._flashmla_C
-
-# On an Ascend NPU the kernels come from a pybind extension instead, which exposes the same
-# sparse_prefill_fwd / sparse_decode_fwd names. It carries no dense or fused ops.
-if os.path.exists("/dev/davinci_manager"):
-    from flash_mla import npu as flash_mla_cuda
 
 @dataclasses.dataclass
 class FlashMLASchedMeta:

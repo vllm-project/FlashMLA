@@ -8,28 +8,6 @@ from setuptools import setup, find_packages
 THIS_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 
 EXT_NAME_CUDA = "flash_mla._flashmla_C"
-EXT_NAME_ASCEND = "flash_mla.npu"
-
-# The pybind11 API of the Ascend extension, carried over from upstream unchanged. The CUDA
-# extension uses csrc/api/ instead, which is built on libtorch's stable ABI; the NPU stream
-# is not reachable through that ABI, so the two cannot share one set of API sources.
-ASCEND_API_SOURCES = [
-    "csrc/api_ascend/api.cpp",
-    "csrc/api_ascend/sparse_prefill.cpp",
-    "csrc/api_ascend/sparse_decode.cpp",
-    "csrc/api_ascend/dense_fwd.cpp",
-    "csrc/api_ascend/dense_bwd.cpp",
-    "csrc/api_ascend/fused_norm_rope_attn_rope_cast_fwd.cpp",
-]
-
-ASCEND_KERNEL_SOURCES = [
-    "csrc/ascend_kernels/prefill/sparse/instantiations/v41_h64_prefill_nosink.asc",
-    "csrc/ascend_kernels/prefill/sparse/instantiations/v41_h64_prefill_sink.asc",
-    "csrc/ascend_kernels/prefill/sparse/instantiations/v41_h64_decode_nosink.asc",
-    "csrc/ascend_kernels/prefill/sparse/instantiations/v41_h64_decode_sink.asc",
-    "csrc/ascend_kernels/prefill/sparse/instantiations/v41fp4_h64_decode_nosink.asc",
-    "csrc/ascend_kernels/prefill/sparse/instantiations/v41fp4_h64_decode_sink.asc",
-]
 
 CUDA_API_SOURCES = [
     "csrc/api/api.cpp",
@@ -247,97 +225,6 @@ def build_on_cuda_platform():
     return ext_modules, BuildExtension
 
 
-def build_on_ascend_platform():
-    """
-    Carried over from upstream's 2026.09.30 release unchanged. It is not exercised by this fork's
-    CI, which has no NPU.
-    """
-    from torch.utils.cpp_extension import BuildExtension, CppExtension
-
-    import torch_npu
-
-    arch = os.environ.get("ASCEND_NPU_ARCH", "dav-3510")
-    asc_home = os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest")
-    if not os.path.isdir(asc_home):
-        raise RuntimeError(
-            f"Ascend toolkit not found at '{asc_home}'. "
-            "Please set ASCEND_HOME_PATH to the root of your CANN installation "
-            "(e.g. /usr/local/Ascend/cann-9.1.0)."
-        )
-
-    class AscendBuildExtension(BuildExtension):
-        def build_extensions(self):
-            self.compiler.src_extensions += [".asc"]
-            os.environ["CXX"] = "bisheng"
-            os.environ["CC"] = "bisheng"
-            super().build_extensions()
-
-    ext_modules = [
-        CppExtension(
-            name=EXT_NAME_ASCEND,
-            sources=[
-                *ASCEND_API_SOURCES,
-                *ASCEND_KERNEL_SOURCES,
-            ],
-            extra_compile_args={
-                "cxx": [
-                    "-Ofast",
-                    "-std=c++20",
-                    f"--npu-arch={arch}",
-                    "-DFLASH_MLA_IS_BUILD_ON_ASCEND",
-                    "-isystem", str(Path(asc_home) / "aarch64-linux" / "include"),  # `-isystem` suppresses warnings
-                    "-isystem", str(Path(asc_home) / "aarch64-linux" / "asc" / "include"),
-                    "-isystem", str(Path(torch_npu.__file__).parent / "include"),
-                    "-mllvm", "-enable-hiipu-vf-loop-unroll",
-                    "--cce-res-usage",
-                    # Otherwise some `__simd_callee__` are incorrectly marked as "function 'XXX' is not needed and will not be emitted"
-                    "-Wno-unneeded-internal-declaration",
-                    "-Wno-microsoft-template",
-                    "-Wno-deprecated-declarations",
-                    # Disable argument preload at the beginning of kernels to avoid a hardware bug
-                    "-mllvm", "-cce-aicore-dcpreload-args=false",
-                ],
-            },
-            extra_link_args=[
-                str(Path(asc_home) / "aarch64-linux" / "lib64" / "libascendc_runtime.a"),
-            ],
-            include_dirs=[
-                THIS_DIR / "csrc",
-                THIS_DIR / "csrc" / "3rdparty" / "kerutils" / "include",
-            ],
-            libraries=[
-                "torch_npu",
-            ],
-            library_dirs=[
-                str(Path(torch_npu.__file__).parent / "lib"),
-                str(Path(asc_home) / "aarch64-linux" / "lib64"),
-            ],
-        )
-    ]
-
-    return ext_modules, AscendBuildExtension
-
-
-def get_build_target_platform() -> str:
-    """
-    The target platform of the build, "CUDA" or "ASCEND".
-
-    `FLASH_MLA_BUILD_TARGET_PLATFORM` takes precedence. Otherwise the platform is detected
-    without any dependency probing: the Ascend driver exposes `/dev/davinci_manager`,
-    so its absence means CUDA.
-    """
-    overrided_platform = os.environ.get("FLASH_MLA_BUILD_TARGET_PLATFORM")
-    if overrided_platform is not None:
-        available = ["CUDA", "ASCEND"]
-        if overrided_platform not in available:
-            raise ValueError(
-                f"Invalid `FLASH_MLA_BUILD_TARGET_PLATFORM`: {overrided_platform}. "
-                f"Available values are {available}"
-            )
-        return overrided_platform
-    return "ASCEND" if os.path.exists("/dev/davinci_manager") else "CUDA"
-
-
 def get_version() -> str:
     try:
         cmd = ['git', 'rev-parse', '--short', 'HEAD']
@@ -350,15 +237,7 @@ def get_version() -> str:
 
 
 def main():
-    current_platform = get_build_target_platform()
-    print(f"Build target: {current_platform}")
-
-    if current_platform == "CUDA":
-        ext_modules, build_ext = build_on_cuda_platform()
-        options = {"bdist_wheel": {"py_limited_api": "cp310"}}
-    else:
-        ext_modules, build_ext = build_on_ascend_platform()
-        options = {}
+    ext_modules, build_ext = build_on_cuda_platform()
 
     setup(
         name="flash_mla",
@@ -366,7 +245,7 @@ def main():
         packages=find_packages(include=['flash_mla']),
         ext_modules=ext_modules,
         cmdclass={"build_ext": build_ext},
-        options=options,
+        options={"bdist_wheel": {"py_limited_api": "cp310"}},
     )
 
 
