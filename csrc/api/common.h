@@ -21,7 +21,7 @@
 
 #include <cutlass/bfloat16.h>
 
-#include "kernels/kv_cache_format.h"
+#include "cuda_kernels/kv_cache_format.h"
 
 using torch::stable::Tensor;
 using torch::headeronly::ScalarType;

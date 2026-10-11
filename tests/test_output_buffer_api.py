@@ -10,7 +10,8 @@ class _FakeOps:
 
     def sparse_decode_fwd(self, *args):
         self.decode_args = args
-        return args[-1], torch.empty(0), None, None
+        # (..., out_, enable_batch_invariant)
+        return args[-2], torch.empty(0), None, None
 
     def dense_decode_fwd(self, *args):
         self.decode_args = args
@@ -42,7 +43,7 @@ def test_sparse_decode_forwards_optional_output(monkeypatch):
         out=out,
     )
 
-    assert fake_ops.decode_args[-1] is out
+    assert fake_ops.decode_args[-2] is out
     assert result is out
 
 

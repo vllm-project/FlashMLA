@@ -5,7 +5,7 @@
 #include "interfaces.h"
 
 STABLE_TORCH_LIBRARY(_flashmla_C, m) {
-    m.def("sparse_decode_fwd(Tensor q, Tensor kv, Tensor indices, Tensor? topk_length, Tensor? attn_sink, Tensor(a)? tile_scheduler_metadata, Tensor(b)? num_splits, Tensor? extra_kv, Tensor? extra_indices, Tensor? extra_topk_length, int d_v, float sm_scale, Tensor(c!)? out_) -> (Tensor(c!), Tensor, Tensor(a)?, Tensor(b)?)");
+    m.def("sparse_decode_fwd(Tensor q, Tensor kv, Tensor indices, Tensor? topk_length, Tensor? attn_sink, Tensor(a)? tile_scheduler_metadata, Tensor(b)? num_splits, Tensor? extra_kv, Tensor? extra_indices, Tensor? extra_topk_length, int d_v, float sm_scale, Tensor(c!)? out_=None, bool enable_batch_invariant=False) -> (Tensor(c!), Tensor, Tensor(a)?, Tensor(b)?)");
     m.def("dense_decode_fwd(Tensor q, Tensor kcache, int head_size_v, Tensor seqlens_k, Tensor block_table, float softmax_scale, bool is_causal, Tensor(a)? tile_scheduler_metadata, Tensor(b)? num_splits, Tensor(c!)? out_) -> (Tensor(c!), Tensor, Tensor(a)?, Tensor(b)?)");
     m.def("sparse_prefill_fwd(Tensor q, Tensor kv, Tensor indices, float sm_scale, int d_v, Tensor? attn_sink, Tensor? topk_length, Tensor(a!)? out_) -> Tensor[]");
     m.def("dense_prefill_fwd(Tensor workspace_buffer, Tensor q, Tensor k, Tensor v, Tensor cumulative_seqlen_q, Tensor cumulative_seqlen_kv, Tensor(a!) o, Tensor(b!) lse, int mask_mode_code, float softmax_scale, int max_seqlen_q, int max_seqlen_kv, bool is_varlen) -> ()");

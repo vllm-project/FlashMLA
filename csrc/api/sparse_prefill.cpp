@@ -1,11 +1,14 @@
 #include "common.h"
 
-#include "kernels/params.h"
+#include "params.h"
 
-#include "kernels/sm90/prefill/sparse/phase1.h"
-#include "kernels/sm100/prefill/sparse/fwd/head128/phase1.h"
-#include "kernels/sm100/prefill/sparse/fwd/head64/phase1.h"
-#include "kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
+#include "cuda_kernels/sm100/prefill/sparse/fwd/head128/phase1.h"
+#include "cuda_kernels/sm100/prefill/sparse/fwd/head64/phase1.h"
+#include "cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
+
+#include "cuda_kernels/legacy/sm90/prefill/sparse/phase1.h"
+#include "cuda_kernels/legacy/sm100/prefill/sparse/fwd/head128/phase1.h"
+#include "cuda_kernels/legacy/sm100/prefill/sparse/fwd/head64/phase1.h"
 
 enum class FwdFeatures : int {
     HEAD_64,
@@ -37,27 +40,29 @@ protected:
     void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
         DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
             DISPATCH_BOOLEAN_FLAG(params.topk_length != nullptr, HAVE_TOPK_LENGTH, [&]() {
-                sm90::prefill::sparse_fwd::run_fwd_phase1_kernel<HEAD_DIM_QK, HAVE_TOPK_LENGTH>(params);
+                legacy::sm90::prefill::sparse_fwd::run_fwd_phase1_kernel<HEAD_DIM_QK, HAVE_TOPK_LENGTH>(params);
             });
         });
     }
 };
 
+// =============================================================================
+// d_qk = 512 (DeepSeek V4 / V4.1). The KV of a prefill is bf16, so these kernels
+// do not depend on the quantized KV cache format and serve both models.
+// =============================================================================
+
 class Fwd_Sm100_Head64_Impl : public FwdImplBase {
     DECLARE_SUPPORTED_FEATURES(
         FwdFeatures::HEAD_64,
         FwdFeatures::HEAD_DIM_512,
-        FwdFeatures::HEAD_DIM_576,
         FwdFeatures::ATTN_SINK,
         FwdFeatures::TOPK_LENGTH
     )
 
 protected:
     void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
-        DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
-            STD_TORCH_CHECK(params.h_q == 64, "Unsupported h_q: ", params.h_q);
-            sm100::prefill::sparse_fwd::head64::run_sparse_fwd_phase1_kernel<SparseAttnFwdMode::Prefill, HEAD_DIM_QK>(params);
-        });
+        STD_TORCH_CHECK(params.h_q == 64, "Unsupported h_q: ", params.h_q);
+        sm100::prefill::sparse_fwd::head64::run_sparse_fwd_phase1_kernel(params);
     }
 };
 
@@ -65,16 +70,13 @@ class Fwd_Sm100_Head128_Impl : public FwdImplBase {
     DECLARE_SUPPORTED_FEATURES(
         FwdFeatures::HEAD_128,
         FwdFeatures::HEAD_DIM_512,
-        FwdFeatures::HEAD_DIM_576,
         FwdFeatures::ATTN_SINK,
         FwdFeatures::TOPK_LENGTH
     )
 
 protected:
     void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
-        DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
-            sm100::prefill::sparse_fwd::head128::run_sparse_fwd_phase1_kernel<HEAD_DIM_QK>(params);
-        });
+        sm100::prefill::sparse_fwd::head128::run_sparse_fwd_phase1_kernel(params);
     }
 };
 
@@ -88,7 +90,41 @@ class Fwd_Sm100_Head128_Small_TopK_Impl : public FwdImplBase {
 
 protected:
     void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
-        sm100::prefill::sparse_fwd_for_small_topk::head128::run_sparse_fwd_for_small_topk_phase1_kernel<SparseAttnFwdMode::Prefill, 512>(params);
+        sm100::prefill::sparse_fwd_for_small_topk::head128::run_sparse_fwd_for_small_topk_phase1_kernel<SparseAttnFwdMode::Prefill, ModelType::V41, ModelType::V41>(params);
+    }
+};
+
+// =============================================================================
+// d_qk = 576 (DeepSeek V3.2). Upstream dropped this head dimension in the
+// 2026.09.30 release, so these dispatch to the kernels kept under legacy/.
+// =============================================================================
+
+class Fwd_Sm100_Head64_HeadDim576_Impl : public FwdImplBase {
+    DECLARE_SUPPORTED_FEATURES(
+        FwdFeatures::HEAD_64,
+        FwdFeatures::HEAD_DIM_576,
+        FwdFeatures::ATTN_SINK,
+        FwdFeatures::TOPK_LENGTH
+    )
+
+protected:
+    void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
+        STD_TORCH_CHECK(params.h_q == 64, "Unsupported h_q: ", params.h_q);
+        legacy::sm100::prefill::sparse_fwd::head64::run_sparse_fwd_phase1_kernel<SparseAttnFwdMode::Prefill, 576>(params);
+    }
+};
+
+class Fwd_Sm100_Head128_HeadDim576_Impl : public FwdImplBase {
+    DECLARE_SUPPORTED_FEATURES(
+        FwdFeatures::HEAD_128,
+        FwdFeatures::HEAD_DIM_576,
+        FwdFeatures::ATTN_SINK,
+        FwdFeatures::TOPK_LENGTH
+    )
+
+protected:
+    void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
+        legacy::sm100::prefill::sparse_fwd::head128::run_sparse_fwd_phase1_kernel<576>(params);
     }
 };
 
@@ -103,7 +139,7 @@ std::vector<Tensor> sparse_attn_prefill_interface(
     const std::optional<Tensor> &out_
 ) {
     using bf16 = cutlass::bfloat16_t;
-    
+
     Arch arch = Arch();
     bool is_sm90a = arch.is_sm90a();
     bool is_sm100f = arch.is_sm100f();
@@ -125,31 +161,31 @@ std::vector<Tensor> sparse_attn_prefill_interface(
 
     STD_TORCH_CHECK(d_qk == 576 || d_qk == 512, "Invalid d_qk: ", d_qk);
     STD_TORCH_CHECK(d_v == 512, "Invalid d_v", d_v);
-    
+
     KU_CHECK_DEVICE(q);
     KU_CHECK_DEVICE(kv);
     KU_CHECK_DEVICE(indices);
     KU_CHECK_DEVICE(attn_sink);
     KU_CHECK_DEVICE(topk_length);
-    
+
     KU_CHECK_DTYPE(q, ScalarType::BFloat16);
     KU_CHECK_DTYPE(kv, ScalarType::BFloat16);
     KU_CHECK_DTYPE(indices, ScalarType::Int);
     KU_CHECK_DTYPE(attn_sink, ScalarType::Float);
     KU_CHECK_DTYPE(topk_length, ScalarType::Int);
-    
+
     KU_CHECK_SHAPE(q, s_q, h_q, d_qk);
     KU_CHECK_SHAPE(kv, s_kv, h_kv, d_qk);
     KU_CHECK_SHAPE(indices, s_q, h_kv, topk);
     KU_CHECK_SHAPE(attn_sink, h_q);
     KU_CHECK_SHAPE(topk_length, s_q);
-    
+
     KU_CHECK_LAST_DIM_CONTIGUOUS(q);
     KU_CHECK_LAST_DIM_CONTIGUOUS(kv);
     KU_CHECK_LAST_DIM_CONTIGUOUS(indices);
     KU_CHECK_LAST_DIM_CONTIGUOUS(attn_sink);
     KU_CHECK_LAST_DIM_CONTIGUOUS(topk_length);
-    
+
     // Allocate results and buffers
     torch::stable::accelerator::DeviceGuard device_guard(q.get_device_index());
 
@@ -187,6 +223,7 @@ std::vector<Tensor> sparse_attn_prefill_interface(
         (float*)max_logits.data_ptr(),
         (float*)lse.data_ptr(),
 
+        SparseAttnFwdMode::Prefill,
         arch.num_sms,
         get_current_cuda_stream(q)
     };
@@ -218,22 +255,33 @@ std::vector<Tensor> sparse_attn_prefill_interface(
         fwd_impl.run(params, required_features);
     } else if (is_sm100f) {
         if (h_q == 64) {
-            Fwd_Sm100_Head64_Impl fwd_impl;
-            fwd_impl.run(params, required_features);
-        } else if (h_q == 128) {
-            Fwd_Sm100_Head128_Small_TopK_Impl small_topk_impl;
-            Fwd_Sm100_Head128_Impl regular_impl;
-            bool use_small_topk_impl = false;
-            if (
-                (topk <= 1280 && small_topk_impl.check_if_all_features_are_supported(required_features)) ||
-                !regular_impl.check_if_all_features_are_supported(required_features)
-            ) {
-                use_small_topk_impl = true;
-            }
-            if (use_small_topk_impl) {
-                small_topk_impl.run(params, required_features);
+            if (d_qk == 576) {
+                Fwd_Sm100_Head64_HeadDim576_Impl fwd_impl;
+                fwd_impl.run(params, required_features);
             } else {
-                regular_impl.run(params, required_features);
+                Fwd_Sm100_Head64_Impl fwd_impl;
+                fwd_impl.run(params, required_features);
+            }
+        } else if (h_q == 128) {
+            if (d_qk == 576) {
+                // The small-topk kernel is only instantiated for d_qk = 512
+                Fwd_Sm100_Head128_HeadDim576_Impl fwd_impl;
+                fwd_impl.run(params, required_features);
+            } else {
+                Fwd_Sm100_Head128_Small_TopK_Impl small_topk_impl;
+                Fwd_Sm100_Head128_Impl regular_impl;
+                bool use_small_topk_impl = false;
+                if (
+                    (topk <= 1280 && small_topk_impl.check_if_all_features_are_supported(required_features)) ||
+                    !regular_impl.check_if_all_features_are_supported(required_features)
+                ) {
+                    use_small_topk_impl = true;
+                }
+                if (use_small_topk_impl) {
+                    small_topk_impl.run(params, required_features);
+                } else {
+                    regular_impl.run(params, required_features);
+                }
             }
         } else {
             STD_TORCH_CHECK(false, "Unsupported h_q: ", h_q);

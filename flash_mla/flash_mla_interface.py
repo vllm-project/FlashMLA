@@ -5,7 +5,8 @@ import torch
 
 # torch.ops._flashmla_C is the op namespace registered by the compiled extension
 # (loaded in __init__.py). Alias it to the old module name so the call sites below
-# are unchanged.
+# are unchanged. Keep the assignment below unindented and spelled exactly like this:
+# vLLM's cmake rewrites this line when it vendors this file.
 flash_mla_cuda = torch.ops._flashmla_C
 
 @dataclasses.dataclass
@@ -28,6 +29,8 @@ class FlashMLASchedMeta:
 
         extra_page_block_size: Optional[int]
         extra_topk: Optional[int]
+
+        enable_batch_invariant: bool
 
     have_initialized: bool = False
 
@@ -71,6 +74,7 @@ def flash_mla_with_kvcache(
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    enable_batch_invariant: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -92,6 +96,10 @@ def flash_mla_with_kvcache(
         attn_sink: Optional[torch.Tensor], (num_heads_q, ), torch.float32. If presented, the final output will be scaled by exp(lse) / (exp(lse) + exp(attn_sink)). Have no affect on the returned softmax_lse. +inf will cause the result to become 0.
         extra_k_cache and extra_indices_in_kvcache: If provided, will attend to these extra tokens in addition to those in k_cache and indices_in_kvcache. Their format requirements are the same as k_cache and indices_in_kvcache respectively.
         topk_length/extra_topk_length: (batch_size, ), torch.int32. If provided, only the leftmost topk_length indices will be processed. Useful when the actual topk for different queries are different so that we can save some computation, compared to masking.
+        enable_batch_invariant: bool. If True, split-KV decoding is disabled so that the result does not
+                depend on how the batch is partitioned. It must keep the same value across every reuse of
+                a given sched_meta. The SM90 kernels and the NVFP4 cache have no unsplit path and reject
+                it.
         out: Optional pre-allocated output tensor with shape (batch_size, seq_len_q, num_heads_q, head_dim_v), same dtype as q, and contiguous. If provided, the result will be written into this buffer to avoid allocation. For dense attention, only num_heads_k == 1 (MLA) is supported.
     
     For DeepSeek V3, DeepSeek V3.1, and DeepSeek V3.2:
@@ -110,10 +118,17 @@ def flash_mla_with_kvcache(
     For DeepSeek V4 and DeepSeek V4.1:
         head_dim should be 512 while head_dim_v should be 512.
         In FP8+sparse mode, the format is detected from the last dimension of `k_cache` (i.e. the bytes per token): 584 (V4), 528 (V4.1) or 288 (V4.1 with an fp4 extra cache).
-        In all three, a page block stores `page_block_size` data rows first and `page_block_size` scale rows afterwards, so the scale factors are not interleaved into the data rows:
+
+        BREAKING CHANGE: the two V4.1 layouts are interleaved as of the 2026.09.30 upstream release.
+        Each token now stores its raw data followed immediately by its own scales, instead of a page
+        block holding all of its data rows first and all of its scale rows afterwards. The bytes per
+        token are unchanged, so a cache written in the old layout is NOT rejected, it is misread.
+            - V4.1 (528 Bytes per token): 512 float8_e4m3 values (the 64 RoPE dimensions are quantized as well, so there is no bfloat16 part), then 16 Bytes of float8_e8m0 scales, each covering 32 consecutive float8_e4m3 values.
+            - V4.1 fp4 (288 Bytes per token): only valid for `extra_k_cache`, and only when `k_cache` is in the V4.1 format; 256 Bytes containing 512 e2m1 values (2 values per byte, the even-indexed one in the low nibble), then 32 Bytes of float8_e4m3 scales, each covering 16 consecutive e2m1 values.
+
+        V4 keeps the separated layout, where a page block stores `page_block_size` data rows first and
+        `page_block_size` scale rows afterwards:
             - V4 (584 Bytes per token): the data row is 448 float8_e4m3 NoPE values followed by 64 bfloat16 RoPE values (not quantized); the scale row is 8 Bytes, of which the first 7 are float8_e8m0 scales (the 8th byte is padding), each covering 64 consecutive float8_e4m3 values of the NoPE part.
-            - V4.1 (528 Bytes per token): the data row is 512 float8_e4m3 values (the 64 RoPE dimensions are quantized as well, so there is no bfloat16 part); the scale row is 16 Bytes of float8_e8m0 scales, each covering 32 consecutive float8_e4m3 values.
-            - V4.1 fp4 (288 Bytes per token): only valid for `extra_k_cache`, and only when `k_cache` is in the V4.1 format; the data row is 256 Bytes containing 512 e2m1 values (2 values per byte, the even-indexed one in the low nibble), and the scale row is 32 Bytes of float8_e4m3 scales, each covering 16 consecutive e2m1 values.
         See tests/quant.py for quantization and dequantization details.
 
     Return:
@@ -151,6 +166,8 @@ def flash_mla_with_kvcache(
 
             extra_k_page_block_size,
             extra_topk,
+
+            enable_batch_invariant,
         )
     else:
         # Check whether the input arguments are consistent with sched_meta
@@ -166,6 +183,7 @@ def flash_mla_with_kvcache(
         assert sched_meta.config.topk == topk, "sched_meta.config.topk must be equal to the last dim of indices_in_kvcache." + helper_msg
         assert sched_meta.config.extra_page_block_size == extra_k_page_block_size, "sched_meta.config.extra_page_block_size must be equal to the page_block_size of extra_k_cache." + helper_msg
         assert sched_meta.config.extra_topk == extra_topk, "sched_meta.config.extra_topk must be equal to the last dim of extra_indices_in_kvcache." + helper_msg
+        assert sched_meta.config.enable_batch_invariant == enable_batch_invariant, "sched_meta.config.enable_batch_invariant must be equal to enable_batch_invariant." + helper_msg
 
     if topk is not None:
         # Sparse attention
@@ -175,7 +193,7 @@ def flash_mla_with_kvcache(
             q, k_cache, indices_in_kvcache, topk_length, attn_sink,
             sched_meta.tile_scheduler_metadata, sched_meta.num_splits,
             extra_k_cache, extra_indices_in_kvcache, extra_topk_length,
-            head_dim_v, softmax_scale, out
+            head_dim_v, softmax_scale, out, enable_batch_invariant
         )
     else:
         # Dense attention

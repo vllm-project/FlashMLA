@@ -1,13 +1,18 @@
 #include "common.h"
 
-#include "kernels/params.h"
+#include "params.h"
 
-#include "kernels/sm90/decode/sparse/splitkv_mla.h"
-#include "kernels/sm100/decode/sparse/head64/kernel.h"
-#include "kernels/sm100/decode/sparse/nvfp4_head64/kernel.h"
-#include "kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
-#include "kernels/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
-#include "kernels/smxx/decode/combine/combine.h"
+// Current (DeepSeek V4.1) kernels and the shared decoding helpers
+#include "cuda_kernels/sm100/decode/sparse/head64/kernel.h"
+#include "cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
+#include "cuda_kernels/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
+#include "cuda_kernels/smxx/decode/combine/combine.h"
+
+// Kernels for the KV cache formats and the architecture that upstream dropped in 2026.09.30
+#include "cuda_kernels/legacy/sm90/decode/sparse/splitkv_mla.h"
+#include "cuda_kernels/legacy/sm100/decode/sparse/head64/kernel.h"
+#include "cuda_kernels/legacy/sm100/decode/sparse/nvfp4_head64/kernel.h"
+#include "cuda_kernels/legacy/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
 
 template<bool ENABLE_SPLIT_KV>
 static constexpr SparseAttnFwdMode get_decode_fwd_mode() {
@@ -35,7 +40,11 @@ enum class DecodeFeatures : int {
     ATTN_SINK,
     TOPK_LENGTH,
     EXTRA_KVCACHE,
-    EXTRA_TOPK_LENGTH
+    EXTRA_TOPK_LENGTH,
+
+    // Results must not depend on how the batch is partitioned, which rules out split-KV.
+    // The kernels that have no unsplit path do not declare it.
+    BATCH_INVARIANT
 };
 
 struct DecodeImplMeta {
@@ -52,6 +61,93 @@ public:
     virtual DecodeImplMeta get_meta(int h_q, int s_q) = 0;
 };
 
+// =============================================================================
+// Current kernels: DeepSeek V4.1, where each token of the KV cache carries its
+// own scales. SM100 only.
+// =============================================================================
+
+class Decode_Sm100_Head64_Impl : public DecodeImplBase {
+    DECLARE_SUPPORTED_FEATURES(
+        DecodeFeatures::HEAD_64,
+        DecodeFeatures::HEAD_DIM_512,
+        DecodeFeatures::V41_KVCACHE_FORMAT,
+        DecodeFeatures::V41_FP4_KVCACHE_FORMAT,
+        DecodeFeatures::ATTN_SINK,
+        DecodeFeatures::TOPK_LENGTH,
+        DecodeFeatures::EXTRA_KVCACHE,
+        DecodeFeatures::EXTRA_TOPK_LENGTH,
+        DecodeFeatures::BATCH_INVARIANT
+    )
+    using SupportedKVFormats = KVFormatPairs<KVFormatPair<ModelType::V41>,
+                                             KVFormatPair<ModelType::V41, ModelType::V41_FP4>>;
+
+public:
+    DecodeImplMeta get_meta(int h_q, int s_q) override {
+        Arch arch = Arch();
+        return {
+            std::max(arch.num_sms / s_q, 1),
+            5,
+            64
+        };
+    }
+
+protected:
+    void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
+        dispatch_kv_formats(SupportedKVFormats{}, params.model_type, params.extra_model_type, [&]<ModelType MODEL_TYPE, ModelType EXTRA_MODEL_TYPE>() {
+            DISPATCH_BOOLEAN_FLAG(params.enable_split_kv, ENABLE_SPLIT_KV, ([&]() {
+                STD_TORCH_CHECK(params.h_q == 64, "Unsupported h_q: ", params.h_q);
+                using sm100::decode::sparse::head64::Config;
+                sm100::decode::sparse::head64::run_flash_splitkv_mla_fp8_sparse_kernel<Config{MODEL_TYPE, EXTRA_MODEL_TYPE, ENABLE_SPLIT_KV}>(params);
+            }));
+        });
+    }
+};
+
+class Decode_Sm100_Head128_Impl : public DecodeImplBase {
+    DECLARE_SUPPORTED_FEATURES(
+        DecodeFeatures::HEAD_128,
+        DecodeFeatures::HEAD_DIM_512,
+        DecodeFeatures::V41_KVCACHE_FORMAT,
+        DecodeFeatures::V41_FP4_KVCACHE_FORMAT,
+        DecodeFeatures::ATTN_SINK,
+        DecodeFeatures::TOPK_LENGTH,
+        DecodeFeatures::EXTRA_KVCACHE,
+        DecodeFeatures::EXTRA_TOPK_LENGTH,
+        DecodeFeatures::BATCH_INVARIANT
+    )
+    using SupportedKVFormats = KVFormatPairs<KVFormatPair<ModelType::V41>,
+                                             KVFormatPair<ModelType::V41, ModelType::V41_FP4>>;
+
+public:
+    DecodeImplMeta get_meta(int h_q, int s_q) override {
+        Arch arch = Arch();
+        return {
+            std::max(arch.num_sms / s_q / 2, 1),
+            3,  // TODO Tune
+            64
+        };
+    }
+
+protected:
+    void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
+        SparseAttnDecodeParams hotfixed_params = params;
+        if (params.s_q == 1 && params.b > 1) {
+            // For this kernel, we require `params.stride_q_b % params.stride_q_s_q == 0`, since we "squeeze" the batch size dimention and the sequence length q dimension together during tensormap creation
+            hotfixed_params.stride_q_s_q = hotfixed_params.stride_q_b;
+        }
+        dispatch_kv_formats(SupportedKVFormats{}, params.model_type, params.extra_model_type, [&]<ModelType MODEL_TYPE, ModelType EXTRA_MODEL_TYPE>() {
+            DISPATCH_BOOLEAN_FLAG(params.enable_split_kv, ENABLE_SPLIT_KV, ([&]() {
+                sm100::prefill::sparse_fwd_for_small_topk::head128::run_sparse_fwd_for_small_topk_phase1_kernel<get_decode_fwd_mode<ENABLE_SPLIT_KV>(), MODEL_TYPE, EXTRA_MODEL_TYPE>(hotfixed_params);
+            }));
+        });
+    }
+};
+
+// =============================================================================
+// Kernels kept from before the 2026.09.30 release: DeepSeek V3.2 / V4 (whose page
+// blocks keep the scales in a region of their own) and everything on SM90.
+// =============================================================================
+
 class Decode_Sm90_Impl : public DecodeImplBase {
     DECLARE_SUPPORTED_FEATURES(
         DecodeFeatures::HEAD_64,
@@ -64,6 +160,7 @@ class Decode_Sm90_Impl : public DecodeImplBase {
         DecodeFeatures::TOPK_LENGTH,
         DecodeFeatures::EXTRA_KVCACHE,
         DecodeFeatures::EXTRA_TOPK_LENGTH
+        // No BATCH_INVARIANT: this kernel always splits the KV
     )
 
 public:
@@ -80,29 +177,26 @@ protected:
     void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
         DISPATCH_MODEL_TYPE(params.model_type, MODEL_TYPE, [&]() {
             DISPATCH_NUM_HEADS(params.h_q, NUM_HEADS, [&]() {
-                sm90::decode::sparse::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE, NUM_HEADS>(params);
+                legacy::sm90::decode::sparse::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE, NUM_HEADS>(params);
             });
         });
     }
 };
 
-class Decode_Sm100_Head64_Impl : public DecodeImplBase {
+class Decode_Sm100_Head64_Legacy_Impl : public DecodeImplBase {
     DECLARE_SUPPORTED_FEATURES(
         DecodeFeatures::HEAD_64,
         DecodeFeatures::HEAD_DIM_512,
         DecodeFeatures::HEAD_DIM_576,
         DecodeFeatures::V32_KVCACHE_FORMAT,
         DecodeFeatures::V4_KVCACHE_FORMAT,
-        DecodeFeatures::V41_KVCACHE_FORMAT,
-        DecodeFeatures::V41_FP4_KVCACHE_FORMAT,
-        DecodeFeatures::NVFP4_FP8ROPE_KVCACHE_FORMAT,
         DecodeFeatures::ATTN_SINK,
         DecodeFeatures::TOPK_LENGTH,
         DecodeFeatures::EXTRA_KVCACHE,
-        DecodeFeatures::EXTRA_TOPK_LENGTH
+        DecodeFeatures::EXTRA_TOPK_LENGTH,
+        DecodeFeatures::BATCH_INVARIANT
     )
-    using SupportedKVFormats = KVFormatPairs<KVFormatPair<ModelType::V32>, KVFormatPair<ModelType::V4>, KVFormatPair<ModelType::V41>,
-                                             KVFormatPair<ModelType::V41, ModelType::V41_FP4>>;
+    using SupportedKVFormats = KVFormatPairs<KVFormatPair<ModelType::V32>, KVFormatPair<ModelType::V4>>;
 
 public:
     DecodeImplMeta get_meta(int h_q, int s_q) override {
@@ -116,27 +210,19 @@ public:
 
 protected:
     void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
-        if (params.model_type == ModelType::V32_NVFP4_FP8ROPE) {
-            STD_TORCH_CHECK(params.extra_model_type == ModelType::V32_NVFP4_FP8ROPE,
-                            "NVFP4 does not support a mixed extra KV-cache format");
-            STD_TORCH_CHECK(params.enable_split_kv, "NVFP4 requires split-KV scheduling");
-            sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32_NVFP4_FP8ROPE>(params);
-            return;
-        }
         dispatch_kv_formats(SupportedKVFormats{}, params.model_type, params.extra_model_type, [&]<ModelType MODEL_TYPE, ModelType EXTRA_MODEL_TYPE>() {
             DISPATCH_BOOLEAN_FLAG(params.enable_split_kv, ENABLE_SPLIT_KV, ([&]() {
                 STD_TORCH_CHECK(params.h_q == 64, "Unsupported h_q: ", params.h_q);
-                using sm100::decode::sparse::head64::Config;
-                sm100::decode::sparse::head64::run_flash_splitkv_mla_fp8_sparse_kernel<Config{MODEL_TYPE, EXTRA_MODEL_TYPE, ENABLE_SPLIT_KV}>(params);
+                using legacy::sm100::decode::sparse::head64::Config;
+                legacy::sm100::decode::sparse::head64::run_flash_splitkv_mla_fp8_sparse_kernel<Config{MODEL_TYPE, EXTRA_MODEL_TYPE, ENABLE_SPLIT_KV}>(params);
             }));
         });
     }
 };
 
-
-// An implementation that calls the head64 kernel twice to process head128
-// Necessary for running V3.2 shape (i.e. h = 128, d_qk = 576) on SM100f
-class Decode_Sm100_Head64x2_Impl : public DecodeImplBase {
+// Calls the head64 kernel twice to cover head128, which is how the V3.2 shape
+// (h_q = 128, d_qk = 576) and the NVFP4 cache run on SM100f.
+class Decode_Sm100_Head64x2_Legacy_Impl : public DecodeImplBase {
     DECLARE_SUPPORTED_FEATURES(
         DecodeFeatures::HEAD_128,
         DecodeFeatures::HEAD_DIM_512,
@@ -148,6 +234,7 @@ class Decode_Sm100_Head64x2_Impl : public DecodeImplBase {
         DecodeFeatures::TOPK_LENGTH,
         DecodeFeatures::EXTRA_KVCACHE,
         DecodeFeatures::EXTRA_TOPK_LENGTH
+        // No BATCH_INVARIANT: the NVFP4 kernel it also serves always splits the KV
     )
     using SupportedKVFormats = KVFormatPairs<KVFormatPair<ModelType::V32>, KVFormatPair<ModelType::V4>>;
 
@@ -178,7 +265,7 @@ protected:
                 cur_params.lse_accum += start_head_idx;
                 cur_params.o_accum += start_head_idx * params.stride_o_accum_h_q;
                 cur_params.h_q = 64;
-                sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32_NVFP4_FP8ROPE>(cur_params);
+                legacy::sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32_NVFP4_FP8ROPE>(cur_params);
             }
             return;
         }
@@ -197,29 +284,58 @@ protected:
                         cur_params.o_accum += start_head_idx * params.stride_o_accum_h_q;
                     }
                     cur_params.h_q = 64;
-                    using sm100::decode::sparse::head64::Config;
-                    sm100::decode::sparse::head64::run_flash_splitkv_mla_fp8_sparse_kernel<Config{MODEL_TYPE, EXTRA_MODEL_TYPE, ENABLE_SPLIT_KV}>(cur_params);
+                    using legacy::sm100::decode::sparse::head64::Config;
+                    legacy::sm100::decode::sparse::head64::run_flash_splitkv_mla_fp8_sparse_kernel<Config{MODEL_TYPE, EXTRA_MODEL_TYPE, ENABLE_SPLIT_KV}>(cur_params);
                 }
             }));
         });
     }
 };
 
-
-class Decode_Sm100_Head128_Impl : public DecodeImplBase {
+// The NVFP4 cache is head64-only on its own; head128 goes through the x2 impl above
+class Decode_Sm100_Head64_Nvfp4_Impl : public DecodeImplBase {
     DECLARE_SUPPORTED_FEATURES(
-        DecodeFeatures::HEAD_128,
-        DecodeFeatures::HEAD_DIM_512,
-        DecodeFeatures::V4_KVCACHE_FORMAT,
-        DecodeFeatures::V41_KVCACHE_FORMAT,
-        DecodeFeatures::V41_FP4_KVCACHE_FORMAT,
+        DecodeFeatures::HEAD_64,
+        DecodeFeatures::HEAD_DIM_576,
+        DecodeFeatures::NVFP4_FP8ROPE_KVCACHE_FORMAT,
         DecodeFeatures::ATTN_SINK,
         DecodeFeatures::TOPK_LENGTH,
         DecodeFeatures::EXTRA_KVCACHE,
         DecodeFeatures::EXTRA_TOPK_LENGTH
+        // No BATCH_INVARIANT: this kernel always splits the KV
     )
-    using SupportedKVFormats = KVFormatPairs<KVFormatPair<ModelType::V4>, KVFormatPair<ModelType::V41>,
-                                             KVFormatPair<ModelType::V41, ModelType::V41_FP4>>;
+
+public:
+    DecodeImplMeta get_meta(int h_q, int s_q) override {
+        Arch arch = Arch();
+        return {
+            std::max(arch.num_sms / s_q, 1),
+            5,
+            64
+        };
+    }
+
+protected:
+    void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
+        STD_TORCH_CHECK(params.extra_model_type == ModelType::V32_NVFP4_FP8ROPE,
+                        "NVFP4 does not support a mixed extra KV-cache format");
+        STD_TORCH_CHECK(params.enable_split_kv, "NVFP4 requires split-KV scheduling");
+        legacy::sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32_NVFP4_FP8ROPE>(params);
+    }
+};
+
+class Decode_Sm100_Head128_Legacy_Impl : public DecodeImplBase {
+    DECLARE_SUPPORTED_FEATURES(
+        DecodeFeatures::HEAD_128,
+        DecodeFeatures::HEAD_DIM_512,
+        DecodeFeatures::V4_KVCACHE_FORMAT,
+        DecodeFeatures::ATTN_SINK,
+        DecodeFeatures::TOPK_LENGTH,
+        DecodeFeatures::EXTRA_KVCACHE,
+        DecodeFeatures::EXTRA_TOPK_LENGTH,
+        DecodeFeatures::BATCH_INVARIANT
+    )
+    using SupportedKVFormats = KVFormatPairs<KVFormatPair<ModelType::V4>>;
 
 public:
     DecodeImplMeta get_meta(int h_q, int s_q) override {
@@ -240,7 +356,7 @@ protected:
         }
         dispatch_kv_formats(SupportedKVFormats{}, params.model_type, params.extra_model_type, [&]<ModelType MODEL_TYPE, ModelType EXTRA_MODEL_TYPE>() {
             DISPATCH_BOOLEAN_FLAG(params.enable_split_kv, ENABLE_SPLIT_KV, ([&]() {
-                sm100::prefill::sparse_fwd_for_small_topk::head128::run_sparse_fwd_for_small_topk_phase1_kernel<get_decode_fwd_mode<ENABLE_SPLIT_KV>(), 512, MODEL_TYPE, EXTRA_MODEL_TYPE>(hotfixed_params);
+                legacy::sm100::prefill::sparse_fwd_for_small_topk::head128::run_sparse_fwd_for_small_topk_phase1_kernel<get_decode_fwd_mode<ENABLE_SPLIT_KV>(), 512, MODEL_TYPE, EXTRA_MODEL_TYPE>(hotfixed_params);
             }));
         });
     }
@@ -260,7 +376,8 @@ sparse_attn_decode_interface(
     const std::optional<Tensor> &extra_topk_length,
     int64_t d_v,
     double sm_scale,
-    const std::optional<Tensor> &out_
+    const std::optional<Tensor> &out_,
+    bool enable_batch_invariant
 ) {
     using bf16 = cutlass::bfloat16_t;
 
@@ -293,9 +410,6 @@ sparse_attn_decode_interface(
     if (extra_indices.has_value()) {
         extra_topk = extra_indices->size(-1);
     }
-
-    // Split-KV only pays off when a request has enough work. The sm90 kernel always splits.
-    bool enable_split_kv = arch.is_sm90a() || !(topk + extra_topk <= 640);
 
     // metadata sanity check
     STD_TORCH_CHECK(b > 0);
@@ -338,7 +452,7 @@ sparse_attn_decode_interface(
     KU_CHECK_DTYPE(num_splits, ScalarType::Int);
     KU_CHECK_DTYPE(extra_indices, ScalarType::Int);
     KU_CHECK_DTYPE(extra_topk_length, ScalarType::Int);
-    
+
     // Check layout
     KU_CHECK_LAST_DIM_CONTIGUOUS(q);
     KU_CHECK_LAST_DIM_CONTIGUOUS(kv);
@@ -352,7 +466,7 @@ sparse_attn_decode_interface(
     KU_CHECK_LAST_DIM_CONTIGUOUS(extra_kv);
     KU_CHECK_LAST_DIM_CONTIGUOUS(extra_indices);
     KU_CHECK_CONTIGUOUS(extra_topk_length);
-    
+
     // Check shape
     KU_CHECK_SHAPE(q, b, s_q, h_q, d_qk);
     // The formats of `kv` and `extra_kv`
@@ -368,9 +482,12 @@ sparse_attn_decode_interface(
     }
     STD_TORCH_CHECK(model_type != ModelType::V41_FP4, "The fp4 KV cache is only supported as extra_kv");
     STD_TORCH_CHECK(is_valid_kv_format_pair(model_type, extra_model_type), "invalid kv format pair, ", get_dynamic_enum_name(model_type), " and ", get_dynamic_enum_name(extra_model_type));
-    // The preserved NVFP4 kernel predates the no-split path and consumes the
-    // split scheduler metadata even for small top-k values.
-    enable_split_kv = enable_split_kv || model_type == ModelType::V32_NVFP4_FP8ROPE;
+
+    // Split-KV only pays off when a request has enough work, but the SM90 kernels and the
+    // preserved NVFP4 kernel have no unsplit path and always consume the split metadata.
+    bool must_split_kv = arch.is_sm90a() || model_type == ModelType::V32_NVFP4_FP8ROPE;
+    bool enable_split_kv = must_split_kv || (!enable_batch_invariant && !(topk + extra_topk <= 640));
+
     KU_CHECK_SHAPE(kv, num_blocks, page_block_size, h_kv, kv_cache_bytes_per_token(model_type));
     KU_CHECK_SHAPE(extra_kv, extra_num_blocks, extra_page_block_size, h_kv, kv_cache_bytes_per_token(extra_model_type));
     STD_TORCH_CHECK(kv.stride(1) == kv_cache_bytes_per_token(model_type), "The whole block must be contiguous when is_fp8_cache is True for kv cache");
@@ -423,6 +540,9 @@ sparse_attn_decode_interface(
     if (have_extra_topk_length) {
         features.push_back(DecodeFeatures::EXTRA_TOPK_LENGTH);
     }
+    if (enable_batch_invariant) {
+        features.push_back(DecodeFeatures::BATCH_INVARIANT);
+    }
     for (ModelType mt : {model_type, extra_model_type}) {
         if (mt == ModelType::V32) {
             features.push_back(DecodeFeatures::V32_KVCACHE_FORMAT);
@@ -439,15 +559,26 @@ sparse_attn_decode_interface(
         }
     }
 
+    // Pick the implementation. V4.1 runs on the current kernels; V3.2 / V4 and everything on
+    // SM90 run on the ones kept under cuda_kernels/legacy/.
+    bool is_v41 = model_type == ModelType::V41;
     DecodeImplBase* impl;
     if (arch.is_sm100f()) {
         if (h_q == 64) {
-            impl = new Decode_Sm100_Head64_Impl();
+            if (is_v41) {
+                impl = new Decode_Sm100_Head64_Impl();
+            } else if (model_type == ModelType::V32_NVFP4_FP8ROPE) {
+                impl = new Decode_Sm100_Head64_Nvfp4_Impl();
+            } else {
+                impl = new Decode_Sm100_Head64_Legacy_Impl();
+            }
         } else if (h_q == 128) {
-            if (d_qk == 576) {
-                impl = new Decode_Sm100_Head64x2_Impl();
-            } else if (d_qk == 512) {
+            if (is_v41) {
                 impl = new Decode_Sm100_Head128_Impl();
+            } else if (d_qk == 576) {
+                impl = new Decode_Sm100_Head64x2_Legacy_Impl();
+            } else if (d_qk == 512) {
+                impl = new Decode_Sm100_Head128_Legacy_Impl();
             } else {
                 STD_TORCH_CHECK(false, "Unsupported d_qk: ", d_qk);
             }
@@ -491,6 +622,8 @@ sparse_attn_decode_interface(
         have_extra_kcache ? int64_stride_to_int(extra_kv->stride(1)) : 0,
         have_extra_kcache ? int64_stride_to_int(extra_indices->stride(0)) : 0,
         have_extra_kcache ? int64_stride_to_int(extra_indices->stride(1)) : 0,
+
+        arch.num_sms,
         get_current_cuda_stream(q),
 
         enable_split_kv,
@@ -509,14 +642,14 @@ sparse_attn_decode_interface(
                 b, s_q,
                 impl_meta.block_size_topk,
                 impl_meta.fixed_overhead_num_blocks,
+                impl_meta.num_sm_parts,
                 topk,
                 extra_topk,
                 ku::get_optional_tensor_ptr<int>(topk_length),
                 ku::get_optional_tensor_ptr<int>(extra_topk_length),
-                nullptr,
+                nullptr,    // seqlens_k_ptr, only used by the dense scheduler
                 (DecodingSchedMeta*)tile_scheduler_metadata->data_ptr(),
                 num_splits->mutable_data_ptr<int>(),
-                impl_meta.num_sm_parts,
                 get_current_cuda_stream(q)
             };
             smxx::decode::run_get_decoding_sched_meta_kernel(get_sched_meta_params);
@@ -550,27 +683,7 @@ sparse_attn_decode_interface(
 
     impl->run(params, features);
     if (enable_split_kv) {
-        CombineParams combine_params = {
-            b, s_q, h_q, d_v,
-
-            params.lse,
-            params.out,
-            params.stride_lse_b, params.stride_lse_s_q,
-            params.stride_o_b, params.stride_o_s_q, params.stride_o_h_q,
-
-            params.lse_accum,
-            params.o_accum,
-            params.stride_lse_accum_split, params.stride_lse_accum_s_q,
-            params.stride_o_accum_split, params.stride_o_accum_s_q, params.stride_o_accum_h_q,
-
-            params.tile_scheduler_metadata_ptr,
-            params.num_splits_ptr,
-            params.num_sm_parts,
-
-            ku::get_optional_tensor_ptr<float>(attn_sink),
-            get_current_cuda_stream(q)
-        };
-        smxx::decode::run_flash_mla_combine_kernel<bf16>(combine_params);
+        smxx::decode::run_flash_mla_combine_kernel(params);
     }
 
     delete impl;

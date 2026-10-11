@@ -2,11 +2,11 @@
 #include <cutlass/fast_math.h>
 
 #include "common.h"
-#include "kernels/params.h"
+#include "params.h"
 
-#include "kernels/sm90/decode/dense/splitkv_mla.h"
-#include "kernels/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
-#include "kernels/smxx/decode/combine/combine.h"
+#include "cuda_kernels/legacy/sm90/decode/dense/splitkv_mla.h"
+#include "cuda_kernels/legacy/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
+#include "cuda_kernels/legacy/smxx/decode/combine/combine.h"
 
 std::tuple<Tensor, Tensor, std::optional<Tensor>, std::optional<Tensor>>
 dense_attn_decode_interface(
@@ -111,15 +111,15 @@ dense_attn_decode_interface(
             batch_size, seqlen_q_ori,
             64,
             5,
-            -1, -1,
+            num_sm_parts,
+            -1, -1,     // topk == -1 selects the dense scheduler, which reads seqlens_k instead
             nullptr, nullptr,
             const_cast<int*>(seqlens_k.const_data_ptr<int>()),
             (DecodingSchedMeta*)tile_scheduler_metadata->data_ptr(),
             num_splits->mutable_data_ptr<int>(),
-            num_sm_parts,
             get_current_cuda_stream(q)
         };
-        smxx::decode::run_get_decoding_sched_meta_kernel(get_sched_meta_params);
+        legacy::smxx::decode::run_get_decoding_sched_meta_kernel(get_sched_meta_params);
     } else {
         KU_CHECK_DTYPE(tile_scheduler_metadata, ScalarType::Int);
         KU_CHECK_DTYPE(num_splits, ScalarType::Int);
@@ -183,18 +183,18 @@ dense_attn_decode_interface(
 
     if (q_dtype == ScalarType::BFloat16) {
         if (head_size_k == 576) {
-            sm90::decode::dense::run_flash_splitkv_mla_kernel<cutlass::bfloat16_t, 576>(params);
+            legacy::sm90::decode::dense::run_flash_splitkv_mla_kernel<cutlass::bfloat16_t, 576>(params);
         } else {
-            sm90::decode::dense::run_flash_splitkv_mla_kernel<cutlass::bfloat16_t, 512>(params);
+            legacy::sm90::decode::dense::run_flash_splitkv_mla_kernel<cutlass::bfloat16_t, 512>(params);
         }
     } else if (q_dtype == ScalarType::Half) {
 #ifdef FLASH_MLA_DISABLE_FP16
         STD_TORCH_CHECK(false, "FlashMLA is compiled with -DFLASH_MLA_DISABLE_FP16. Please remove this flag from your environment and re-compile FlashMLA.");
 #else
         if (head_size_k == 576) {
-            sm90::decode::dense::run_flash_splitkv_mla_kernel<cutlass::half_t, 576>(params);
+            legacy::sm90::decode::dense::run_flash_splitkv_mla_kernel<cutlass::half_t, 576>(params);
         } else {
-            sm90::decode::dense::run_flash_splitkv_mla_kernel<cutlass::half_t, 512>(params);
+            legacy::sm90::decode::dense::run_flash_splitkv_mla_kernel<cutlass::half_t, 512>(params);
         }
 #endif
     } else {
@@ -224,10 +224,10 @@ dense_attn_decode_interface(
     };
 
     if (q_dtype == ScalarType::BFloat16) {
-        smxx::decode::run_flash_mla_combine_kernel<cutlass::bfloat16_t>(combine_params);
+        legacy::smxx::decode::run_flash_mla_combine_kernel<cutlass::bfloat16_t>(combine_params);
     } else if (q_dtype == ScalarType::Half) {
 #ifndef FLASH_MLA_DISABLE_FP16
-        smxx::decode::run_flash_mla_combine_kernel<cutlass::half_t>(combine_params);
+        legacy::smxx::decode::run_flash_mla_combine_kernel<cutlass::half_t>(combine_params);
 #endif
     } else {
         STD_TORCH_CHECK(false, "Unsupported tensor dtype for query");
