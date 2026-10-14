@@ -11,6 +11,7 @@
 #include "cuda_kernels/legacy/sm100/prefill/sparse/fwd/head64/phase1.h"
 
 enum class FwdFeatures : int {
+    SMALL_HEADS,
     HEAD_64,
     HEAD_128,
 
@@ -28,6 +29,7 @@ class FwdImplBase : public ImplBase<
 
 class Fwd_Sm90_Impl : public FwdImplBase {
     DECLARE_SUPPORTED_FEATURES(
+        FwdFeatures::SMALL_HEADS,
         FwdFeatures::HEAD_64,
         FwdFeatures::HEAD_128,
         FwdFeatures::HEAD_DIM_512,
@@ -158,6 +160,11 @@ std::vector<Tensor> sparse_attn_prefill_interface(
     int d_qk = q.size(2);
     int topk = indices.size(2);
     bool have_topk_length = topk_length.has_value();
+    const bool small_heads = is_sm90a && is_sm90_small_heads_h_q(h_q);
+    STD_TORCH_CHECK(small_heads || h_q == 64 || h_q == 128,
+                    "Unsupported h_q: ", h_q,
+                    ". SM90a supports 8, 16, 32, 64 and 128 heads; SM100f supports 64 and 128.");
+    STD_TORCH_CHECK(h_kv == 1, "Sparse prefill requires h_kv == 1, got ", h_kv);
 
     STD_TORCH_CHECK(d_qk == 576 || d_qk == 512, "Invalid d_qk: ", d_qk);
     STD_TORCH_CHECK(d_v == 512, "Invalid d_v", d_v);
@@ -201,7 +208,9 @@ std::vector<Tensor> sparse_attn_prefill_interface(
     }
     Tensor lse = torch::stable::new_empty(q, {s_q, h_q}, ScalarType::Float);
     Tensor max_logits = torch::stable::new_empty(q, {s_q, h_q}, ScalarType::Float);
-    KU_CHECK_CONTIGUOUS(out);
+    if (!small_heads) {
+        KU_CHECK_CONTIGUOUS(out);
+    }
     KU_CHECK_CONTIGUOUS(lse);
     KU_CHECK_CONTIGUOUS(max_logits);
 
@@ -223,13 +232,17 @@ std::vector<Tensor> sparse_attn_prefill_interface(
         (float*)max_logits.data_ptr(),
         (float*)lse.data_ptr(),
 
+        int64_stride_to_int(out.stride(0)), int64_stride_to_int(out.stride(1)),
+
         SparseAttnFwdMode::Prefill,
         arch.num_sms,
         get_current_cuda_stream(q)
     };
 
     std::vector<FwdFeatures> required_features;
-    if (h_q == 64) {
+    if (small_heads) {
+        required_features.push_back(FwdFeatures::SMALL_HEADS);
+    } else if (h_q == 64) {
         required_features.push_back(FwdFeatures::HEAD_64);
     } else if (h_q == 128) {
         required_features.push_back(FwdFeatures::HEAD_128);

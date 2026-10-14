@@ -4,6 +4,7 @@
 
 #include "cuda_kernels/legacy/utils.h"
 #include "../../helpers.h"
+#include "small_heads.cuh"
 
 namespace legacy::sm90::prefill::sparse_fwd {
 
@@ -640,7 +641,11 @@ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::run(const SparseAttnFwdParams &para
 
 template<int D_QK, bool HAVE_TOPK_LENGTH>
 void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
-    KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::run(params);
+    if (is_sm90_small_heads_h_q(params.h_q)) {
+        run_small_heads<D_QK, HAVE_TOPK_LENGTH>(params);
+    } else {
+        KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::run(params);
+    }
 }
 
 }
