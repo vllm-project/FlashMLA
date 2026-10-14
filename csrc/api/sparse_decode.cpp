@@ -177,7 +177,14 @@ protected:
     void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
         DISPATCH_MODEL_TYPE(params.model_type, MODEL_TYPE, [&]() {
             DISPATCH_NUM_HEADS(params.h_q, NUM_HEADS, [&]() {
-                legacy::sm90::decode::sparse::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE, NUM_HEADS>(params);
+                if constexpr (MODEL_TYPE == ModelType::V32) {
+                    DISPATCH_BOOLEAN_FLAG(params.topk_length != nullptr, HAVE_TOPK_LENGTH, [&]() {
+                        legacy::sm90::decode::sparse::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE, NUM_HEADS, HAVE_TOPK_LENGTH>(params);
+                    });
+                } else {
+                    // DeepSeek-V4 always handles topk_length, so it has a single instantiation
+                    legacy::sm90::decode::sparse::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE, NUM_HEADS, false>(params);
+                }
             });
         });
     }
