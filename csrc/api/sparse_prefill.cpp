@@ -208,7 +208,11 @@ std::vector<Tensor> sparse_attn_prefill_interface(
     }
     Tensor lse = torch::stable::new_empty(q, {s_q, h_q}, ScalarType::Float);
     Tensor max_logits = torch::stable::new_empty(q, {s_q, h_q}, ScalarType::Float);
-    if (!small_heads) {
+    if (small_heads) {
+        STD_TORCH_CHECK(out.stride(1) >= d_v &&
+                        out.stride(0) >= (h_q - 1) * out.stride(1) + d_v,
+                        "out must not have overlapping rows");
+    } else {
         KU_CHECK_CONTIGUOUS(out);
     }
     KU_CHECK_CONTIGUOUS(lse);

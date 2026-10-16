@@ -84,6 +84,43 @@ def test_small_heads_write_into_padded_head_slice(heads, dim, topk, head_offset)
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9, reason="SM90 kernel")
 @pytest.mark.parametrize("heads", [8, 16, 32])
+@pytest.mark.parametrize("dim", [512, 576])
+@pytest.mark.parametrize("overlap", ["query", "head", "partial_query"])
+def test_small_heads_reject_overlapping_output(heads, dim, overlap):
+    from flash_mla import flash_mla_sparse_fwd
+
+    q = torch.zeros((3, heads, dim), device="cuda", dtype=torch.bfloat16)
+    kv = torch.zeros((17, 1, dim), device="cuda", dtype=torch.bfloat16)
+    indices = torch.zeros((3, 1, 32), device="cuda", dtype=torch.int32)
+    storage = torch.empty((3, heads, 512), device="cuda", dtype=torch.bfloat16)
+    if overlap == "query":
+        out = storage[:1].expand(3, heads, 512)
+    elif overlap == "head":
+        out = storage.as_strided((3, heads, 512), (heads * 512, 256, 1))
+    else:
+        out = storage.as_strided((3, heads, 512), (heads * 512 - 1, 512, 1))
+    with pytest.raises(RuntimeError, match="out must not have overlapping rows"):
+        flash_mla_sparse_fwd(q, kv, indices, dim ** -0.5, out=out)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9, reason="SM90 kernel")
+@pytest.mark.parametrize("heads", [64, 128])
+@pytest.mark.parametrize("dim", [512, 576])
+@pytest.mark.parametrize("layout", ["head_slice", "head_step"])
+def test_large_heads_reject_strided_output(heads, dim, layout):
+    from flash_mla import flash_mla_sparse_fwd
+
+    q = torch.zeros((3, heads, dim), device="cuda", dtype=torch.bfloat16)
+    kv = torch.zeros((17, 1, dim), device="cuda", dtype=torch.bfloat16)
+    indices = torch.zeros((3, 1, 128), device="cuda", dtype=torch.int32)
+    storage = torch.empty((3, heads * 2, 512), device="cuda", dtype=torch.bfloat16)
+    out = storage[:, 8:8 + heads] if layout == "head_slice" else storage[:, ::2]
+    with pytest.raises(RuntimeError, match="contiguous"):
+        flash_mla_sparse_fwd(q, kv, indices, dim ** -0.5, out=out)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9, reason="SM90 kernel")
+@pytest.mark.parametrize("heads", [8, 16, 32])
 @torch.inference_mode()
 def test_tp_heads_graph_updates_sparse_lengths(heads):
     """Graph replay reads current device lengths, including fully empty rows."""
@@ -236,13 +273,15 @@ if __name__ == '__main__':
     torch.cuda.set_device(device)
     torch.set_float32_matmul_precision('high')
 
+    head_counts = [128, 64]
+    if torch.cuda.get_device_capability()[0] == 9:
+        head_counts += [8, 16, 32]
+
     correctness_cases = [
         # Regular shapes
         TestParam(s_q, s_kv, topk, h_q=h_q, num_runs=0, d_qk=d_qk)
         for d_qk in [512, 576]
-        for h_q in [
-            128, 64
-        ]
+        for h_q in head_counts
         for s_kv, topk in [
             # Regular shapes
             (128, 128),
@@ -268,9 +307,7 @@ if __name__ == '__main__':
     correctness_cases_with_features = [
         TestParam(s_q, s_kv, topk, h_q=h_q, num_runs=0, have_attn_sink=have_attn_sink, have_topk_length=have_topk_length, d_qk=d_qk)
         for d_qk in [512, 576]
-        for h_q in [
-            128, 64
-        ]
+        for h_q in head_counts
         for s_kv, topk in [
             (592, 128),
             (1840, 256),
@@ -289,9 +326,7 @@ if __name__ == '__main__':
     corner_cases = [
         TestParam(s_q, s_kv, topk, h_q=h_q, is_all_indices_invalid=True, num_runs=0, have_attn_sink=True, have_topk_length=True, d_qk=d_qk)
         for d_qk in [512, 576]
-        for h_q in [
-            128, 64
-        ]
+        for h_q in head_counts
         for s_q, s_kv, topk in [
             (1, 128, 128),
             (1, 256, 256),
@@ -302,9 +337,7 @@ if __name__ == '__main__':
         # In these cases, some blocks may not have any valid topk indices
         TestParam(s_q, s_kv, topk, h_q=h_q, is_all_indices_invalid=False, num_runs=0, have_attn_sink=True, have_topk_length=True, d_qk=d_qk)
         for d_qk in [512, 576]
-        for h_q in [
-            128, 64
-        ]
+        for h_q in head_counts
         for s_kv, topk in [
             (32, 2048),
             (64, 8192)
@@ -314,9 +347,7 @@ if __name__ == '__main__':
         # In this testcase, s_q is really large, so we cannot put it on the second dimension of grid shape
         TestParam(70000, 256, 256, h_q=h_q, check_correctness=False, num_runs=0, have_attn_sink=True, have_topk_length=True, d_qk=d_qk)
         for d_qk in [512, 576]
-        for h_q in [
-            128, 64
-        ]
+        for h_q in head_counts
     ]
 
     performance_case_templates = [

@@ -3,6 +3,7 @@
 #include <cuda_bf16.h>
 
 #include "params.h"
+#include "../../helpers.h"
 #include "cuda_kernels/legacy/utils.h"
 
 namespace legacy::sm90::prefill::sparse_fwd {
@@ -32,14 +33,11 @@ struct SmallHeadsShared {
     int indices[BK];
 };
 
-__device__ __forceinline__ uint32_t smem_u32(const void* p) {
-    return (uint32_t)__cvta_generic_to_shared(p);
-}
-
-// 512 resident threads per SM: BH=16 is register bound (4 CTAs), BH=32 is
-// shared-memory bound (2 CTAs).
+// Target 4 CTAs for BH=16, except D_QK=576 where shared memory permits only 3.
+// BH=32 targets 2 CTAs to leave enough registers for the PV accumulators;
+// shared memory alone permits 3 CTAs at D_QK=512 and 2 at D_QK=576.
 template<int D_QK, bool HAVE_TOPK_LENGTH, int BH>
-__global__ void __launch_bounds__(BH * 8, 512 / (BH * 8))
+__global__ void __launch_bounds__(BH * 8, (BH == 16 ? (D_QK == 576 ? 3 : 4) : 2))
 sparse_attn_fwd_small_heads_kernel(const SparseAttnFwdParams params) {
     constexpr int BK = 32;
     using Shared = SmallHeadsShared<D_QK, BH>;
@@ -62,7 +60,7 @@ sparse_attn_fwd_small_heads_kernel(const SparseAttnFwdParams params) {
             int row = i / (D_QK / 8), col = (i % (D_QK / 8)) * 8;
             int head = head_base + row;
             const auto* src = q + int64_t(query) * params.stride_q_s_q + min(head, params.h_q - 1) * params.stride_q_h_q + col;
-            unsigned dst = smem_u32(smem.q + row * LD + col);
+            unsigned dst = cute::cast_smem_ptr_to_uint(smem.q + row * LD + col);
             int bytes = head < params.h_q ? 16 : 0;
             asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(dst), "l"(src), "r"(bytes));
         }
@@ -93,6 +91,7 @@ sparse_attn_fwd_small_heads_kernel(const SparseAttnFwdParams params) {
     // Value tile for the PV: lanes 0..15 address keys 0..15 of one 8-dim slice.
     const __nv_bfloat16* pv_row = smem.buffer.kv + (lane & 15) * LD;
 
+    const int64_t cache_policy = legacy::sm90::createpolicy_evict_last();
     int length = params.topk;
     if constexpr (HAVE_TOPK_LENGTH) length = min(length, max(0, params.topk_length[query]));
     for (int start = 0; start < length; start += BK) {
@@ -107,9 +106,8 @@ sparse_attn_fwd_small_heads_kernel(const SparseAttnFwdParams params) {
                 int row = i / (D_QK / 8), col = (i % (D_QK / 8)) * 8;
                 int index = smem.indices[row];
                 const auto* src = kv + int64_t(max(index, 0)) * params.stride_kv_s_kv + col;
-                unsigned dst = smem_u32(smem.buffer.kv + row * LD + col);
-                int bytes = index >= 0 ? 16 : 0;
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(dst), "l"(src), "r"(bytes));
+                legacy::sm90::cp_async_cacheglobal_l2_prefetch_256B(
+                    src, smem.buffer.kv + row * LD + col, index >= 0, cache_policy);
             }
             asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;" ::: "memory");
         } else {
@@ -122,14 +120,14 @@ sparse_attn_fwd_small_heads_kernel(const SparseAttnFwdParams params) {
         __syncthreads();
         float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
         {
-            const uint32_t b_off0 = smem_u32(kv_row + 2 * tig);
-            const uint32_t b_off1 = smem_u32(kv_row + 2 * tig + 8);
+            const uint32_t b_off0 = cute::cast_smem_ptr_to_uint(kv_row + 2 * tig);
+            const uint32_t b_off1 = cute::cast_smem_ptr_to_uint(kv_row + 2 * tig + 8);
             #pragma unroll 4
             for (int d = 0; d < D_QK; d += 16) {
                 uint32_t a0, a1, a2, a3, b0, b1;
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
                              : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
-                             : "r"(smem_u32(q_tile + d)));
+                             : "r"(cute::cast_smem_ptr_to_uint(q_tile + d)));
                 asm volatile("ld.shared.u32 %0, [%1];" : "=r"(b0) : "r"(b_off0 + d * 2));
                 asm volatile("ld.shared.u32 %0, [%1];" : "=r"(b1) : "r"(b_off1 + d * 2));
                 asm volatile(
@@ -147,7 +145,8 @@ sparse_attn_fwd_small_heads_kernel(const SparseAttnFwdParams params) {
         __syncthreads();
         const int row = tid / 8, slane = tid % 8;
         float values[BK / 8];
-        float maximum = smem.maximum[row];
+        const float old_max = smem.maximum[row];
+        float maximum = old_max;
         #pragma unroll
         for (int j = 0; j < BK / 8; ++j) {
             const int col = slane + 8 * j;
@@ -158,7 +157,7 @@ sparse_attn_fwd_small_heads_kernel(const SparseAttnFwdParams params) {
         #pragma unroll
         for (int offset = 4; offset; offset /= 2)
             maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, offset, 8));
-        float alpha = exp2f(smem.maximum[row] - maximum);
+        float alpha = exp2f(old_max - maximum);
         float sum = 0.f;
         #pragma unroll
         for (int j = 0; j < BK / 8; ++j) {
@@ -169,6 +168,8 @@ sparse_attn_fwd_small_heads_kernel(const SparseAttnFwdParams params) {
         #pragma unroll
         for (int offset = 4; offset; offset /= 2)
             sum += __shfl_xor_sync(0xffffffff, sum, offset, 8);
+        // Finish every lane's old_max read before lane 0 overwrites it.
+        __syncwarp();
         if (slane == 0) {
             smem.alpha[row] = alpha;
             smem.maximum[row] = maximum;
@@ -187,13 +188,13 @@ sparse_attn_fwd_small_heads_kernel(const SparseAttnFwdParams params) {
             uint32_t a0, a1, a2, a3;
             asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
                          : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
-                         : "r"(smem_u32(smem.prob + group * 16 * LP + k + p_off)));
+                         : "r"(cute::cast_smem_ptr_to_uint(smem.prob + group * 16 * LP + k + p_off)));
             #pragma unroll
             for (int j = 0; j < Shared::PV_FRAGS; ++j) {
                 uint32_t b0, b1;
                 asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];"
                              : "=r"(b0), "=r"(b1)
-                             : "r"(smem_u32(pv_row + k * LD + kw * 128 + j * 8)));
+                             : "r"(cute::cast_smem_ptr_to_uint(pv_row + k * LD + kw * 128 + j * 8)));
                 asm volatile(
                     "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                     "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
