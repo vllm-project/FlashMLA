@@ -1,6 +1,7 @@
 import time
 import sys
 
+import pytest
 import torch
 import kernelkit as kk
 
@@ -9,6 +10,219 @@ import lib
 import ref
 
 _counter = kk.Counter()
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9, reason="SM90 kernel")
+@pytest.mark.parametrize("heads", [8, 16, 32, 64, 128])
+@pytest.mark.parametrize("dim", [512, 576])
+@pytest.mark.parametrize("topk", [128, 640])
+@pytest.mark.parametrize("features", ["plain", "sink", "length", "both"])
+@torch.inference_mode()
+def test_tp_heads_sparse_prefill(heads, dim, topk, features):
+    """TP-local heads preserve sparse masking, sink and auxiliary output semantics."""
+    from flash_mla import flash_mla_sparse_fwd
+
+    with torch.device("cuda"):
+        p = TestParam(17, 257, topk, h_q=heads, d_qk=dim, seed=42, num_runs=0,
+                      have_attn_sink=features in ("sink", "both"),
+                      have_topk_length=features in ("length", "both"))
+        t = lib.generate_testcase(p)
+        # Match vLLM's slice of a padded Q allocation, including head strides.
+        q_storage = torch.empty((p.s_q, heads * 2, dim), dtype=torch.bfloat16)
+        q_storage[:, ::2].copy_(t.q)
+        t.q = q_storage[:, ::2]
+        kv_storage = torch.empty((p.s_kv * 2, 1, dim), dtype=torch.bfloat16)
+        kv_storage[::2].copy_(t.kv)
+        t.kv = kv_storage[::2]
+        indices_storage = torch.empty((p.s_q * 2, 1, topk), dtype=torch.int32)
+        indices_storage[::2].copy_(t.indices)
+        t.indices = indices_storage[::2]
+        t.indices[0].fill_(-1)
+        t.indices[1, :, :64] = -1
+        t.indices[2, :, ::3] = p.s_kv
+        if t.topk_length is not None:
+            t.topk_length[:8] = torch.tensor([0, 1, 31, 63, 64, 65, 127, 128], dtype=torch.int32)
+        if t.attn_sink is not None:
+            t.attn_sink[:2] = torch.tensor([float("inf"), -float("inf")])
+        out = torch.full((p.s_q, heads, 512), float("nan"), dtype=torch.bfloat16)
+        actual = flash_mla_sparse_fwd(t.q, t.kv, t.indices, t.sm_scale,
+                                     attn_sink=t.attn_sink, topk_length=t.topk_length, out=out)
+        assert actual[0].data_ptr() == out.data_ptr()
+        _, expected, maximum, lse = ref.ref_sparse_attn_fwd(p, t)
+        assert kk.check_is_allclose("out", actual[0].float(), expected, abs_tol=8e-4, rel_tol=3.01/128, cos_diff_tol=7e-6)
+        torch.testing.assert_close(actual[1], maximum, atol=1e-5, rtol=2.01/65536)
+        torch.testing.assert_close(actual[2], lse, atol=1e-5, rtol=2.01/65536)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9, reason="SM90 kernel")
+@pytest.mark.parametrize("head_offset", [0, 8])
+@pytest.mark.parametrize("heads", [8, 16, 32])
+@pytest.mark.parametrize("dim", [512, 576])
+@pytest.mark.parametrize("topk", [128, 640])
+@torch.inference_mode()
+def test_small_heads_write_into_padded_head_slice(heads, dim, topk, head_offset):
+    """The SM90 small-heads kernel writes through the output strides of a head slice."""
+    from flash_mla import flash_mla_sparse_fwd
+
+    with torch.device("cuda"):
+        p = TestParam(17, 257, topk, h_q=heads, d_qk=dim, seed=42, num_runs=0,
+                      have_attn_sink=True, have_topk_length=True)
+        t = lib.generate_testcase(p)
+        t.topk_length[:8] = torch.tensor([0, 1, 31, 63, 64, 65, 127, 128], dtype=torch.int32)
+        padded_storage = torch.full((p.s_q, 64, 512), float("nan"), dtype=torch.bfloat16)
+        out = padded_storage[:, head_offset:head_offset + heads]
+        assert out.stride(1) == 512 and out.stride(0) == 64 * 512
+        actual = flash_mla_sparse_fwd(t.q, t.kv, t.indices, t.sm_scale,
+                                     attn_sink=t.attn_sink, topk_length=t.topk_length, out=out)
+        assert actual[0].data_ptr() == out.data_ptr()
+        _, expected, maximum, lse = ref.ref_sparse_attn_fwd(p, t)
+        assert kk.check_is_allclose("out", actual[0].float(), expected, abs_tol=8e-4, rel_tol=3.01/128, cos_diff_tol=7e-6)
+        torch.testing.assert_close(actual[1], maximum, atol=1e-5, rtol=2.01/65536)
+        torch.testing.assert_close(actual[2], lse, atol=1e-5, rtol=2.01/65536)
+        untouched = torch.cat([padded_storage[:, :head_offset], padded_storage[:, head_offset + heads:]], dim=1)
+        assert torch.isnan(untouched).all(), "kernel wrote outside the supplied head slice"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9, reason="SM90 kernel")
+@pytest.mark.parametrize("heads", [8, 16, 32])
+@pytest.mark.parametrize("dim", [512, 576])
+@pytest.mark.parametrize("overlap", ["query", "head", "partial_query"])
+def test_small_heads_reject_overlapping_output(heads, dim, overlap):
+    from flash_mla import flash_mla_sparse_fwd
+
+    q = torch.zeros((3, heads, dim), device="cuda", dtype=torch.bfloat16)
+    kv = torch.zeros((17, 1, dim), device="cuda", dtype=torch.bfloat16)
+    indices = torch.zeros((3, 1, 32), device="cuda", dtype=torch.int32)
+    storage = torch.empty((3, heads, 512), device="cuda", dtype=torch.bfloat16)
+    if overlap == "query":
+        out = storage[:1].expand(3, heads, 512)
+    elif overlap == "head":
+        out = storage.as_strided((3, heads, 512), (heads * 512, 256, 1))
+    else:
+        out = storage.as_strided((3, heads, 512), (heads * 512 - 1, 512, 1))
+    with pytest.raises(RuntimeError, match="out must not have overlapping rows"):
+        flash_mla_sparse_fwd(q, kv, indices, dim ** -0.5, out=out)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9, reason="SM90 kernel")
+@pytest.mark.parametrize("heads", [64, 128])
+@pytest.mark.parametrize("dim", [512, 576])
+@pytest.mark.parametrize("layout", ["head_slice", "head_step"])
+def test_large_heads_reject_strided_output(heads, dim, layout):
+    from flash_mla import flash_mla_sparse_fwd
+
+    q = torch.zeros((3, heads, dim), device="cuda", dtype=torch.bfloat16)
+    kv = torch.zeros((17, 1, dim), device="cuda", dtype=torch.bfloat16)
+    indices = torch.zeros((3, 1, 128), device="cuda", dtype=torch.int32)
+    storage = torch.empty((3, heads * 2, 512), device="cuda", dtype=torch.bfloat16)
+    out = storage[:, 8:8 + heads] if layout == "head_slice" else storage[:, ::2]
+    with pytest.raises(RuntimeError, match="contiguous"):
+        flash_mla_sparse_fwd(q, kv, indices, dim ** -0.5, out=out)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9, reason="SM90 kernel")
+@pytest.mark.parametrize("heads", [8, 16, 32])
+@torch.inference_mode()
+def test_tp_heads_graph_updates_sparse_lengths(heads):
+    """Graph replay reads current device lengths, including fully empty rows."""
+    from flash_mla import flash_mla_sparse_fwd
+
+    with torch.device("cuda"):
+        p = TestParam(17, 257, 640, h_q=heads, seed=7, num_runs=0,
+                      have_topk_length=True, have_attn_sink=True)
+        t = lib.generate_testcase(p)
+        def run():
+            return flash_mla_sparse_fwd(t.q, t.kv, t.indices, t.sm_scale,
+                                       attn_sink=t.attn_sink, topk_length=t.topk_length)
+        run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = run()
+        for length in [0, 1, 65, 640]:
+            t.topk_length.fill_(length)
+            graph.replay()
+            expected = run()
+            for a, b in zip(actual, expected):
+                torch.testing.assert_close(a, b, atol=0, rtol=0)
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9, reason="SM90 kernel")
+@pytest.mark.parametrize("heads", [20, 24, 48])
+@torch.inference_mode()
+def test_unsupported_head_counts_are_rejected(heads):
+    """Head counts below 64 that are not 8, 16 or 32 must not fall through to the 64-head tile."""
+    from flash_mla import flash_mla_sparse_fwd
+
+    with torch.device("cuda"):
+        p = TestParam(17, 257, 128, h_q=heads, seed=42, num_runs=0)
+        t = lib.generate_testcase(p)
+    with pytest.raises(RuntimeError, match="Unsupported h_q"):
+        flash_mla_sparse_fwd(t.q, t.kv, t.indices, t.sm_scale)
+
+
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9, reason="SM90 kernel")
+@pytest.mark.parametrize("heads", [8, 16, 32])
+@pytest.mark.parametrize("dim", [512, 576])
+@pytest.mark.parametrize("topk", [1, 7, 33, 100, 129])
+@torch.inference_mode()
+def test_small_heads_unaligned_strides_and_tail(heads, dim, topk):
+    """Exercise scalar loads/stores, partial key tiles and clamped lengths."""
+    from flash_mla import flash_mla_sparse_fwd
+
+    with torch.device("cuda"):
+        p = TestParam(9, 257, topk, h_q=heads, d_qk=dim, seed=19, num_runs=0,
+                      have_attn_sink=True, have_topk_length=True)
+        t = lib.generate_testcase(p)
+        # Odd row strides and an offset pointer force the scalar fallback paths.
+        q_storage = torch.empty((p.s_q, heads, dim + 1), dtype=torch.bfloat16)
+        t.q = q_storage[..., 1:].copy_(t.q)
+        kv_storage = torch.empty((p.s_kv, 1, dim + 1), dtype=torch.bfloat16)
+        t.kv = kv_storage[..., 1:].copy_(t.kv)
+        t.indices[0].fill_(-1)
+        t.indices[1].fill_(p.s_kv)
+        t.topk_length[:5] = torch.tensor([-1, 0, 1, topk, topk + 7], dtype=torch.int32)
+        storage = torch.full((p.s_q, heads * 2, 513), float("nan"), dtype=torch.bfloat16)
+        out = storage[:, ::2, 1:]
+        actual = flash_mla_sparse_fwd(t.q, t.kv, t.indices, t.sm_scale,
+                                     attn_sink=t.attn_sink, topk_length=t.topk_length, out=out)
+        _, expected, maximum, lse = ref.ref_sparse_attn_fwd(p, t)
+        assert actual[0].data_ptr() == out.data_ptr()
+        assert kk.check_is_allclose("out", actual[0].float(), expected, abs_tol=8e-4, rel_tol=3.01/128, cos_diff_tol=7e-6)
+        torch.testing.assert_close(actual[1], maximum, atol=1e-5, rtol=2.01/65536)
+        torch.testing.assert_close(actual[2], lse, atol=1e-5, rtol=2.01/65536)
+        assert torch.isnan(storage[:, 1::2]).all()
+        assert torch.isnan(storage[:, :, 0]).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9, reason="SM90 kernel")
+@pytest.mark.parametrize("heads", [8, 16, 32])
+@pytest.mark.parametrize("shape", [(0, 17, 33), (3, 0, 33), (3, 17, 0)])
+@torch.inference_mode()
+def test_small_heads_empty_inputs(heads, shape):
+    from flash_mla import flash_mla_sparse_fwd
+
+    s_q, s_kv, topk = shape
+    q = torch.zeros((s_q, heads, 512), device="cuda", dtype=torch.bfloat16)
+    kv = torch.zeros((s_kv, 1, 512), device="cuda", dtype=torch.bfloat16)
+    indices = torch.full((s_q, 1, topk), -1, device="cuda", dtype=torch.int32)
+    out, maximum, lse = flash_mla_sparse_fwd(q, kv, indices, 512 ** -0.5)
+    assert out.shape == (s_q, heads, 512)
+    assert (out == 0).all()
+    assert torch.isneginf(maximum).all()
+    assert torch.isposinf(lse).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9, reason="SM90 kernel")
+@pytest.mark.parametrize("heads", [8, 64])
+def test_sparse_prefill_rejects_multiple_kv_heads(heads):
+    from flash_mla import flash_mla_sparse_fwd
+
+    q = torch.zeros((3, heads, 512), device="cuda", dtype=torch.bfloat16)
+    kv = torch.zeros((17, 2, 512), device="cuda", dtype=torch.bfloat16)
+    indices = torch.zeros((3, 2, 32), device="cuda", dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="h_kv == 1"):
+        flash_mla_sparse_fwd(q, kv, indices, 512 ** -0.5)
+
 
 @torch.inference_mode()
 def run_test(p: TestParam) -> bool:
@@ -59,13 +273,15 @@ if __name__ == '__main__':
     torch.cuda.set_device(device)
     torch.set_float32_matmul_precision('high')
 
+    head_counts = [128, 64]
+    if torch.cuda.get_device_capability()[0] == 9:
+        head_counts += [8, 16, 32]
+
     correctness_cases = [
         # Regular shapes
         TestParam(s_q, s_kv, topk, h_q=h_q, num_runs=0, d_qk=d_qk)
         for d_qk in [512, 576]
-        for h_q in [
-            128, 64
-        ]
+        for h_q in head_counts
         for s_kv, topk in [
             # Regular shapes
             (128, 128),
@@ -91,9 +307,7 @@ if __name__ == '__main__':
     correctness_cases_with_features = [
         TestParam(s_q, s_kv, topk, h_q=h_q, num_runs=0, have_attn_sink=have_attn_sink, have_topk_length=have_topk_length, d_qk=d_qk)
         for d_qk in [512, 576]
-        for h_q in [
-            128, 64
-        ]
+        for h_q in head_counts
         for s_kv, topk in [
             (592, 128),
             (1840, 256),
@@ -112,9 +326,7 @@ if __name__ == '__main__':
     corner_cases = [
         TestParam(s_q, s_kv, topk, h_q=h_q, is_all_indices_invalid=True, num_runs=0, have_attn_sink=True, have_topk_length=True, d_qk=d_qk)
         for d_qk in [512, 576]
-        for h_q in [
-            128, 64
-        ]
+        for h_q in head_counts
         for s_q, s_kv, topk in [
             (1, 128, 128),
             (1, 256, 256),
@@ -125,9 +337,7 @@ if __name__ == '__main__':
         # In these cases, some blocks may not have any valid topk indices
         TestParam(s_q, s_kv, topk, h_q=h_q, is_all_indices_invalid=False, num_runs=0, have_attn_sink=True, have_topk_length=True, d_qk=d_qk)
         for d_qk in [512, 576]
-        for h_q in [
-            128, 64
-        ]
+        for h_q in head_counts
         for s_kv, topk in [
             (32, 2048),
             (64, 8192)
@@ -137,9 +347,7 @@ if __name__ == '__main__':
         # In this testcase, s_q is really large, so we cannot put it on the second dimension of grid shape
         TestParam(70000, 256, 256, h_q=h_q, check_correctness=False, num_runs=0, have_attn_sink=True, have_topk_length=True, d_qk=d_qk)
         for d_qk in [512, 576]
-        for h_q in [
-            128, 64
-        ]
+        for h_q in head_counts
     ]
 
     performance_case_templates = [

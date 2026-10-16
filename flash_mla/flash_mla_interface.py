@@ -225,8 +225,9 @@ def flash_mla_sparse_fwd(
     Sparse attention prefill kernel
 
     Args:
-        q: [s_q, h_q, d_qk], bfloat16
-        kv: [s_kv, h_kv, d_qk], bfloat16
+        q: [s_q, h_q, d_qk], bfloat16. SM90 supports 8, 16, 32, 64 or 128 heads;
+            SM100 supports 64 or 128 heads. Other counts must be padded.
+        kv: [s_kv, h_kv, d_qk], bfloat16. h_kv must be 1.
         indices: [s_q, h_kv, topk], int32. Invalid indices should be set to -1 or numbers >= s_kv
         sm_scale: float
         d_v: The dimension of value vectors. Can only be 512
@@ -236,7 +237,10 @@ def flash_mla_sparse_fwd(
             This argument has no effect on lse and max_logits.
         topk_length: optional, [s_q], int32. If provided, the i-th q token will only attend to k tokens specified by indices[i, :, :topk_length[i]], ignoring later k/v tokens (even if provided in indices).
             In extremely rare cases (topk_length provided, there is a valid topk index between topk_length[i] ~ s_kv, and that topk index points to a k token containing NaN), operator output will contain NaN, so please avoid this situation.
-        out: optional pre-allocated output tensor with shape [s_q, h_q, d_v], bfloat16, contiguous on the last dim. If provided, the result will be written into this buffer to avoid allocation.
+        out: optional pre-allocated output tensor with shape [s_q, h_q, d_v], bfloat16.
+            SM90 with 8/16/32 heads accepts strided head slices with a contiguous last dim;
+            all other paths require a contiguous tensor. If provided, the result is written
+            into this buffer to avoid allocation.
 
     Returns:
         (output, max_logits, lse)

@@ -216,6 +216,9 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
         (float*)max_logits.data_ptr(),
         (float*)lse.data_ptr(),
 
+        // BF16 out is unused; the fused path has its own FP8 output strides.
+        0, 0,
+
         SparseAttnFwdMode::Prefill,
         arch.num_sms,
         get_current_cuda_stream(q),
