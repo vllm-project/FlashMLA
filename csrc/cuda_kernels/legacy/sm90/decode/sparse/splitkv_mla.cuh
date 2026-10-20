@@ -131,6 +131,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
         }
         cutlass::arch::fence_barrier_init();
     }
+    if constexpr (NUM_HEADS == 32) {
+        // Separate elect_one_sync calls may choose different lanes.
+        if (warp_idx == 0) __syncwarp();
+    }
     ku::barrier_cluster_arrive_relaxed();
 
     int bar_phase_k = 0; // Don't use array here to prevent using local memory
@@ -200,7 +204,12 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
         if (params.attn_sink != nullptr) {
             for (int i = 0; i < 2; ++i) {
                 int head_idx = head_block_idx*BLOCK_M + get_AorC_row_idx(i, idx_in_warpgroup);
-                rAttn_sink[i] = __ldg((float*)params.attn_sink + head_idx) * CUDART_L2E_F;
+                if constexpr (NUM_HEADS == 32) {
+                    if (head_idx < NUM_HEADS)
+                        rAttn_sink[i] = __ldg((float*)params.attn_sink + head_idx) * CUDART_L2E_F;
+                } else {
+                    rAttn_sink[i] = __ldg((float*)params.attn_sink + head_idx) * CUDART_L2E_F;
+                }
             }
         }
 
@@ -257,7 +266,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     rO
                 );
 
-                NamedBarrier::arrive(256, NamedBarriers::sScale_and_sS_ready);
+                if constexpr (NUM_HEADS == 32)
+                    NamedBarrier::arrive_and_wait(256, NamedBarriers::sScale_and_sS_ready);
+                else
+                    NamedBarrier::arrive(256, NamedBarriers::sScale_and_sS_ready);
 
                 cute::warpgroup_wait<0>();
 
@@ -386,6 +398,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 // Scale O
                 float cur_scales[2];
                 *(float2*)cur_scales = *(float2*)(sScale + (idx_in_warpgroup/4)*2);
+                if constexpr (NUM_HEADS == 32) __syncwarp();
                 CUTE_UNROLL
                 for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
                     Tensor cur_rO = flatten(rO(make_coord(_, local_row_idx, _), _, _));
@@ -411,8 +424,12 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     plan.bar_k_avail[buf_idx].arrive();
                 }
                 
-                if (block_idx != args.end_block_idx-1)
-                    NamedBarrier::arrive(256, NamedBarriers::sScale_and_sS_free);   // Tell WG0 that sScale and sS are available
+                if (block_idx != args.end_block_idx-1) {
+                    if constexpr (NUM_HEADS == 32)
+                        NamedBarrier::arrive_and_wait(256, NamedBarriers::sScale_and_sS_free);
+                    else
+                        NamedBarrier::arrive(256, NamedBarriers::sScale_and_sS_free);
+                }
             }
 
             NamedBarrier::arrive_and_wait(256, NamedBarriers::oBuf_free_and_sL_ready);
@@ -535,6 +552,11 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         }
                     }
 
+                    if constexpr (NUM_HEADS == 32) {
+                        const int num_blocks = IS_EXTRA_BLOCK ? params.extra_num_blocks : params.num_blocks;
+                        if (token_index < 0 || int64_t(token_index) >= int64_t(num_blocks) * page_block_size)
+                            token_index = -1;
+                    }
                     int block_index = token_index == -1 ? 0 : (int)((uint32_t)token_index/(uint32_t)page_block_size);   // Use uint32_t division and mod to improve performance
                     int rel_idx_in_block = (uint32_t)token_index % (uint32_t)page_block_size;   // NOTE When token_index is -1 (UINT_MAX), UINT_MAX%page_block_size < page_block_size, so there will be no illegal-memory-access error
 
@@ -628,6 +650,11 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 if (idx_in_warpgroup < 32) {
                     // We put this after fence_view_async_shared() since this won't be read by async proxy
                     auto is_index_valid = [&](int index, int offset_within_thread) -> bool {
+                        if constexpr (NUM_HEADS == 32) {
+                            const int num_blocks = IS_EXTRA_BLOCK ? params.extra_num_blocks : params.num_blocks;
+                            if (index < 0 || int64_t(index) >= int64_t(num_blocks) * page_block_size)
+                                return false;
+                        }
                         if constexpr (MODEL_TYPE == ModelType::V32) {
                             return index != -1;
                         } else {
@@ -689,7 +716,7 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &pa
     KU_ASSERT(params.topk % TOPK_BLOCK_SIZE == 0);
     KU_ASSERT(params.d_qk == HEAD_DIM_K);
     KU_ASSERT(params.d_v == HEAD_DIM_V);
-    KU_ASSERT(params.h_q % BLOCK_M == 0);
+    KU_ASSERT(params.h_q == NUM_HEADS);
     if constexpr (MODEL_TYPE == ModelType::V4) {
         constexpr int BYTES_PER_TOKEN = HEAD_DIM_NOPE + 2*HEAD_DIM_ROPE + 8;
         KU_ASSERT(params.stride_kv_row == BYTES_PER_TOKEN, "Each page block in KV cache must be contiguous for head64 sparse fp8 decoding attention in DeepSeek-V4");  // Each block must be contiguous

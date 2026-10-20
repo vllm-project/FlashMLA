@@ -98,8 +98,8 @@ def flash_mla_with_kvcache(
         topk_length/extra_topk_length: (batch_size, ), torch.int32. If provided, only the leftmost topk_length indices will be processed. Useful when the actual topk for different queries are different so that we can save some computation, compared to masking.
         enable_batch_invariant: bool. If True, split-KV decoding is disabled so that the result does not
                 depend on how the batch is partitioned. It must keep the same value across every reuse of
-                a given sched_meta. The SM90 kernels and the NVFP4 cache have no unsplit path and reject
-                it.
+                a given sched_meta. On SM90, only the native 8/16/32-head sparse path supports it;
+                the 64/128-head kernels and the NVFP4 cache reject it.
         out: Optional pre-allocated output tensor with shape (batch_size, seq_len_q, num_heads_q, head_dim_v), same dtype as q, and contiguous. If provided, the result will be written into this buffer to avoid allocation. For dense attention, only num_heads_k == 1 (MLA) is supported.
     
     For DeepSeek V3, DeepSeek V3.1, and DeepSeek V3.2:
@@ -130,6 +130,17 @@ def flash_mla_with_kvcache(
         `page_block_size` scale rows afterwards:
             - V4 (584 Bytes per token): the data row is 448 float8_e4m3 NoPE values followed by 64 bfloat16 RoPE values (not quantized); the scale row is 8 Bytes, of which the first 7 are float8_e8m0 scales (the 8th byte is padding), each covering 64 consecutive float8_e4m3 values of the NoPE part.
         See tests/quant.py for quantization and dequantization details.
+
+    SM90 sparse decode supports 8/16/32 query heads natively with the 584-byte V4
+    and 656-byte V3.2 FP8 cache formats. Pass the actual head count to avoid
+    padding computation. Strided Q and output head slices of padded buffers
+    are supported. For 32 heads and at least 32 query rows (4 rows when the
+    total key width exceeds 128), aligned buffers
+    with fixed top-k widths divisible by 64 use a persistent WGMMA kernel
+    with masked head rows. V3.2 extra KV, dynamic top-k lengths and
+    enable_batch_invariant use the small-tile kernel. That kernel chooses
+    splits from the query count and key width and reads current device top-k
+    lengths on every invocation. Benchmark the intended shapes and layouts.
 
     Return:
         out: (batch_size, seq_len_q, num_heads_q, head_dim_v).
