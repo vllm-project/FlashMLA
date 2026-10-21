@@ -178,6 +178,12 @@ struct SparseAttnDecodeParams {
     DecodingSchedMeta* __restrict__ tile_scheduler_metadata_ptr; // [num_sm_parts], tile scheduling metadata
     int* __restrict__ num_splits_ptr; // [batch_size+1], cumulative split counts per request
     int num_sm_parts;               // Number of SM partitions for split-KV scheduling
+
+    // Row masks (SM90 only) — lets one query tile hold several queries that share a key list.
+    // Row r of the tile belongs to slot r / rows_per_slot; bit s of mask[i] says whether slot s attends key i.
+    const uint8_t* __restrict__ indices_mask;        // [b, s_q, topk], may be nullptr; same strides as `indices`
+    const uint8_t* __restrict__ extra_indices_mask;  // [b, s_q, extra_topk], may be nullptr; same strides as `extra_indices`
+    int rows_per_slot;                               // 0 when no row mask is given
 };
 
 template<SparseAttnFwdMode FWD_MODE>
