@@ -22,6 +22,9 @@ namespace legacy::sm90::decode::sparse {
 static constexpr float MAX_INIT_VAL = -1e30;    // Prevent (-inf) - (-inf) = nan
 using cutlass::arch::fence_view_async_shared;
 using cutlass::arch::NamedBarrier;
+// Named barriers join only the two math warpgroups, from distinct control-flow
+// paths. Use the unaligned PTX forms; bar.sync/bar.arrive promise CTA-wide
+// convergence, which the producer warpgroup does not participate in.
 using fp8_e8m0 = __nv_fp8_e8m0;
 
 template<
@@ -132,6 +135,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
         cutlass::arch::fence_barrier_init();
     }
     ku::barrier_cluster_arrive_relaxed();
+    // Election at initialization and at the Q load can choose different
+    // lanes. Publish initialized barriers to every issuer before a TMA load
+    // or arrive-and-expect operation can touch them.
+    ku::barrier_cluster_wait_acquire();
 
     int bar_phase_k = 0; // Don't use array here to prevent using local memory
 
@@ -151,8 +158,6 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
         launch_tma_copy(tma_params.tma_Q, gQ, sQ, plan.bar_q, TMA::CacheHintSm90::EVICT_FIRST);
         plan.bar_q.arrive_and_expect_tx(BLOCK_M*HEAD_DIM_K*sizeof(bf16));
     }
-
-    ku::barrier_cluster_wait_acquire();
 
     struct MainloopArgs {
         int start_block_idx, end_block_idx;
@@ -240,7 +245,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 
                 // Calculate S = softmax(mask(scale(P)))
                 if (block_idx != args.start_block_idx)
-                    NamedBarrier::arrive_and_wait(256, NamedBarriers::sScale_and_sS_free);  // Make sure that sScale and sS is free
+                    NamedBarrier(256, NamedBarriers::sScale_and_sS_free).arrive_and_wait_unaligned();  // Make sure that sScale and sS is free
 
                 // Since in our case TOPK_BLOCK_SIZE == BLOCK_M, so we only need to do OOB checking for the last 2 blocks
                 scale_softmax(rP, rS, rO, params.sm_scale_div_log2, sScale, rM, rL, plan.is_kv_valid[buf_idx], block_idx, idx_in_warpgroup);
@@ -257,7 +262,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     rO
                 );
 
-                NamedBarrier::arrive(256, NamedBarriers::sScale_and_sS_ready);
+                NamedBarrier(256, NamedBarriers::sScale_and_sS_ready).arrive_unaligned();
 
                 cute::warpgroup_wait<0>();
 
@@ -316,7 +321,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
             // This is a synchronization point for warpgroup 0/1.
             // Warpgroup 0 should wait wg 1 for oBuf/oAccumBuf (overlapped with k) to be free
             // Warpgroup 1 should wait wg 0 for sL to be ready
-            NamedBarrier::arrive_and_wait(256, NamedBarriers::oBuf_free_and_sL_ready);
+            NamedBarrier(256, NamedBarriers::oBuf_free_and_sL_ready).arrive_and_wait_unaligned();
 
             CUTE_UNROLL
             for (int i = 0; i < 2; ++i)
@@ -381,7 +386,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 Tensor sV = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data() + (SmemLayoutV{})(_256{}, _0{})), SmemLayoutHalfV{});
 
                 // Wait for S and sScale
-                NamedBarrier::arrive_and_wait(256, NamedBarriers::sScale_and_sS_ready);
+                NamedBarrier(256, NamedBarriers::sScale_and_sS_ready).arrive_and_wait_unaligned();
 
                 // Scale O
                 float cur_scales[2];
@@ -412,10 +417,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 }
                 
                 if (block_idx != args.end_block_idx-1)
-                    NamedBarrier::arrive(256, NamedBarriers::sScale_and_sS_free);   // Tell WG0 that sScale and sS are available
+                    NamedBarrier(256, NamedBarriers::sScale_and_sS_free).arrive_unaligned();   // Tell WG0 that sScale and sS are available
             }
 
-            NamedBarrier::arrive_and_wait(256, NamedBarriers::oBuf_free_and_sL_ready);
+            NamedBarrier(256, NamedBarriers::oBuf_free_and_sL_ready).arrive_and_wait_unaligned();
 
             float o_scales[2];
             CUTE_UNROLL
