@@ -7,6 +7,11 @@ from setuptools import setup, find_packages
 
 THIS_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 
+
+def is_flag_set(flag: str) -> bool:
+    return os.getenv(flag, "FALSE").lower() in ["true", "1", "y", "yes"]
+
+
 EXT_NAME_CUDA = "flash_mla._flashmla_C"
 
 CUDA_API_SOURCES = [
@@ -63,9 +68,13 @@ LEGACY_KERNEL_SOURCES = [
     "csrc/cuda_kernels/legacy/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
     "csrc/cuda_kernels/legacy/smxx/decode/combine/combine.cu",
 
-    # sm90 dense decode (DeepSeek V3 / V3.1, GLM5Next)
-    "csrc/cuda_kernels/legacy/sm90/decode/dense/instantiations/fp16.cu",
-    "csrc/cuda_kernels/legacy/sm90/decode/dense/instantiations/bf16.cu",
+    # sm90 dense decode (DeepSeek V3 / V3.1, GLM5Next). These are the only wgmma kernels
+    # left in this list and `ptxas` rejects wgmma for sm_120a, so an sm120-only build drops
+    # them; the API entry point stays registered and rejects SM90 at runtime.
+    *([] if is_flag_set("FLASH_MLA_DISABLE_SM90_DENSE_DECODE") else [
+        "csrc/cuda_kernels/legacy/sm90/decode/dense/instantiations/fp16.cu",
+        "csrc/cuda_kernels/legacy/sm90/decode/dense/instantiations/bf16.cu",
+    ]),
 
     # sm90 sparse decode
     "csrc/cuda_kernels/legacy/sm90/decode/sparse/instantiations/v4_persistent_h64.cu",
@@ -99,9 +108,36 @@ LEGACY_KERNEL_SOURCES = [
       for norm in ("norm", "nonorm")],
 ]
 
+# Register `mma.sync` kernels for sm_120a, where upstream has none: sm_120a rejects both
+# tcgen05 and wgmma, so these are standalone kernels (csrc/cuda_kernels/sm120/) rather than
+# ports. Their gencode is behind FLASH_MLA_DISABLE_SM120, but they are always compiled: the
+# arch they target is selected at runtime by the API.
+SM120_KERNEL_SOURCES = [
+    "csrc/cuda_kernels/sm120/decode/dense/instantiations/bf16_512.cu",
+    "csrc/cuda_kernels/sm120/decode/dense/instantiations/bf16_576.cu",
+    "csrc/cuda_kernels/sm120/decode/dense/instantiations/fp16_512.cu",
+    "csrc/cuda_kernels/sm120/decode/dense/instantiations/fp16_576.cu",
 
-def is_flag_set(flag: str) -> bool:
-    return os.getenv(flag, "FALSE").lower() in ["true", "1", "y", "yes"]
+    "csrc/cuda_kernels/sm120/decode/sparse/instantiations/v4_persistent_h64.cu",
+    "csrc/cuda_kernels/sm120/decode/sparse/instantiations/v4_persistent_h128.cu",
+    "csrc/cuda_kernels/sm120/decode/sparse/instantiations/v32_persistent_h64.cu",
+    "csrc/cuda_kernels/sm120/decode/sparse/instantiations/v32_persistent_h128.cu",
+
+    "csrc/cuda_kernels/sm120/prefill/dense/instantiations/d128.cu",
+    "csrc/cuda_kernels/sm120/prefill/dense/instantiations/d192.cu",
+
+    "csrc/cuda_kernels/sm120/prefill/sparse/instantiations/k512.cu",
+    "csrc/cuda_kernels/sm120/prefill/sparse/instantiations/k576.cu",
+
+    "csrc/cuda_kernels/sm120/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_q_b_proj/kernel.cu",
+    "csrc/cuda_kernels/sm120/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_wv_proj/kernel.cu",
+    # 6 instantiations per head count: V4 / V4.1 fp8 / V4.1 fp4 decode, each with and without
+    # q norm, plus V4 prefill with and without q norm (prefill KV is bf16, format inert)
+    *[f"csrc/cuda_kernels/sm120/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/{model}_h{h}_{mode}_{norm}.cu"
+      for h in HEADS_FOR_FUSED_CORE_ATTN
+      for model, mode in (("v4", "prefill"), ("v4", "decode"), ("v41", "decode"), ("v41fp4", "decode"))
+      for norm in ("norm", "nonorm")],
+]
 
 
 def get_features_args():
@@ -120,6 +156,8 @@ def get_features_args():
     ]
     if is_flag_set("FLASH_MLA_DISABLE_FP16"):
         features_args.append("-DFLASH_MLA_DISABLE_FP16")
+    if is_flag_set("FLASH_MLA_DISABLE_SM90_DENSE_DECODE"):
+        features_args.append("-DFLASH_MLA_DISABLE_SM90_DENSE_DECODE")
     return features_args
 
 
@@ -135,14 +173,18 @@ def get_arch_flags(cuda_home):
 
     DISABLE_SM100 = is_flag_set("FLASH_MLA_DISABLE_SM100")
     DISABLE_SM90 = is_flag_set("FLASH_MLA_DISABLE_SM90")
+    DISABLE_SM120 = is_flag_set("FLASH_MLA_DISABLE_SM120")
     if major < 12 or (major == 12 and minor <= 8):
-        assert DISABLE_SM100, "sm100 compilation for Flash MLA requires NVCC 12.9 or higher. Please set FLASH_MLA_DISABLE_SM100=1 to disable sm100 compilation, or update your environment."    # TODO Implement this
+        assert DISABLE_SM100 and DISABLE_SM120, "sm100/sm120 compilation for Flash MLA requires NVCC 12.9 or higher. Please set FLASH_MLA_DISABLE_SM100=1 and/or FLASH_MLA_DISABLE_SM120=1 to disable, or update your environment."    # TODO Implement this
 
     arch_flags = []
     if not DISABLE_SM100:
         # We use architecture-specific (sm_100a / sm_103a) targets instead of the family-specific one (sm_100f) for better SASS code generation
         arch_flags.extend(["-gencode", "arch=compute_100a,code=sm_100a"])
         arch_flags.extend(["-gencode", "arch=compute_103a,code=sm_103a"])
+    if not DISABLE_SM120:
+        # sm_120a: Blackwell consumer/professional (RTX PRO 6000 / GeForce RTX 50)
+        arch_flags.extend(["-gencode", "arch=compute_120a,code=sm_120a"])
     if not DISABLE_SM90:
         arch_flags.extend(["-gencode", "arch=compute_90a,code=sm_90a"])
     return arch_flags
@@ -176,6 +218,7 @@ def build_on_cuda_platform():
                 *CUDA_API_SOURCES,
                 *CUDA_KERNEL_SOURCES,
                 *LEGACY_KERNEL_SOURCES,
+                *SM120_KERNEL_SOURCES,
             ],
             extra_compile_args={
                 # kerutils sets KERUTILS_IS_BUILD_ON_CUDA itself when __CUDACC__ is defined, so
