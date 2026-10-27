@@ -2,6 +2,8 @@
 
 Run from the repository root:
     PYTHONPATH=. python tests/bench_small_heads_sparse_prefill.py --tokens 1024 8192
+Set USE_MMA_FOR_SMALL_N_HEAD=1 to measure the previous mma.sync small-heads
+kernel instead of the transposed kernel.
 Timings use warm caches; compare ratios within the same run.
 """
 import argparse
