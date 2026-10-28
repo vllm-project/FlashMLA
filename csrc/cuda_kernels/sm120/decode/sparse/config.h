@@ -2,6 +2,8 @@
 
 #include <math_constants.h>
 #include <cute/tensor.hpp>
+#include <cute/arch/mma_sm89.hpp>
+#include <cute/atom/mma_traits_sm89.hpp>
 #include <cutlass/cluster_launch.hpp>
 #include <cutlass/arch/reg_reconfig.h>
 #include <cutlass/arch/arch.h>
@@ -51,6 +53,13 @@ static constexpr int NUM_QK_SEG = HEAD_DIM_K / D_QK_SEG;
 // ldmatrix rows) and rotates the banks.
 static constexpr int K_ROW_BYTES = HEAD_DIM_NOPE + HEAD_DIM_ROPE*2;
 static constexpr int K_ROW_PAD = K_ROW_BYTES + 16;
+// Q is resident the same way, and for the same reason: the fp8 QK mma wants its
+// A operand in e4m3, so Q is quantized per (row, 128-dim tile) once per block
+// instead of per segment. Only the nope dims live here - the rope segment keeps
+// the bf16 mma and reads its Q from gmem, so the plane is 512 B/row.
+static constexpr int Q_ROW_BYTES = HEAD_DIM_NOPE;
+static constexpr int Q_ROW_PAD = Q_ROW_BYTES + 16;
+static constexpr int Q_BYTES = BLOCK_M * Q_ROW_PAD;
 // byte offset of dim d inside its own row
 static constexpr int k_dim_byte(int d) {
     return d < HEAD_DIM_NOPE ? d : HEAD_DIM_NOPE + (d - HEAD_DIM_NOPE)*2;
@@ -78,9 +87,13 @@ using SmemLayoutS = decltype(coalesce(tile_to_shape(
 
 // O staging buffer for the no-split TMA store: keep the 128B-swizzled GMMA layout
 // so the 5D tensor_map_o descriptor built by the host works unchanged.
+// Half of O at a time (256 of the 512 V dims). A full-width staging buffer is
+// 64 KB and the Q plane (33 KB, row 12) no longer fits beside it; the epilogue
+// stores the two halves back to back out of the same buffer instead, which is
+// free because it runs once per batch, not per page.
 using SmemLayoutOBuf = decltype(tile_to_shape(
     GMMA::Layout_K_SW128_Atom<bf16>{},
-    Shape<Int<BLOCK_M>, Int<HEAD_DIM_V>>{},
+    Shape<Int<BLOCK_M>, Int<HEAD_DIM_V/2>>{},
     Step<_1, _2>{}
 ));
 
@@ -92,10 +105,15 @@ struct SharedMemoryPlan {
     // Per-token dequant scales, so the fragment load can convert without the
     // producer having done it. NUM_SCALES per token, indexed dim/QUANT_TILE_SIZE.
     bf16 sScales[TOPK_BLOCK_SIZE * NUM_SCALES];
-    // WG1's QK partial, published for WG0 to add before the softmax. fp32:
-    // rounding the partial to bf16 shifts lse by ~2e-4, and the sparse lse gate
-    // is 1e-6 abs / 1.2e-4 rel.
-    float sP[BLOCK_M * TOPK_BLOCK_SIZE];
+    // Q as e4m3, one row per mma row, quantized once per block. The rope dims
+    // stay in gmem and keep the bf16 mma.
+    CUTE_ALIGNAS(1024) array_aligned<uint8_t, Q_BYTES> q;
+    // Per-(row, 128-dim tile) Q scales, mirrored to sScales' indexing.
+    bf16 sQscales[BLOCK_M * NUM_SCALES];
+    // WG1's QK partial, published for WG0 to add before the softmax. fp16: the
+    // Q plane costs 33 KB, so the fp32 form (16 KB) no longer fits the 99 KB cap;
+    // fp16 lands at 91 KB and keeps the 1.2e-4 rel gate, where bf16's 2e-4 does not.
+    __half sP[BLOCK_M * TOPK_BLOCK_SIZE];
     CUTE_ALIGNAS(1024) array_aligned<bf16, cosize_v<SmemLayoutS>> s;
     bool is_kv_valid[TOPK_BLOCK_SIZE];
 
@@ -114,6 +132,19 @@ using TMMA_SM120 = decltype(make_tiled_mma(
 ));
 
 using TiledMMA_QK = TMMA_SM120;
+
+// The nope dims run on the fp8 atom: e4m3 A and B, k = 32. Its B fragment is 2
+// registers of 4 consecutive bytes each (k = 4*(t%4) + {0..3} and +16, see
+// MMA_Traits<SM89_16x8x32_F32E4M3E4M3F32_TN>), i.e. exactly two 4-byte aligned
+// reads out of the raw plane - no conversion and no scale in the inner loop. The
+// C fragment is the same SM80_16x8_Row layout as TMMA_SM120, so rP, rS, the
+// save_rS_to_sS map and scale_softmax are shared.
+using TMMA_SM120_FP8 = decltype(make_tiled_mma(
+    SM89_16x8x32_F32E4M3E4M3F32_TN{},
+    Layout<Shape<_4, _1, _1>>{},
+    Layout<Shape<_1, _1, _1>>{}
+));
+using TiledMMA_QK8 = TMMA_SM120_FP8;
 using TiledMMA_PV_LocalP = TMMA_SM120;   // WG0: rS stays in registers (gemm_rs)
 using TiledMMA_PV_RemoteP = TMMA_SM120;  // WG1: rS re-read from sS (gemm_ss)
 

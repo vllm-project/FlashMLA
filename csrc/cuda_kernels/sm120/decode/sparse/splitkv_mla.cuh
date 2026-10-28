@@ -86,6 +86,16 @@ __device__ __forceinline__ __nv_bfloat162 cvt_fp8x2_bf16x2(
     return __float22bfloat162_rn((float2)v) * scale;
 }
 
+// bf16x8 -> e4m3x8 with a per-row scale (V32's Q quantization, once per batch).
+__device__ __forceinline__ fp8x8 quant_bf16x8(const bf16x8 &v, float qs) {
+    float2 a = __bfloat1622float2(v.a01), b = __bfloat1622float2(v.a23);
+    float2 c = __bfloat1622float2(v.a45), d = __bfloat1622float2(v.a67);
+    fp8x8 o;
+    o.lo = __nv_fp8x4_e4m3(make_float4(a.x*qs, a.y*qs, b.x*qs, b.y*qs));
+    o.hi = __nv_fp8x4_e4m3(make_float4(c.x*qs, c.y*qs, d.x*qs, d.y*qs));
+    return o;
+}
+
 // Load the e4m3 B tile `sB8` into the bf16 fragment `rB`, scaling each element
 // by its token's scale from `sSc`. `sSc` is laid out like `sB8` in the axis that
 // carries the token (n for QK, k for PV). The mma B atom pairs k, so KCONTIG
@@ -374,6 +384,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
 
     TiledMMA_QK tiled_mma_QK{};
     auto thr_mma_QK = tiled_mma_QK.get_slice(idx_in_warpgroup);
+    TiledMMA_QK8 tiled_mma_QK8{};
+    auto thr_mma_QK8 = tiled_mma_QK8.get_slice(idx_in_warpgroup);
     TiledMMA_PV_LocalP tiled_mma_PV{};
     auto thr_mma_PV = tiled_mma_PV.get_slice(idx_in_warpgroup);
 
@@ -457,6 +469,36 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
             Tile<Int<BLOCK_M>, Int<HEAD_DIM_K>>{}
         )(_, _, head_block_idx, _0{});   // (BLOCK_M, HEAD_DIM_K)
 
+        // -------- Q to e4m3, once per batch --------
+        // One scale per row over the whole nope half (the probe says granularity
+        // is not the lever), so the scale is a single multiply folded into rP
+        // after the QK loop and the plane needs no per-tile bookkeeping. The rope
+        // dims stay bf16 and keep the bf16 mma.
+        {
+            {
+                const int row = threadIdx.x & 63;
+                CUTE_NO_UNROLL
+                for (int tile = threadIdx.x >> 6; tile < HEAD_DIM_NOPE/QUANT_TILE_SIZE; tile += 4) {
+                    const bf16* src = &gQ(row, tile*QUANT_TILE_SIZE);
+                    float amax = 0.f;
+                    CUTE_UNROLL
+                    for (int i = 0; i < QUANT_TILE_SIZE; ++i)
+                        amax = fmaxf(amax, fabsf((float)src[i]));
+                    const bf16 deq = amax > 0.f ? (bf16)(amax/448.f) : (bf16)1.f;
+                    plan.sQscales[row*NUM_SCALES + tile] = deq;
+                    const float qs = 1.f/(float)deq;
+                    fp8* dst = (fp8*)plan.q.data() + (uint64_t)row*Q_ROW_PAD + tile*QUANT_TILE_SIZE;
+                    CUTE_UNROLL
+                    for (int c = 0; c < QUANT_TILE_SIZE/8; ++c) {
+                        bf16x8 v = load_128b_from_gmem<bf16x8, L1CacheHint::EVICT_LAST, L2PrefetchHint::B256>(src + 8*c);
+                        fp8x8 o = quant_bf16x8(v, qs);
+                        *(uint64_t*)(dst + 8*c) = *(uint64_t*)&o;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+
         CUTE_NO_UNROLL
         for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; ++block_idx) {
             // -------- phase 1: dequant K (all 256 threads) --------
@@ -487,31 +529,78 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 const int k_begin = (warpgroup_idx == 0 ? 0 : QK_SPLIT) * 16;
                 const int k_end = (warpgroup_idx == 0 ? QK_SPLIT : HEAD_DIM_K/16) * 16;
                 cute::clear(rP);
-                // 16 dims at a time: the source is either e4m3 bytes that need
-                // the token scale or plain bf16 (the rope dims).
+                // The nope dims run the fp8 atom, 32 dims at a time: both
+                // fragments are filled with raw 4-byte reads out of the planes
+                // (see TiledMMA_QK8). The token scale is applied to rP, but only
+                // when the 128-dim quant tile changes - and once more before the
+                // rope dims, which carry no scale. The row's Q scale is one
+                // multiply after the loop. The rope segment keeps the bf16 atom
+                // and its Q from gmem.
+                const int qk_lane = idx_in_warpgroup % 32;
+                const int qk_row = 16*(idx_in_warpgroup/32) + qk_lane/4;
+                const int qk_k0 = 4*(qk_lane % 4);
+                auto apply_k_tile_scale = [&](int tile) {
+                    const bf16* sc = plan.sScales + tile;
+                    const float sq0 = (float)plan.sQscales[qk_row*NUM_SCALES + tile];
+                    const float sq1 = (float)plan.sQscales[(qk_row + 8)*NUM_SCALES + tile];
+                    CUTE_UNROLL
+                    for (int nb = 0; nb < TOPK_BLOCK_SIZE/8; ++nb)
+                        CUTE_UNROLL
+                        for (int lut = 0; lut < 2; ++lut)
+                            CUTE_UNROLL
+                            for (int cp = 0; cp < 2; ++cp)
+                                rP(4*nb + 2*lut + cp) *= (float)sc[
+                                    (8*nb + 2*(idx_in_warpgroup%4) + cp)*NUM_SCALES] * (lut ? sq1 : sq0);
+                };
+                int pending_tile = -1;
                 CUTE_NO_UNROLL
-                for (int k = k_begin; k < k_end; k += 16) {
-                    Tensor gQk = local_tile(gQ, Shape<Int<BLOCK_M>, _16>{}, make_coord(_0{}, k/16));
-                    Tensor rQa = thr_mma_QK.partition_fragment_A(gQk);
-                    cute::copy(thr_mma_QK.partition_A(gQk), rQa);
+                for (int k = k_begin; k < k_end; k += 32) {
                     uint8_t* p = sKbytes + k_dim_byte(k);
-                    Tensor sSc = make_tensor(
-                        plan.sScales + k/QUANT_TILE_SIZE,
-                        Layout<Shape<Int<TOPK_BLOCK_SIZE>, _16>, Stride<Int<NUM_SCALES>, _0>>{});
-                    if (k + 16 <= HEAD_DIM_NOPE) {
+                    if (k + 32 <= HEAD_DIM_NOPE) {
+                        if ((int)(k/QUANT_TILE_SIZE) != pending_tile) {
+                            if (pending_tile >= 0) apply_k_tile_scale(pending_tile);
+                            pending_tile = k/QUANT_TILE_SIZE;
+                        }
+                        // A: registers are (row, k0+{0..3}) and the same at +16,
+                        // for rows qk_row and qk_row+8.
+                        Tensor sQk = make_tensor(
+                            (fp8*)plan.q.data() + k,
+                            Layout<Shape<Int<BLOCK_M>, _32>, Stride<Int<Q_ROW_PAD>, _1>>{});
+                        Tensor rQa = thr_mma_QK8.partition_fragment_A(sQk);
+                        const uint8_t* qa = plan.q.data() + (uint64_t)qk_row*Q_ROW_PAD + k + qk_k0;
+                        *(uint32_t*)&rQa(0)  = *(const uint32_t*)(qa);
+                        *(uint32_t*)&rQa(4)  = *(const uint32_t*)(qa + 8*Q_ROW_PAD);
+                        *(uint32_t*)&rQa(8)  = *(const uint32_t*)(qa + 16);
+                        *(uint32_t*)&rQa(12) = *(const uint32_t*)(qa + 8*Q_ROW_PAD + 16);
                         Tensor sB = make_tensor(
-                            p, Layout<Shape<Int<TOPK_BLOCK_SIZE>, _16>, Stride<Int<K_ROW_PAD>, _1>>{});
-                        Tensor rKb = thr_mma_QK.partition_fragment_B(sB);
-                        dequant_b_frag<true>(rKb, thr_mma_QK, sB, sSc, 2*(idx_in_warpgroup & 3));
-                        cute::gemm(tiled_mma_QK, rQa, rKb, rP);
+                            (fp8*)p, Layout<Shape<Int<TOPK_BLOCK_SIZE>, _32>, Stride<Int<K_ROW_PAD>, _1>>{});
+                        Tensor rKb = thr_mma_QK8.partition_fragment_B(sB);
+                        const uint8_t* kb = p + (uint64_t)(qk_lane/4)*K_ROW_PAD + qk_k0;
+                        CUTE_UNROLL
+                        for (int a = 0; a < TOPK_BLOCK_SIZE/8; ++a) {
+                            *(uint32_t*)&rKb(8*a)     = *(const uint32_t*)(kb + 8*a*K_ROW_PAD);
+                            *(uint32_t*)&rKb(8*a + 4) = *(const uint32_t*)(kb + 8*a*K_ROW_PAD + 16);
+                        }
+                        cute::gemm(tiled_mma_QK8, rQa, rKb, rP);
                     } else {
-                        Tensor sB = make_tensor(
-                            (bf16*)p, Layout<Shape<Int<TOPK_BLOCK_SIZE>, _16>, Stride<Int<K_ROW_PAD_BF16>, _1>>{});
-                        Tensor rKb = thr_mma_QK.partition_fragment_B(sB);
-                        cute::copy(thr_mma_QK.partition_B(sB), rKb);
-                        cute::gemm(tiled_mma_QK, rQa, rKb, rP);
+                        // rope: bf16, two 16-dim steps to keep the 32-dim loop stride.
+                        // It has no scale of its own, so the pending one goes in first.
+                        if (pending_tile >= 0) { apply_k_tile_scale(pending_tile); pending_tile = -1; }
+                        CUTE_UNROLL
+                        for (int kk = k; kk < k + 32; kk += 16) {
+                            Tensor gQk = local_tile(gQ, Shape<Int<BLOCK_M>, _16>{}, make_coord(_0{}, kk/16));
+                            Tensor rQa = thr_mma_QK.partition_fragment_A(gQk);
+                            cute::copy(thr_mma_QK.partition_A(gQk), rQa);
+                            Tensor sB = make_tensor(
+                                (bf16*)(sKbytes + k_dim_byte(kk)),
+                                Layout<Shape<Int<TOPK_BLOCK_SIZE>, _16>, Stride<Int<K_ROW_PAD_BF16>, _1>>{});
+                            Tensor rKb = thr_mma_QK.partition_fragment_B(sB);
+                            cute::copy(thr_mma_QK.partition_B(sB), rKb);
+                            cute::gemm(tiled_mma_QK, rQa, rKb, rP);
+                        }
                     }
                 }
+                if (pending_tile >= 0) apply_k_tile_scale(pending_tile);
             }
             __syncthreads();
             // rP registers carry the C-fragment (row, col) map of save_rS_to_sS
@@ -524,7 +613,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         CUTE_UNROLL
                         for (int cp = 0; cp < 2; ++cp)
                             plan.sP[(prow_base + 8*lut)*TOPK_BLOCK_SIZE + 8*nb + 2*(idx_in_warpgroup%4) + cp] =
-                                rP(4*nb + 2*lut + cp);
+                                (__half)rP(4*nb + 2*lut + cp);
             }
             __syncthreads();
             if (warpgroup_idx == 0) {
@@ -535,7 +624,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         CUTE_UNROLL
                         for (int cp = 0; cp < 2; ++cp)
                             rP(4*nb + 2*lut + cp) +=
-                                plan.sP[(prow_base + 8*lut)*TOPK_BLOCK_SIZE + 8*nb + 2*(idx_in_warpgroup%4) + cp];
+                                (float)plan.sP[(prow_base + 8*lut)*TOPK_BLOCK_SIZE + 8*nb + 2*(idx_in_warpgroup%4) + cp];
 
                 // softmax on segment 0; every segment rescales its own 64 cols
                 float scale_for_olds[2];
@@ -662,28 +751,36 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
             // base = 16*(t/32)+(t%32)/4; col = 8*(g/4)+2*(t%4)+(g%4)%2; lut=(g%4)/2.
             const int t = idx_in_warpgroup;
             const int base = 16*(t/32) + (t%32)/4;
+            // one half of V at a time, own warpgroup's half staged by itself
             CUTE_UNROLL
-            for (int s = 0; s < 4; ++s) {
-                Tensor sMySeg = local_tile(sOBuf, Shape<_64, _64>{}, make_coord(_0{}, warpgroup_idx*4 + s));
-                CUTE_UNROLL
-                for (int g = 0; g < 32; ++g) {
-                    int lut = (g%4)/2, cp = (g%4)%2;
-                    int row = base + 8*lut;
-                    int col = 8*(g/4) + 2*(t%4) + cp;
-                    sMySeg(row, col) = (bf16)(rO[s](g) * o_scales[lut]);
+            for (int h = 0; h < 2; ++h) {
+                if (warpgroup_idx == h) {
+                    CUTE_UNROLL
+                    for (int s = 0; s < 4; ++s) {
+                        Tensor sMySeg = local_tile(sOBuf, Shape<_64, _64>{}, make_coord(_0{}, s));
+                        CUTE_UNROLL
+                        for (int g = 0; g < 32; ++g) {
+                            int lut = (g%4)/2, cp = (g%4)%2;
+                            int row = base + 8*lut;
+                            int col = 8*(g/4) + 2*(t%4) + cp;
+                            sMySeg(row, col) = (bf16)(rO[s](g) * o_scales[lut]);
+                        }
+                    }
                 }
-            }
-            fence_view_async_shared();
-            __syncthreads();
+                fence_view_async_shared();
+                __syncthreads();
 
-            if (threadIdx.x == 0) {
-                SM90_TMA_STORE_5D::copy(
-                    &tma_params.tensor_map_O,
-                    plan.u.oBuf.data(),
-                    0, head_block_idx*64, 0,
-                    s_q_idx, batch_idx
-                );
-                cute::tma_store_arrive();
+                if (threadIdx.x == 0) {
+                    SM90_TMA_STORE_5D::copy(
+                        &tma_params.tensor_map_O,
+                        plan.u.oBuf.data(),
+                        0, head_block_idx*64, h*(HEAD_DIM_V/2/OBUF_SW),
+                        s_q_idx, batch_idx
+                    );
+                    cute::tma_store_arrive();
+                    cute::tma_store_wait<0>();
+                }
+                __syncthreads();
             }
 
             if (warpgroup_idx == 0) {
@@ -764,7 +861,7 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &pa
         // 5D TMA to store O
         uint64_t size[5] = {OBUF_SW, (unsigned long)params.h_q, HEAD_DIM_V/OBUF_SW, (unsigned long)params.s_q, (unsigned long)params.b};
         uint64_t stride[4] = {params.stride_o_h_q*sizeof(bf16), OBUF_SW*sizeof(bf16), params.stride_o_s_q*sizeof(bf16), params.stride_o_b*sizeof(bf16)};
-        uint32_t box_size[5] = {OBUF_SW, BLOCK_M, HEAD_DIM_V/OBUF_SW, 1, 1};
+        uint32_t box_size[5] = {OBUF_SW, BLOCK_M, HEAD_DIM_V/OBUF_SW/2, 1, 1};
         uint32_t elem_stride[5] = {1, 1, 1, 1, 1};
         CUresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
             &tensor_map_O,
