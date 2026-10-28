@@ -250,7 +250,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
             bf16 cached_q[NUM_CACHED_BF16_PER_THREAD];
             float q_sqr_sum = 0.0f;
 
-            uint32_t cur_q_position = __ldg(params.token_positions + cur_job.s_q_idx);
+            int64_t cur_q_position = __ldg(params.token_positions + cur_job.s_q_idx);   // Kept in int64, see the V4.1 kernel
             cached_cos[1] = __ldg(params.cos_sin_cache + cur_q_position * D_ROPE + lane_idx);
             cached_sin[1] = __ldg(params.cos_sin_cache + cur_q_position * D_ROPE + D_ROPE / 2 + lane_idx);
 

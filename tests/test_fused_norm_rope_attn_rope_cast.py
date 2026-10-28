@@ -207,7 +207,7 @@ def run_test(p: TestParam) -> bool:
 
     o_scale_gran = 32
     enable_q_norm = random.choice([False, True])
-    token_positions = torch.randint(0, max_token_position, (p.s_q, ), device='cuda', dtype=torch.int32)
+    token_positions = torch.randint(0, max_token_position, (p.s_q, ), device='cuda', dtype=torch.int64)
 
     wv_group_size = 8
     n_wv_group = p.h_q // 8
@@ -327,7 +327,7 @@ def run_decode_test(p: TestParam) -> bool:
         deep_gemm.fp8_gemm_nt(q_lora, weight, q, recipe_a=(1, q_b_proj_scale_gran), recipe_b=(1, q_b_proj_scale_gran))
         return q.view(b*s_q, p.h_q, p.d_qk)
     q_for_fused = calculate_q_b_proj(q_b_proj_permuted)
-    token_positions = torch.randint(0, max_token_position, (b*s_q, ), device='cuda', dtype=torch.int32)
+    token_positions = torch.randint(0, max_token_position, (b*s_q, ), device='cuda', dtype=torch.int64)
 
     def run_fused_norm_rope_attn_rope_cast_decode():
         # NOTE The kernel interface does not have the batch dimension (batch size is always 1),

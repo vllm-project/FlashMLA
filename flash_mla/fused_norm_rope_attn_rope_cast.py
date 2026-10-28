@@ -40,7 +40,7 @@ def prefill(
         rms_norm_eps: float. EPS for RMSNorm
 
     Args (RoPE):
-        token_positions: [s_q], int32
+        token_positions: [s_q], int64
         is_rope_neox_style: must be False now
         rope_dim: int32, must be 64 now
         cos_sin_cache: [*, rope_dim], float32
@@ -135,7 +135,7 @@ def decode(
         rms_norm_eps: float. EPS for RMSNorm
 
     Args (RoPE):
-        token_positions: [s_q], int32
+        token_positions: [s_q], int64
         is_rope_neox_style: must be False now
         rope_dim: int32, must be 64 now
         cos_sin_cache: [*, rope_dim], float32

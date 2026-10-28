@@ -94,7 +94,7 @@ def prefill_inputs(s_q: int, h_q: int, gen: torch.Generator, s_kv: int = 4096, t
     indices[torch.rand(indices.shape, device=DEV, generator=gen) < 0.1] = -1
     if s_q > 1:
         indices[1] = -1  # a token with no valid KV: lse = +inf, out = 0
-    positions = torch.randint(0, MAX_POS, (s_q,), dtype=torch.int32, device=DEV, generator=gen)
+    positions = torch.randint(0, MAX_POS, (s_q,), dtype=torch.int64, device=DEV, generator=gen)
     attn_sink = torch.randn((h_q,), dtype=torch.float32, device=DEV, generator=gen)
     return q, kv, indices, positions, attn_sink
 
@@ -104,7 +104,7 @@ def decode_inputs(s_q: int, h_q: int, fmt: str, gen: torch.Generator, num_blocks
     k_cache = make_kv_cache(fmt, num_blocks, block_size, gen)
     indices = torch.randint(0, num_blocks * block_size, (s_q, topk), dtype=torch.int32, device=DEV, generator=gen)
     indices[torch.rand(indices.shape, device=DEV, generator=gen) < 0.1] = -1
-    positions = torch.randint(0, MAX_POS, (s_q,), dtype=torch.int32, device=DEV, generator=gen)
+    positions = torch.randint(0, MAX_POS, (s_q,), dtype=torch.int64, device=DEV, generator=gen)
     attn_sink = torch.randn((h_q,), dtype=torch.float32, device=DEV, generator=gen)
     return q, k_cache, indices, positions, attn_sink
 
