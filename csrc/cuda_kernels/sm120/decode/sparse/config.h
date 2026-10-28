@@ -44,6 +44,10 @@ static constexpr int NUM_SCALES = MODEL_TYPE == ModelType::V32 ? 4 : 8;  // For 
 // 64x64 gemm = 32 A + 32 B + 32 C regs/thread, no register spill.
 static constexpr int D_QK_SEG = 64;
 static constexpr int NUM_QK_SEG = HEAD_DIM_K / D_QK_SEG;
+// 8-column pad per token (144 B token stride, bank rotation 4): the PV
+// ldmatrix reads and the QK B copies are conflict free, and 16 B stores stay
+// aligned because 144 is a multiple of 16.
+static constexpr int K_ROW_PAD = 72;
 
 // K/V shared layout: (SEG, TOKEN, COL64) -- each 64-col segment is a
 // standalone (64,64) NKContig stride (64,1), the mma.sync B-operand layout
@@ -54,11 +58,11 @@ static constexpr int NUM_QK_SEG = HEAD_DIM_K / D_QK_SEG;
 // value is the dequantized nope part of K, i.e. segments 0..7 of the K buffer.
 using SmemLayoutK = Layout<
     Shape<Int<NUM_QK_SEG>, Int<TOPK_BLOCK_SIZE>, Int<D_QK_SEG>>,
-    Stride<Int<TOPK_BLOCK_SIZE*D_QK_SEG>, Int<D_QK_SEG>, _1>
+    Stride<Int<TOPK_BLOCK_SIZE*K_ROW_PAD>, Int<K_ROW_PAD>, _1>
 >;
 using SmemLayoutV = Layout<
     Shape<Int<HEAD_DIM_V/D_QK_SEG>, Int<TOPK_BLOCK_SIZE>, Int<D_QK_SEG>>,
-    Stride<Int<TOPK_BLOCK_SIZE*D_QK_SEG>, Int<D_QK_SEG>, _1>
+    Stride<Int<TOPK_BLOCK_SIZE*K_ROW_PAD>, Int<K_ROW_PAD>, _1>
 >;
 
 using SmemLayoutS = decltype(coalesce(tile_to_shape(

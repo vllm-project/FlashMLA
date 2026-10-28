@@ -11,6 +11,7 @@
 
 #include <kerutils/kerutils.cuh>
 
+#include "cuda_kernels/sm120/cp_async.cuh"
 #include "cuda_kernels/utils.h"
 #include "components/dequant.h"
 #include "config.h"
@@ -18,6 +19,10 @@
 using namespace cute;
 
 namespace sm120::decode::sparse {
+
+#ifndef FLASH_MLA_SM120_PHASE_TIME
+#define FLASH_MLA_SM120_PHASE_TIME 0
+#endif
 
 static constexpr float MAX_INIT_VAL = -1e30;    // Prevent (-inf) - (-inf) = nan
 using cutlass::arch::fence_view_async_shared;
@@ -63,6 +68,7 @@ __device__ __forceinline__ void dequant_k_block(
     constexpr int QUANT_TILE_SIZE = Kernel::QUANT_TILE_SIZE;
     constexpr int TOPK_BLOCK_SIZE = Kernel::TOPK_BLOCK_SIZE;
     constexpr int D_QK_SEG = Kernel::D_QK_SEG;
+    constexpr int K_ROW_PAD = Kernel::K_ROW_PAD;
 
     const int token = threadIdx.x & 63;
     const int tg = threadIdx.x >> 6;    // 0..3 -> one of the 4 dim strips handled per token
@@ -138,10 +144,12 @@ __device__ __forceinline__ void dequant_k_block(
     }
 
     // (SEG, TOKEN, COL64) layout: dim d -> seg = d/64, col-in-seg = d%64, element
-    // address = seg*SEG_STRIDE + token*64 + col. 8-col int128 stores are 16B aligned.
-    constexpr int SEG_STRIDE = TOPK_BLOCK_SIZE * D_QK_SEG;
+    // address = seg*SEG_STRIDE + token*K_ROW_PAD + col. The 8-column pad keeps
+    // consecutive tokens 144 B apart (bank rotation 4), so the ldmatrix reads
+    // of the PV path are conflict free; 16 B stores stay aligned.
+    constexpr int SEG_STRIDE = TOPK_BLOCK_SIZE * K_ROW_PAD;
     auto sk_addr = [&](int dim) -> __int128_t* {
-        return (__int128_t*)(plan.u.k.data() + (dim / D_QK_SEG)*SEG_STRIDE + token*D_QK_SEG + dim % D_QK_SEG);
+        return (__int128_t*)(plan.u.k.data() + (dim / D_QK_SEG)*SEG_STRIDE + token*K_ROW_PAD + dim % D_QK_SEG);
     };
 
     // ----- nope dims (fp8, dequant): 8 x (16 dims) per thread -----
@@ -175,11 +183,16 @@ __device__ __forceinline__ void dequant_k_block(
         }
         CUTE_UNROLL
         for (int j = 0; j < 2; ++j) {
-            bf16x8 cur = load_128b_from_gmem<bf16x8, L1CacheHint::EVICT_LAST, L2PrefetchHint::B128>(gK_rope + dim16 + j*8);
-            if (!is_valid) *(uint128_t*)(&cur) = uint128_t();
-            *sk_addr(HEAD_DIM_NOPE + dim16 + j*8) = *(__int128_t*)&cur;
+            // rope is already bf16, so it can go straight through cp.async instead
+            // of a register round-trip; invalid tokens take the zero-fill form.
+            cp_async16(sk_addr(HEAD_DIM_NOPE + dim16 + j*8),
+                       gK_rope + dim16 + j*8, is_valid ? 16 : 0);
         }
     }
+    // The nope half above still writes smem with plain stores; this drains the
+    // rope copies so the block barrier publishes both halves together.
+    cp_commit();
+    cp_wait<0>();
 }
 
 // ---------------------------------------------------------------------------
@@ -188,9 +201,10 @@ __device__ __forceinline__ void dequant_k_block(
 //   WG0: QK (Q re-read from gmem per 64-dim segment) -> mask/softmax -> rS/sS;
 //        PV over V dims [0,256) with rS staying in registers (gemm_rs).
 //   WG1: PV over V dims [256,512) with rS re-read from sS (gemm_ss).
-// Single KV buffer (K dequantized dim-contiguous; V is K's nope part, no copy).
-// v0 sync model: plain __syncthreads() between phases (correctness first; the
-// gmem<->smem pipeline overlap / dual buffering comes with the perf pass).
+// Single KV buffer: K is dequantized fp8 -> bf16 into (SEG,TOKEN,COL64) with a
+// K_ROW_PAD stride, V is that buffer's nope part read dim-major by
+// ldmatrix.trans (no copy, no transpose). Sync is plain __syncthreads() between
+// the phases; dual buffering is still open (it needs the fp8 plane to fit).
 // ---------------------------------------------------------------------------
 template<ModelType MODEL_TYPE, int NUM_HEADS>
 template<typename TMAParams>
@@ -268,6 +282,17 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
     TiledMMA_PV_LocalP tiled_mma_PV{};
     auto thr_mma_PV = tiled_mma_PV.get_slice(idx_in_warpgroup);
 
+    // PV's B operand is V read DIM-major (K axis = token, stride 1). ldmatrix.trans
+    // reads the stored (token, dim) plane through a transposed view and returns
+    // the transposed fragment directly, so the per-block in-place transpose is
+    // gone. U16x4 (x2) covers exactly one 8n x 16k mma B atom, which is what
+    // make_tiled_copy_B requires; retile_D reinterprets the fragment.
+    auto ldsm_PV = make_tiled_copy_B(Copy_Atom<SM75_U16x4_LDSM_T, bf16>{}, tiled_mma_PV);
+    auto thr_ldsm_PV = ldsm_PV.get_slice(idx_in_warpgroup);
+    // element (d,t) lives at t*K_ROW_PAD + d in the untouched plane
+    static constexpr auto kTransposedView =
+        Layout<Shape<Int<D_QK_SEG>, Int<TOPK_BLOCK_SIZE>>, Stride<_1, Int<K_ROW_PAD>>>{};
+
     float rL[2], rM[2];
     // PV output: 4 independent 64-col C fragments (one 64x64
     // C per V N-segment; a single (64,256) C cannot be N-sliced by local_tile).
@@ -289,6 +314,14 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
         }
     }
 
+#if FLASH_MLA_SM120_PHASE_TIME
+    // Diagnostic only (compile with -DFLASH_MLA_SM120_PHASE_TIME=1): per-block
+    // clock64() deltas for the page copy, QK+softmax, the barrier that separates
+    // them from PV, and PV. Block 0 prints its totals once at the end.
+    unsigned long long ph_copy = 0, ph_qk = 0, ph_bar = 0, ph_pv = 0, t_prev = 0;
+    int pages = 0;
+    if (threadIdx.x == 0) t_prev = clock64();
+#endif
     #pragma unroll 1
     for (int batch_idx = sched_meta.begin_req_idx; batch_idx <= sched_meta.end_req_idx; ++batch_idx) {
         MainloopArgs args = get_cur_req_info(batch_idx);
@@ -316,6 +349,12 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     dequant_k_block<MODEL_TYPE, NUM_HEADS>(params, plan, batch_idx, s_q_idx, block_idx, args, true, true);
             }
             __syncthreads();
+#if FLASH_MLA_SM120_PHASE_TIME
+            if (threadIdx.x == 0) {
+                unsigned long long t = clock64();
+                ph_copy += t - t_prev; t_prev = t; ++pages;
+            }
+#endif
 
             // -------- phase 2 (WG0): QK + mask/softmax -> rS/sS --------
             if (warpgroup_idx == 0) {
@@ -323,10 +362,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 CUTE_NO_UNROLL
                 for (int seg = 0; seg < NUM_QK_SEG; ++seg) {
                     Tensor gQseg = local_tile(gQ, Shape<Int<BLOCK_M>, _64>{}, make_coord(_0{}, seg));
-                    // (SEG,TOKEN,COL64) -> standalone (64,64) NKContig stride (64,1) per segment
+                    // (SEG,TOKEN,COL64) -> standalone (64,64) NKContig stride (K_ROW_PAD,1) per segment
                     Tensor sKseg = make_tensor(
-                        sK.data() + seg*D_QK_SEG*TOPK_BLOCK_SIZE,
-                        Layout<Shape<Int<TOPK_BLOCK_SIZE>, Int<D_QK_SEG>>, Stride<Int<D_QK_SEG>, _1>>{});
+                        sK.data() + seg*K_ROW_PAD*TOPK_BLOCK_SIZE,
+                        Layout<Shape<Int<TOPK_BLOCK_SIZE>, Int<D_QK_SEG>>, Stride<Int<K_ROW_PAD>, _1>>{});
                     Tensor rQa = thr_mma_QK.partition_fragment_A(gQseg);
                     Tensor rKb = thr_mma_QK.partition_fragment_B(sKseg);
                     cute::copy(thr_mma_QK.partition_A(gQseg), rQa);
@@ -342,33 +381,20 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
 
                 save_rS_to_sS(rS, sS, idx_in_warpgroup);
                 fence_view_async_shared();
-                // Transpose V segs 0..7 to DIM-major (dim*64+token) so the PV B-partition's
-                // K-axis (token) is the fast stride-1 axis. cute::partition_fragment_B
-                // requires K-major B operands (verified: PV rO was garbage until transposed;
-                // QK's B already has K=dim fast and works). In-place pairwise swap per seg.
-                // Parallelized across the 128 WG0 threads. Visibility to both warpgroups
-                // is established by the __syncthreads() right after this branch. (No barrier
-                // inside this branch: that would be a divergent bar.sync -- WG1 never
-                // reaches it. The full-block barrier after the branch is sufficient.)
-                {
-                    bf16* svbase = plan.u.k.data();
-                    const int seg_elems = D_QK_SEG * TOPK_BLOCK_SIZE;
-                    const int total = 8 * seg_elems;
-                    for (int X = threadIdx.x; X < total; X += NUM_THREADS / 2) {
-                        const int sg = X / seg_elems;
-                        const int x = X - sg * seg_elems;
-                        const int t = x / D_QK_SEG, d = x - t * D_QK_SEG;
-                        const int y = d*TOPK_BLOCK_SIZE + t;
-                        if (x < y) {
-                            bf16 tmp = svbase[sg*seg_elems + x];
-                            svbase[sg*seg_elems + x] = svbase[sg*seg_elems + y];
-                            svbase[sg*seg_elems + y] = tmp;
-                        }
-                    }
+#if FLASH_MLA_SM120_PHASE_TIME
+                if (threadIdx.x == 0) {
+                    unsigned long long t = clock64();
+                    ph_qk += t - t_prev; t_prev = t;
                 }
-                fence_view_async_shared();
+#endif
             }
             __syncthreads();
+#if FLASH_MLA_SM120_PHASE_TIME
+            if (threadIdx.x == 0) {
+                unsigned long long t = clock64();
+                ph_bar += t - t_prev; t_prev = t;
+            }
+#endif
 
             // -------- phase 3: PV (each WG its half of V; V = K's nope, no dequant) --------
             if (warpgroup_idx == 0) {
@@ -382,10 +408,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 CUTE_NO_UNROLL
                 for (int seg = 0; seg < 4; ++seg) {
                     Tensor sVseg = make_tensor(
-                        sV.data() + seg*D_QK_SEG*TOPK_BLOCK_SIZE,
-                        Layout<Shape<Int<TOPK_BLOCK_SIZE>, Int<D_QK_SEG>>, Stride<Int<D_QK_SEG>, _1>>{});
+                        sV.data() + seg*K_ROW_PAD*TOPK_BLOCK_SIZE, kTransposedView);
                     Tensor rVb = thr_mma_PV.partition_fragment_B(sVseg);
-                    cute::copy(thr_mma_PV.partition_B(sVseg), rVb);
+                    cute::copy(ldsm_PV, thr_ldsm_PV.partition_S(sVseg),
+                               thr_ldsm_PV.retile_D(rVb));
                     cute::gemm(tiled_mma_PV, rSv, rVb, rO[seg]);
                 }
             } else {
@@ -403,16 +429,27 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 CUTE_NO_UNROLL
                 for (int seg = 0; seg < 4; ++seg) {
                     Tensor sVseg = make_tensor(
-                        sV.data() + (4 + seg)*D_QK_SEG*TOPK_BLOCK_SIZE,
-                        Layout<Shape<Int<TOPK_BLOCK_SIZE>, Int<D_QK_SEG>>, Stride<Int<D_QK_SEG>, _1>>{});
+                        sV.data() + (4 + seg)*K_ROW_PAD*TOPK_BLOCK_SIZE, kTransposedView);
                     Tensor rVb = thr_mma_PV.partition_fragment_B(sVseg);
-                    cute::copy(thr_mma_PV.partition_B(sVseg), rVb);
+                    cute::copy(ldsm_PV, thr_ldsm_PV.partition_S(sVseg),
+                               thr_ldsm_PV.retile_D(rVb));
                     cute::gemm(tiled_mma_PV, rSv, rVb, rO[seg]);
                 }
             }
             __syncthreads();
+#if FLASH_MLA_SM120_PHASE_TIME
+            if (threadIdx.x == 0) {
+                unsigned long long t = clock64();
+                ph_pv += t - t_prev; t_prev = t;
+            }
+#endif
         }
 
+#if FLASH_MLA_SM120_PHASE_TIME
+        if (blockIdx.x == 0 && blockIdx.z == 0 && threadIdx.x == 0)
+            printf("PHASE pages=%d copy=%llu qk=%llu tr=%llu pv=%llu\n",
+                   pages, ph_copy, ph_qk, ph_bar, ph_pv);
+#endif
         // -------- epilogue (per batch) --------
         if (warpgroup_idx == 0) {
             // combine L/M across the two rows this thread owns

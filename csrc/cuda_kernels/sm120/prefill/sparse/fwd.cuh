@@ -72,6 +72,13 @@ __device__ __forceinline__ void KernelTemplate<D_QK>::devfunc(const SparseAttnFw
     TiledMMA_PV_LocalP tiled_mma_PV{};
     auto thr_mma_PV = tiled_mma_PV.get_slice(idx_in_warpgroup);
 
+    // PV reads V DIM-major through ldmatrix.trans instead of transposing in
+    // smem; U16x4 (x2) covers exactly one 8n x 16k mma B atom.
+    auto ldsm_PV = make_tiled_copy_B(Copy_Atom<SM75_U16x4_LDSM_T, bf16>{}, tiled_mma_PV);
+    auto thr_ldsm_PV = ldsm_PV.get_slice(idx_in_warpgroup);
+    static constexpr auto kTransposedView =
+        Layout<Shape<Int<D_QK_SEG>, Int<TOPK_BLOCK_SIZE>>, Stride<_1, Int<K_ROW_PAD>>>{};
+
     float rL[2], rM[2];
     // PV output: 4 independent 64-col C fragments (same as decode).
     using ROType = decltype(partition_fragment_C(tiled_mma_PV, Shape<Int<BLOCK_M>, _64>{}));
@@ -127,9 +134,9 @@ __device__ __forceinline__ void KernelTemplate<D_QK>::devfunc(const SparseAttnFw
 
             // (SEG, TOKEN, COL64) layout: dim d -> seg = d/64, col-in-seg = d%64,
             // element address = seg*SEG_STRIDE + token*64 + col. 16B stores.
-            constexpr int SEG_STRIDE = TOPK_BLOCK_SIZE * D_QK_SEG;
+            constexpr int SEG_STRIDE = TOPK_BLOCK_SIZE * K_ROW_PAD;
             auto sk_addr = [&](int dim) -> __int128_t* {
-                return (__int128_t*)(plan.k.data() + (dim / D_QK_SEG)*SEG_STRIDE + token*D_QK_SEG + dim % D_QK_SEG);
+                return (__int128_t*)(plan.k.data() + (dim / D_QK_SEG)*SEG_STRIDE + token*K_ROW_PAD + dim % D_QK_SEG);
             };
 
             // bf16 straight copy: 16 dims per (i,j) step; tg covers every (NUM_QK_SEG*16)th dim.
@@ -155,8 +162,8 @@ __device__ __forceinline__ void KernelTemplate<D_QK>::devfunc(const SparseAttnFw
                 Tensor gQseg = local_tile(gQ, Shape<Int<BLOCK_M>, _64>{}, make_coord(_0{}, seg));
                 // (SEG,TOKEN,COL64) -> standalone (64,64) NKContig stride (64,1) per segment
                 Tensor sKseg = make_tensor(
-                    sK.data() + seg*D_QK_SEG*TOPK_BLOCK_SIZE,
-                    Layout<Shape<Int<TOPK_BLOCK_SIZE>, Int<D_QK_SEG>>, Stride<Int<D_QK_SEG>, _1>>{});
+                    sK.data() + seg*K_ROW_PAD*TOPK_BLOCK_SIZE,
+                    Layout<Shape<Int<TOPK_BLOCK_SIZE>, Int<D_QK_SEG>>, Stride<Int<K_ROW_PAD>, _1>>{});
                 Tensor rQa = thr_mma_QK.partition_fragment_A(gQseg);
                 Tensor rKb = thr_mma_QK.partition_fragment_B(sKseg);
                 cute::copy(thr_mma_QK.partition_A(gQseg), rQa);
@@ -172,29 +179,6 @@ __device__ __forceinline__ void KernelTemplate<D_QK>::devfunc(const SparseAttnFw
 
             save_rS_to_sS(rS, sS, idx_in_warpgroup);
             fence_view_async_shared();
-            // Transpose V segs 0..7 to DIM-major (dim*64+token) so the PV B-partition's
-            // K-axis (token) is the fast stride-1 axis (see decode config.h).
-            // Parallel K->V transpose across the 128 WG0 threads. Visibility to both
-            // warpgroups via the __syncthreads() right after this branch (WG1 never
-            // reaches a barrier inside this branch).
-            {
-                bf16* svbase = plan.k.data();
-                const int seg_elems = D_QK_SEG * TOPK_BLOCK_SIZE;
-                const int total = 8 * seg_elems;
-                CUTE_UNROLL
-                for (int X = threadIdx.x; X < total; X += NUM_THREADS / 2) {
-                    const int sg = X / seg_elems;
-                    const int x = X - sg * seg_elems;
-                    const int t_ = x / D_QK_SEG, d = x % D_QK_SEG;
-                    const int y = d*TOPK_BLOCK_SIZE + t_;
-                    if (x < y) {
-                        bf16 tmp = svbase[sg*seg_elems + x];
-                        svbase[sg*seg_elems + x] = svbase[sg*seg_elems + y];
-                        svbase[sg*seg_elems + y] = tmp;
-                    }
-                }
-            }
-            fence_view_async_shared();
         }
         __syncthreads();
 
@@ -206,10 +190,10 @@ __device__ __forceinline__ void KernelTemplate<D_QK>::devfunc(const SparseAttnFw
             CUTE_NO_UNROLL
             for (int seg = 0; seg < 4; ++seg) {
                 Tensor sVseg = make_tensor(
-                    sV.data() + seg*D_QK_SEG*TOPK_BLOCK_SIZE,
-                    Layout<Shape<Int<TOPK_BLOCK_SIZE>, Int<D_QK_SEG>>, Stride<Int<D_QK_SEG>, _1>>{});
+                    sV.data() + seg*K_ROW_PAD*TOPK_BLOCK_SIZE, kTransposedView);
                 Tensor rVb = thr_mma_PV.partition_fragment_B(sVseg);
-                cute::copy(thr_mma_PV.partition_B(sVseg), rVb);
+                cute::copy(ldsm_PV, thr_ldsm_PV.partition_S(sVseg),
+                           thr_ldsm_PV.retile_D(rVb));
                 cute::gemm(tiled_mma_PV, rSv, rVb, rO[seg]);
             }
         } else {
@@ -227,10 +211,10 @@ __device__ __forceinline__ void KernelTemplate<D_QK>::devfunc(const SparseAttnFw
             CUTE_NO_UNROLL
             for (int seg = 0; seg < 4; ++seg) {
                 Tensor sVseg = make_tensor(
-                    sV.data() + (4 + seg)*D_QK_SEG*TOPK_BLOCK_SIZE,
-                    Layout<Shape<Int<TOPK_BLOCK_SIZE>, Int<D_QK_SEG>>, Stride<Int<D_QK_SEG>, _1>>{});
+                    sV.data() + (4 + seg)*K_ROW_PAD*TOPK_BLOCK_SIZE, kTransposedView);
                 Tensor rVb = thr_mma_PV.partition_fragment_B(sVseg);
-                cute::copy(thr_mma_PV.partition_B(sVseg), rVb);
+                cute::copy(ldsm_PV, thr_ldsm_PV.partition_S(sVseg),
+                           thr_ldsm_PV.retile_D(rVb));
                 cute::gemm(tiled_mma_PV, rSv, rVb, rO[seg]);
             }
         }

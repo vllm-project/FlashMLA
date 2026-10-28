@@ -40,6 +40,9 @@ static constexpr int HEAD_DIM_NOPE = HEAD_DIM_V;
 
 static constexpr int D_QK_SEG = 64;
 static constexpr int NUM_QK_SEG = HEAD_DIM_K / D_QK_SEG;
+// 8-column pad per token (144 B stride, bank rotation 4) so the PV ldmatrix
+// reads and the QK B copies are conflict free; 16 B stores stay aligned.
+static constexpr int K_ROW_PAD = 72;
 
 // Same shared layouts as the decode kernel: each 64-col segment is a standalone
 // (64,64) NKContig stride (64,1); the mma.sync B operand of QK needs K (dim)
@@ -47,11 +50,11 @@ static constexpr int NUM_QK_SEG = HEAD_DIM_K / D_QK_SEG;
 // (dim*64+token) before PV.
 using SmemLayoutK = Layout<
     Shape<Int<NUM_QK_SEG>, Int<TOPK_BLOCK_SIZE>, Int<D_QK_SEG>>,
-    Stride<Int<TOPK_BLOCK_SIZE*D_QK_SEG>, Int<D_QK_SEG>, _1>
+    Stride<Int<TOPK_BLOCK_SIZE*K_ROW_PAD>, Int<K_ROW_PAD>, _1>
 >;
 using SmemLayoutV = Layout<
     Shape<Int<HEAD_DIM_V/D_QK_SEG>, Int<TOPK_BLOCK_SIZE>, Int<D_QK_SEG>>,
-    Stride<Int<TOPK_BLOCK_SIZE*D_QK_SEG>, Int<D_QK_SEG>, _1>
+    Stride<Int<TOPK_BLOCK_SIZE*K_ROW_PAD>, Int<K_ROW_PAD>, _1>
 >;
 
 using SmemLayoutS = decltype(coalesce(tile_to_shape(

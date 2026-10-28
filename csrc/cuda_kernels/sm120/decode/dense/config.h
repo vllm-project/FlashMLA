@@ -94,7 +94,10 @@ using SmemLayoutS = decltype(coalesce(tile_to_shape(
 
 struct SharedMemoryPlan {
     CUTE_ALIGNAS(1024) array_aligned<InputT, cosize_v<SmemLayoutK>> k;   // K (first 512 dims reused as V)
-    CUTE_ALIGNAS(1024) array_aligned<InputT, cosize_v<SmemLayoutS>> s;   // P in InputT (softmax output)
+    CUTE_ALIGNAS(1024) array_aligned<InputT, cosize_v<SmemLayoutS>> s;
+    // WG1's QK partial tile (bf16): the K segments are split across the two
+    // warpgroups, so WG1 publishes here and WG0 adds before the softmax.
+    CUTE_ALIGNAS(1024) array_aligned<InputT, BLOCK_M*PAGE_BLOCK_SIZE> sP;   // P in InputT (softmax output)
 
     float sM[BLOCK_M], sL[BLOCK_M], sScale[BLOCK_M], sOScale[BLOCK_M];
 };
@@ -167,7 +170,6 @@ static __forceinline__ __device__ void scale_softmax(
     bool do_softmax
 ) {
     if (do_softmax) {
-        const int base = 16*(idx_in_warpgroup/32) + (idx_in_warpgroup%32)/4;
         const int qcol = 2*(idx_in_warpgroup%4);
         constexpr int P_COL_SLOTS = decltype(size(rP))::value/4;   // PAGE_BLOCK_SIZE/8 == 8
         const int toff = block_idx*PAGE_BLOCK_SIZE;

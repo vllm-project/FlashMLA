@@ -1,7 +1,7 @@
 // Dense (raw bf16/fp16) MLA decode: register mma.sync, segmented dataflow.
 // Ported from the sm120 sparse DECODE kernel: same 256-thread / 2-warpgroup
-// structure, same register fragment math (verified on sm_120a), same
-// in-place K->V transpose for the PV B operand. Differences vs sparse decode:
+// structure, same register fragment math (verified on sm_120a). Differences vs
+// sparse decode:
 //   - no top-k: every request iterates its KV blocks [block_start, block_end)
 //     from the paged block_table (raw KV, 64 tokens per page);
 //   - the query tile is per-(batch,h_k): grid covers (m_block, h_k, sm_part),
@@ -11,8 +11,17 @@
 //     per-token validity mask;
 //   - output is bf16 (no_split) or fp32 oaccum (split), with ln-domain lse /
 //     log2-domain lse_accum, no attn_sink, no scale_for_olds asymmetry.
-// v0 sync model: plain __syncthreads() between phases (correctness first).
+// Per-block flow: cp.async page copy (one commit group per K segment) -> QK over
+// the two warpgroups with an sP partial reduction -> mask/softmax -> PV, whose V
+// operand is read dim-major by ldmatrix.trans straight out of the (token, dim)
+// plane. Sync is plain __syncthreads() between the phases.
 #include "splitkv_mla.h"
+
+#include <cstdio>
+
+#ifndef FLASH_MLA_SM120_PHASE_TIME
+#define FLASH_MLA_SM120_PHASE_TIME 0
+#endif
 
 #include <cuda_bf16.h>
 #include <math_constants.h>
@@ -23,6 +32,7 @@
 
 #include <kerutils/kerutils.cuh>
 
+#include "cuda_kernels/sm120/cp_async.cuh"
 #include "cuda_kernels/legacy/defines.h"
 #include "params.h"
 #include "config.h"
@@ -101,6 +111,21 @@ void KernelTemplate<InputT, HEAD_DIM_K>::devfunc(const DenseAttnDecodeParams &pa
     auto tiled_mma_PV = make_input_tiled_mma<InputT>();   // WG0 gemm_rs + WG1 gemm_ss share the atom
     auto thr_mma_PV = tiled_mma_PV.get_slice(idx_in_warpgroup);
 
+    // PV's B operand is V read DIM-major (K axis = token, stride 1). Instead of
+    // transposing the tile in smem, read the stored (token, dim) plane through a
+    // transposed view with ldmatrix.trans: each lane hands over one 16 B row of
+    // 8 DIMS, the instruction returns the transposed fragment, and its
+    // destination layout is the mma B fragment layout by construction (this is
+    // the same atom CUTLASS's SM75_U16x8_LDSM_T carries). No data movement, so
+    // the per-block transpose and its barrier window disappear.
+    auto ldsm_PV = make_tiled_copy_B(Copy_Atom<SM75_U16x4_LDSM_T, InputT>{}, tiled_mma_PV);
+    auto thr_ldsm_PV = ldsm_PV.get_slice(idx_in_warpgroup);
+    // (dim, token) view over the untouched (token, dim) segment: element (d,t)
+    // lives at t*K_ROW_PAD + d, so the fast axis is dim and each lane's 8
+    // contiguous elements are 8 dims of one token.
+    static constexpr auto kTransposedView =
+        Layout<Shape<Int<D_QK_SEG_>, Int<PAGE_BLOCK_SIZE>>, Stride<_1, Int<K_ROW_PAD>>>{};
+
     DecodingSchedMeta sched_meta = params.tile_scheduler_metadata_ptr[partition_idx];
     if (sched_meta.begin_req_idx >= params.b) return;
     // Zero-fill pad columns [64,72) of plan.k (K_ROW_PAD stride): any stray
@@ -121,6 +146,14 @@ void KernelTemplate<InputT, HEAD_DIM_K>::devfunc(const DenseAttnDecodeParams &pa
     }
     __syncthreads();
 
+#if FLASH_MLA_SM120_PHASE_TIME
+    // Diagnostic only (compile with -DFLASH_MLA_SM120_PHASE_TIME=1): per-block
+    // clock64() deltas for the page copy, QK+softmax, the barrier that separates
+    // them from PV, and PV. Block 0 prints its totals once at the end.
+    unsigned long long ph_copy = 0, ph_qk = 0, ph_bar = 0, ph_pv = 0, t_prev = 0;
+    int pages = 0;
+    if (threadIdx.x == 0) t_prev = clock64();
+#endif
     const int* block_table = params.block_table + 0;   // + batch*block_table_batch_stride inside loop
 
     float rL[2], rM[2];
@@ -173,13 +206,11 @@ void KernelTemplate<InputT, HEAD_DIM_K>::devfunc(const DenseAttnDecodeParams &pa
         CUTE_NO_UNROLL
         for (int block_idx = start_block_idx; block_idx < end_block_idx; ++block_idx) {
             // -------- phase 1: copy K page (raw InputT, all 256 threads) --------
-            // Gmem-coalesced reload: each warp owns 8 contiguous in-page tokens
-            // and streams their full rows (HEAD_DIM_K bf16) as 32x16B lanes ->
-            // 512B/iteration, fully-coalesced 128B sectors. Smem destination
-            // unchanged: (SEG,TOKEN,COL64), 16B stores at 8-bf16-aligned cols.
+            // Coalesced reload: 8 threads stream one token's 8 groups of 16 B, so
+            // a warp covers 4 tokens with 128 B sectors and the threads walk the
+            // page in token order. Smem destination: (SEG,TOKEN,COL64), 16 B
+            // stores at 8-element-aligned cols.
             {
-                const int warp = threadIdx.x >> 5;          // 0..7
-                const int lane = threadIdx.x & 31;
                 const int page = __ldg(block_table_b + block_idx);
                 // Page is OOB-guarded by the scheduler; kcache rows are [page][token][d]
                 // with token the IN-PAGE position (0..63); the page covers one 64-token
@@ -187,33 +218,51 @@ void KernelTemplate<InputT, HEAD_DIM_K>::devfunc(const DenseAttnDecodeParams &pa
                 // a request is partial (seqlen_k % 64 != 0), and rows beyond seqlen_k
                 // must be zero-filled (their QK then has no effect and V contributes 0).
                 // (Rows are read anyway -- the page's 64 slots are always allocated.)
-                const int gtok_base = block_idx*PAGE_BLOCK_SIZE + warp*8;   // GLOBAL token (validity only)
-                constexpr int GPR = (NUM_QK_SEG_ * D_QK_SEG_) / 8;          // 16B groups per row (72/64)
-                constexpr int PASSES = GPR / 4;                             // 8 rows * GPR / 32 lanes (18/16)
+                const int gtok_base = block_idx*PAGE_BLOCK_SIZE;            // GLOBAL token (validity only)
+                constexpr int GROUPS_PER_SEG = PAGE_BLOCK_SIZE * (D_QK_SEG_ / 8);   // 512
                 const InputT* gK_row_base = (const InputT*)params.k_ptr
                     + (int64_t)page*params.k_batch_stride + (int64_t)k_head_idx*params.k_head_stride;
                 constexpr int SEG_STRIDE = PAGE_BLOCK_SIZE * K_ROW_PAD;
+                // One commit group per K segment, issued oldest first, so the QK
+                // below can wait for segment s alone and let the rest of the page
+                // land underneath it (the copy no longer blocks the whole page).
                 CUTE_UNROLL
-                for (int k = 0; k < PASSES; ++k) {
-                    const int g = lane + k*32;              // contiguous group -> warp reads 512B/iter
-                    const int tok = g / GPR;                // in-warp token 0..7 (PAGE-LOCAL row)
-                    const int dim8 = (g % GPR) * 8;         // dim, 8-bf16 aligned
-                    // gK_row_base already points at this page, so the row index is
-                    // the PAGE-LOCAL token (warp*8+tok), same as the pre-COPY1 code;
-                    // gtok (global) is used for row validity only.
-                    const uint4 cur = *reinterpret_cast<const uint4*>(
-                        gK_row_base + (int64_t)(warp*8 + tok)*params.k_row_stride + dim8);
-                    const uint4 v = (gtok_base + tok < seqlen_k) ? cur : make_uint4(0, 0, 0, 0);
-                    *(uint4*)(plan.k.data() + (dim8 / D_QK_SEG_)*SEG_STRIDE + (warp*8 + tok)*K_ROW_PAD + dim8 % D_QK_SEG_) = v;
+                for (int seg = 0; seg < NUM_QK_SEG_; ++seg) {
+                    CUTE_UNROLL
+                    for (int k = 0; k < GROUPS_PER_SEG / NUM_THREADS; ++k) {
+                        const int g = threadIdx.x + k*NUM_THREADS;
+                        const int tok = g / (D_QK_SEG_ / 8);        // PAGE-LOCAL token
+                        const int dim8 = seg*D_QK_SEG_ + (g % (D_QK_SEG_ / 8))*8;
+                        cp_async16(
+                            plan.k.data() + (dim8 / D_QK_SEG_)*SEG_STRIDE + tok*K_ROW_PAD + dim8 % D_QK_SEG_,
+                            gK_row_base + (int64_t)tok*params.k_row_stride + dim8,
+                            gtok_base + tok < seqlen_k ? 16 : 0);
+                    }
+                    cp_commit();
                 }
             }
-            __syncthreads();
+#if FLASH_MLA_SM120_PHASE_TIME
+            if (threadIdx.x == 0) {
+                unsigned long long t = clock64();
+                ph_copy += t - t_prev; t_prev = t; ++pages;
+            }
+#endif
 
-            // -------- phase 2 (WG0): QK + mask/softmax -> rS/sS --------
-            if (warpgroup_idx == 0) {
+            // -------- phase 2: QK, K segments split across the warpgroups --------
+            // WG1 used to idle through the whole QK phase, the serial half of this
+            // kernel. Both warpgroups now run the same 64x64 tile over disjoint
+            // segment halves (WG0 [0, QK_SPLIT), WG1 [QK_SPLIT, end)) into their own
+            // rP; WG1 publishes its partial to sP and WG0 adds it before the
+            // mask/softmax, which is the only cross-warpgroup reduction.
+            {
+                constexpr int QK_SPLIT = (NUM_QK_SEG_ + 1) / 2;
+                const int seg_begin = warpgroup_idx == 0 ? 0 : QK_SPLIT;
+                const int seg_end   = warpgroup_idx == 0 ? QK_SPLIT : NUM_QK_SEG_;
+                cp_wait<0>();
+                __syncthreads();
                 cute::clear(rP);
                 CUTE_NO_UNROLL
-                for (int seg = 0; seg < NUM_QK_SEG_; ++seg) {
+                for (int seg = seg_begin; seg < seg_end; ++seg) {
                     Tensor gQseg = local_tile(gQ_b, Shape<Int<BLOCK_M>, _64>{}, make_coord(_0{}, seg));
                     // (SEG,TOKEN,COL64) -> standalone (64,64) NKContig stride (K_ROW_PAD,1) per segment
                     Tensor sKseg = make_tensor(
@@ -225,6 +274,34 @@ void KernelTemplate<InputT, HEAD_DIM_K>::devfunc(const DenseAttnDecodeParams &pa
                     cute::copy(thr_mma_QK.partition_B(sKseg), rKb);
                     cute::gemm(tiled_mma_QK, rQa, rKb, rP);
                 }
+            }
+            __syncthreads();
+            if (warpgroup_idx == 1) {
+                // rP registers carry the C-fragment (row, col) map of save_rS_to_sS
+                const int base = 16*(idx_in_warpgroup/32) + (idx_in_warpgroup%32)/4;
+                CUTE_UNROLL
+                for (int nb = 0; nb < PAGE_BLOCK_SIZE/8; ++nb)
+                    CUTE_UNROLL
+                    for (int lut = 0; lut < 2; ++lut)
+                        CUTE_UNROLL
+                        for (int cp = 0; cp < 2; ++cp)
+                            plan.sP[(base + 8*lut)*PAGE_BLOCK_SIZE + 8*nb + 2*(idx_in_warpgroup%4) + cp] =
+                                (InputT)rP(4*nb + 2*lut + cp);
+            }
+            __syncthreads();
+            if (warpgroup_idx == 0) {
+                {
+                    // add WG1's partial; same (row, col) map as above
+                    const int base = 16*(idx_in_warpgroup/32) + (idx_in_warpgroup%32)/4;
+                    CUTE_UNROLL
+                    for (int nb = 0; nb < PAGE_BLOCK_SIZE/8; ++nb)
+                        CUTE_UNROLL
+                        for (int lut = 0; lut < 2; ++lut)
+                            CUTE_UNROLL
+                            for (int cp = 0; cp < 2; ++cp)
+                                rP(4*nb + 2*lut + cp) +=
+                                    (float)plan.sP[(base + 8*lut)*PAGE_BLOCK_SIZE + 8*nb + 2*(idx_in_warpgroup%4) + cp];
+                }
 
                 // softmax on segment 0; every segment rescales its own 64 cols
                 float scale_for_olds[2];
@@ -233,35 +310,20 @@ void KernelTemplate<InputT, HEAD_DIM_K>::devfunc(const DenseAttnDecodeParams &pa
                     scale_softmax(rP, rS, rO[s], params.scale_softmax_log2, plan.sScale, rM, rL, rRightBorder, block_idx, idx_in_warpgroup, scale_for_olds, s == 0);
 
                 save_rS_to_sS(rS, sS, idx_in_warpgroup);
-                // In-place K->V DIM-major transpose (kept in the WG0 branch so it
-                // cannot race this warpgroup's QK reads of plan.k; WG1 only reads
-                // plan.k after the __syncthreads() below). Under the 72-stride
-                // addressing, logical element (t,d) sits at t*72+d and its
-                // transpose partner (d,t) at d*72+t in the same segment; after
-                // the swap, sVs[tok*72+dim] == the original (dim,tok) element.
-                {
-                    InputT* svbase = plan.k.data();
-                    constexpr int SEG_LOGICAL = D_QK_SEG_ * PAGE_BLOCK_SIZE;  // 4096 bf16 per seg
-                    constexpr int TOTAL = NUM_QK_SEG_ * SEG_LOGICAL;          // all 8 segs
-                    constexpr int SEG_BF16 = PAGE_BLOCK_SIZE * K_ROW_PAD;     // 4608 physical bf16 per seg
-                    CUTE_NO_UNROLL
-                    for (int X = threadIdx.x; X < TOTAL; X += NUM_THREADS / 2) {   // 128 WG0 threads, stride 128
-                        const int sg = X / SEG_LOGICAL;
-                        const int x = X - sg * SEG_LOGICAL;
-                        const int t = x / D_QK_SEG_;
-                        const int d = x - t * D_QK_SEG_;
-                        const int base = sg * SEG_BF16;
-                        const int a = base + t * K_ROW_PAD + d;
-                        const int b = base + d * K_ROW_PAD + t;
-                        if (a < b) {
-                            InputT tmp = svbase[a];
-                            svbase[a] = svbase[b];
-                            svbase[b] = tmp;
-                        }
-                    }
+#if FLASH_MLA_SM120_PHASE_TIME
+                if (threadIdx.x == 0) {
+                    unsigned long long t = clock64();
+                    ph_qk += t - t_prev; t_prev = t;
                 }
+#endif
             }
             __syncthreads();
+#if FLASH_MLA_SM120_PHASE_TIME
+            if (threadIdx.x == 0) {
+                unsigned long long t = clock64();
+                ph_bar += t - t_prev; t_prev = t;
+            }
+#endif
 
             // -------- phase 3: PV (each WG its half of V; V = K's first 512) --------
             if (warpgroup_idx == 0) {
@@ -271,11 +333,10 @@ void KernelTemplate<InputT, HEAD_DIM_K>::devfunc(const DenseAttnDecodeParams &pa
                 CUTE_NO_UNROLL
                 for (int seg = 0; seg < 4; ++seg) {
                     Tensor sVseg = make_tensor(
-                        sV.data() + seg*K_ROW_PAD*PAGE_BLOCK_SIZE,
-                        Layout<Shape<Int<PAGE_BLOCK_SIZE>, Int<D_QK_SEG_>>, Stride<Int<K_ROW_PAD>, _1>>{});
+                        sV.data() + seg*K_ROW_PAD*PAGE_BLOCK_SIZE, kTransposedView);
                     Tensor rVb = thr_mma_PV.partition_fragment_B(sVseg);
-                    // Same read as the QK B path (cute::copy).
-                    cute::copy(thr_mma_PV.partition_B(sVseg), rVb);
+                    cute::copy(ldsm_PV, thr_ldsm_PV.partition_S(sVseg),
+                               thr_ldsm_PV.retile_D(rVb));
                     cute::gemm(tiled_mma_PV, rSv, rVb, rO[seg]);
                 }
             } else {
@@ -293,16 +354,27 @@ void KernelTemplate<InputT, HEAD_DIM_K>::devfunc(const DenseAttnDecodeParams &pa
                 CUTE_NO_UNROLL
                 for (int seg = 0; seg < 4; ++seg) {
                     Tensor sVseg = make_tensor(
-                        sV.data() + (4 + seg)*K_ROW_PAD*PAGE_BLOCK_SIZE,
-                        Layout<Shape<Int<PAGE_BLOCK_SIZE>, Int<D_QK_SEG_>>, Stride<Int<K_ROW_PAD>, _1>>{});
+                        sV.data() + (4 + seg)*K_ROW_PAD*PAGE_BLOCK_SIZE, kTransposedView);
                     Tensor rVb = thr_mma_PV.partition_fragment_B(sVseg);
-                    cute::copy(thr_mma_PV.partition_B(sVseg), rVb);
+                    cute::copy(ldsm_PV, thr_ldsm_PV.partition_S(sVseg),
+                               thr_ldsm_PV.retile_D(rVb));
                     cute::gemm(tiled_mma_PV, rSv, rVb, rO[seg]);
                 }
             }
             __syncthreads();
+#if FLASH_MLA_SM120_PHASE_TIME
+            if (threadIdx.x == 0) {
+                unsigned long long t = clock64();
+                ph_pv += t - t_prev; t_prev = t;
+            }
+#endif
         }
 
+#if FLASH_MLA_SM120_PHASE_TIME
+        if (blockIdx.x == 0 && threadIdx.x == 0)
+            printf("PHASE pages=%d copy=%llu qk=%llu tr=%llu pv=%llu\n",
+                   pages, ph_copy, ph_qk, ph_bar, ph_pv);
+#endif
         // -------- epilogue (per batch) --------
         if (warpgroup_idx == 0) {
             // combine L/M across the two rows this thread owns
