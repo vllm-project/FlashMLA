@@ -28,6 +28,56 @@ static constexpr float MAX_INIT_VAL = -1e30;    // Prevent (-inf) - (-inf) = nan
 using cutlass::arch::fence_view_async_shared;
 using fp8_e8m0 = __nv_fp8_e8m0;
 
+// `ldmatrix` is b8-only in the .trans form (probe 15), and one x2 hands lane l
+// rows 4*(l&3)+{0..3} at columns (l>>2) and (l>>2)+8 -- 32 rows x 16 columns per
+// warp, 16 B per lane. The address lanes 0-15 feed column group 0 (rows 0-15)
+// and lanes 16-31 group 1 (rows 16-31).
+__device__ __forceinline__ void ldm_b8x2(uint32_t const *addr, uint32_t (&r)[4]) {
+    asm volatile(
+        "ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0, %1, %2, %3}, [%4];"
+        : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+        : "r"((uint32_t)__cvta_generic_to_shared(addr)));
+}
+
+// Fill one PV B fragment from the fp8 plane: one `ldm_b8x2` per 32 tokens x 16
+// dims, then a 4-lane exchange. Lane l holds rows 4*(l&3)+{0..3} while the
+// fragment wants lane t to hold rows 2*(t%4)+{0,1} and +8, so the two source
+// lanes are (t & ~3) | (j>>1) and (t & ~3) | (2 + (j>>1)), j = t%4, and the
+// wanted bytes sit at (j&1)*2 of their word.
+template<class TFrag, int TOPK, int SEG, int ROWPAD, int NSC>
+__device__ __forceinline__ void pv_dequant_ldsm(TFrag &rVb, const uint8_t* seg_base,
+                                                const bf16* sSc, int lane) {
+    const int j = lane & 3, grp = lane & ~3;
+    const int src[2] = {grp | (j >> 1), grp | (2 + (j >> 1))};
+    const int sh = (j & 1)*16;   // bit offset of the byte pair
+    CUTE_UNROLL
+    for (int twin = 0; twin < TOPK; twin += 32) {
+        CUTE_UNROLL
+        for (int dwin = 0; dwin < SEG; dwin += 16) {
+            uint32_t raw[4];
+            ldm_b8x2((const uint32_t*)(seg_base + (twin + lane)*ROWPAD + dwin), raw);
+            CUTE_UNROLL
+            for (int q = 0; q < 4; ++q) {
+                // q = a + 2*s: a picks the dim half (r0/r2 -> +0, r1/r3 -> +8),
+                // s picks the token half (r0/r1 -> +0, r2/r3 -> +16).
+                const int a = q & 1, s = q >> 1;
+                const int tok0 = twin + 16*s + 2*j;
+                const int i0 = 4*(dwin/8 + a) + 32*(twin/16 + s);
+                uint32_t wa = __shfl_sync(0xffffffff, raw[q], src[0]);
+                uint32_t wb = __shfl_sync(0xffffffff, raw[q], src[1]);
+                __nv_fp8x2_e4m3 pa, pb;
+                *(uint16_t*)&pa = (uint16_t)(wa >> sh);
+                *(uint16_t*)&pb = (uint16_t)(wb >> sh);
+                float2 fa = (float2)pa, fb = (float2)pb;
+                rVb(i0)     = bf16(fa.x) * sSc[(tok0    )*NSC];
+                rVb(i0 + 1) = bf16(fa.y) * sSc[(tok0 + 1)*NSC];
+                rVb(i0 + 2) = bf16(fb.x) * sSc[(tok0 + 8    )*NSC];
+                rVb(i0 + 3) = bf16(fb.y) * sSc[(tok0 + 8 + 1)*NSC];
+            }
+        }
+    }
+}
+
 // Element-granular twin of cvt_fp8x8_bf16x8 (same fp8 -> float -> bf16 -> *scale
 // order), for the fragment loads where the two k values of an mma B atom pair are
 // the only contiguous ones.
@@ -361,8 +411,9 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
         if (abs_seg*D_QK_SEG + D_QK_SEG <= HEAD_DIM_NOPE) {
             Tensor sB = make_tensor(sKbytes + abs_seg*D_QK_SEG, kTransposedView8);
             Tensor rVb = thr_mma_PV.partition_fragment_B(sB);
-            dequant_b_frag<false>(rVb, thr_mma_PV, sB,
-                make_tensor(plan.sScales + abs_seg*D_QK_SEG/QUANT_TILE_SIZE, kScaleTransposedView));
+            pv_dequant_ldsm<decltype(rVb), TOPK_BLOCK_SIZE, D_QK_SEG, K_ROW_PAD, NUM_SCALES>(
+                rVb, sKbytes + abs_seg*D_QK_SEG,
+                plan.sScales + abs_seg*D_QK_SEG/QUANT_TILE_SIZE, idx_in_warpgroup % 32);
             cute::gemm(tiled_mma_PV, rSv, rVb, rO[local_seg]);
         } else {
             Tensor sB = make_tensor((bf16*)(sKbytes + HEAD_DIM_NOPE), kTransposedViewBf16);
