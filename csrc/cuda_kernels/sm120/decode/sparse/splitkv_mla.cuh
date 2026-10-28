@@ -28,6 +28,63 @@ static constexpr float MAX_INIT_VAL = -1e30;    // Prevent (-inf) - (-inf) = nan
 using cutlass::arch::fence_view_async_shared;
 using fp8_e8m0 = __nv_fp8_e8m0;
 
+// Element-granular twin of cvt_fp8x8_bf16x8 (same fp8 -> float -> bf16 -> *scale
+// order), for the fragment loads where the two k values of an mma B atom pair are
+// the only contiguous ones.
+__device__ __forceinline__ __nv_bfloat162 cvt_fp8x2_bf16x2(
+    const __nv_fp8x2_e4m3 &v, const __nv_bfloat162 &scale) {
+    return __float22bfloat162_rn((float2)v) * scale;
+}
+
+// Load the e4m3 B tile `sB8` into the bf16 fragment `rB`, scaling each element
+// by its token's scale from `sSc`. `sSc` is laid out like `sB8` in the axis that
+// carries the token (n for QK, k for PV). The mma B atom pairs k, so KCONTIG
+// (QK: k is the dim axis, contiguous) can fetch a pair with one 2-byte read and
+// share one scale; for PV k is the token axis and the pair is K_ROW_PAD apart.
+// `rB` is taken by reference: a cute register tensor owns its storage, so a
+// by-value parameter would be written into a copy and the caller would keep an
+// uninitialized fragment.
+template<bool KCONTIG, class TFrag, class TThr, class TSrc8, class TSrcSc>
+__device__ __forceinline__ void dequant_b_frag(TFrag &rB, TThr const &thr,
+                                               TSrc8 sB8, TSrcSc sSc, int k0 = 0) {
+    Tensor src = thr.partition_B(sB8);
+    Tensor srcSc = thr.partition_B(sSc);
+    if constexpr (KCONTIG) {
+        // One n (token) per atom and the tile is one quant tile wide, so one
+        // scale serves the atom's two k-pairs. The 16 dims of the tile are 16 B
+        // of one row, so a single aligned 16 B read covers every k the atom can
+        // ask for (k0 and k0+8, k0 = 2*(lane%4)); the pairs are then cut out of
+        // its low and high word instead of costing a load each.
+        CUTE_UNROLL
+        for (int a = 0; a < (int)cute::size(rB)/4; ++a) {
+            int i = 4*a;
+            __nv_bfloat162 s = __bfloat162bfloat162(*(const __nv_bfloat16*)&srcSc(i));
+            CUTE_UNROLL
+            for (int p = 0; p < 2; ++p) {
+                int j = i + 2*p;
+                *(__nv_bfloat162*)&rB(j) =
+                    cvt_fp8x2_bf16x2(*(const __nv_fp8x2_e4m3*)&src(j), s);
+            }
+        }
+    } else {
+        // k is the token axis: element i is step i/32, k-slot i%4 (a pair of
+        // 2 + 8, see the mma B atom), n-atom i%32/4. One scale serves each
+        // k-slot across all 8 n-atoms, so hoist it out of the inner loop.
+        static_assert(decltype(cute::size(rB))::value == 128, "expected the 8n x 64k B tile");
+        CUTE_UNROLL
+        for (int slot = 0; slot < 16; ++slot) {
+            int i0 = (slot/4)*32 + slot%4;
+            __nv_bfloat16 s = *(const __nv_bfloat16*)&srcSc(i0);
+            CUTE_UNROLL
+            for (int a = 0; a < 8; ++a) {
+                int i = i0 + 4*a;
+                *(__nv_bfloat16*)&rB(i) =
+                    __float2bfloat16_rn((float)*(const __nv_fp8_e4m3*)&src(i)) * s;
+            }
+        }
+    }
+}
+
 // Host-side parameters handed to the kernel through __grid_constant__: only the
 // O store descriptor is needed (Q is read directly by the compute threads).
 struct TMAParams { CUtensorMap tensor_map_O; };
@@ -41,13 +98,14 @@ struct MainloopArgs {
 };
 
 // ---------------------------------------------------------------------------
-// Dequantize one topk block (64 tokens) of K from global memory into the
-// shared K buffer, in K-major (dim-contiguous) format. All 256 threads take part;
-// each thread owns one token and a 16-dim strip of that token's dims.
+// Copy one topk block (64 tokens) of K from global memory into the shared K
+// plane. All 256 threads take part; each thread owns one token and a 16-dim
+// strip of that token's dims.
 //
-// V is never dequantized: in MLA decode the value operand of the PV gemm is the
-// dequantized nope part of K (d_v == nope dims), read straight from the same
-// buffer (token stride HEAD_DIM_K, dim stride 1) -- no copy, no extra smem.
+// Nothing is converted: the cache bytes (e4m3 nope + bf16 rope) move as they
+// are, so this is a pure cp.async copy and the plane is half the size it was
+// when the nope half was dequantized on the way in. The per-token scales land
+// in sScales and the dequant happens at the fragment load instead.
 // ---------------------------------------------------------------------------
 template<ModelType MODEL_TYPE, int NUM_HEADS>
 __device__ __forceinline__ void dequant_k_block(
@@ -61,13 +119,10 @@ __device__ __forceinline__ void dequant_k_block(
     [[maybe_unused]] bool is_first_extra_block
 ) {
     using Kernel = KernelTemplate<MODEL_TYPE, NUM_HEADS>;
-    constexpr int HEAD_DIM_K = Kernel::HEAD_DIM_K;
     constexpr int HEAD_DIM_NOPE = Kernel::HEAD_DIM_NOPE;
     constexpr int HEAD_DIM_ROPE = Kernel::HEAD_DIM_ROPE;
     constexpr int NUM_SCALES = Kernel::NUM_SCALES;
-    constexpr int QUANT_TILE_SIZE = Kernel::QUANT_TILE_SIZE;
     constexpr int TOPK_BLOCK_SIZE = Kernel::TOPK_BLOCK_SIZE;
-    constexpr int D_QK_SEG = Kernel::D_QK_SEG;
     constexpr int K_ROW_PAD = Kernel::K_ROW_PAD;
 
     const int token = threadIdx.x & 63;
@@ -142,35 +197,30 @@ __device__ __forceinline__ void dequant_k_block(
         for (int i = 0; i < NUM_SCALES; ++i)
             scales[i] = (bf16)0.0f;
     }
+    CUTE_UNROLL
+    for (int i = 0; i < NUM_SCALES; ++i)
+        plan.sScales[token*NUM_SCALES + i] = scales[i];
 
-    // (SEG, TOKEN, COL64) layout: dim d -> seg = d/64, col-in-seg = d%64, element
-    // address = seg*SEG_STRIDE + token*K_ROW_PAD + col. The 8-column pad keeps
-    // consecutive tokens 144 B apart (bank rotation 4), so the ldmatrix reads
-    // of the PV path are conflict free; 16 B stores stay aligned.
-    constexpr int SEG_STRIDE = TOPK_BLOCK_SIZE * K_ROW_PAD;
-    auto sk_addr = [&](int dim) -> __int128_t* {
-        return (__int128_t*)(plan.u.k.data() + (dim / D_QK_SEG)*SEG_STRIDE + token*K_ROW_PAD + dim % D_QK_SEG);
+    // Row addressing: dim d of token t lives at t*K_ROW_PAD + k_dim_byte(d). The
+    // 16 B pad keeps the tokens apart for the fragment reads and keeps every
+    // 16 B chunk of a row aligned.
+    auto sk_addr = [&](int dim) -> uint8_t* {
+        return plan.u.k.data() + token*K_ROW_PAD + Kernel::k_dim_byte(dim);
     };
 
-    // ----- nope dims (fp8, dequant): 8 x (16 dims) per thread -----
-    // Alignment: V32 rows are 656B and V4 data rows 576B, both 16B-aligned (and
-    // the V4 block stride is a multiple of 576), so 16B loads are always safe.
+    // ----- nope dims (e4m3, byte copy): 8 x (16 dims) per thread -----
+    // Alignment: V32 rows are 656 B and V4 data rows 576 B, both 16 B-aligned
+    // (and the V4 block stride is a multiple of 576), so 16 B copies are safe.
+    // Invalid tokens take the zero-fill form of cp.async.
     fp8* gK_nope = gK_base;
     CUTE_UNROLL
     for (int i = 0; i < 8; ++i) {
         int dim16 = (tg*8 + i)*16;
         if (dim16 >= HEAD_DIM_NOPE) break;
-        fp8x16 cur = load_128b_from_gmem<fp8x16, L1CacheHint::EVICT_LAST, L2PrefetchHint::B256>(gK_nope + dim16);
-        if (!is_valid) *(uint128_t*)(&cur) = uint128_t();
-        bf16 scale = scales[dim16 / QUANT_TILE_SIZE];
-        __nv_bfloat162 scale2 = __bfloat162bfloat162(*(__nv_bfloat16*)(&scale));
-        bf16x8 lo = cvt_fp8x8_bf16x8(cur.lo, scale2);
-        bf16x8 hi = cvt_fp8x8_bf16x8(cur.hi, scale2);
-        *sk_addr(dim16)     = *(__int128_t*)&lo;
-        *sk_addr(dim16 + 8) = *(__int128_t*)&hi;
+        cp_async16(sk_addr(dim16), gK_nope + dim16, is_valid ? 16 : 0);
     }
 
-    // ----- rope dims (bf16, straight copy): 16 dims per thread -----
+    // ----- rope dims (bf16, byte copy): 16 dims per thread -----
     {
         int dim16 = tg*16;   // 0..48 (HEAD_DIM_ROPE == 64, 4 threads x 16)
         bf16* gK_rope;
@@ -182,15 +232,11 @@ __device__ __forceinline__ void dequant_k_block(
             gK_rope = (bf16*)(gK_base + HEAD_DIM_NOPE);
         }
         CUTE_UNROLL
-        for (int j = 0; j < 2; ++j) {
-            // rope is already bf16, so it can go straight through cp.async instead
-            // of a register round-trip; invalid tokens take the zero-fill form.
+        for (int j = 0; j < 2; ++j)
             cp_async16(sk_addr(HEAD_DIM_NOPE + dim16 + j*8),
                        gK_rope + dim16 + j*8, is_valid ? 16 : 0);
-        }
     }
-    // The nope half above still writes smem with plain stores; this drains the
-    // rope copies so the block barrier publishes both halves together.
+    // One commit group for the whole block; the block barrier publishes it.
     cp_commit();
     cp_wait<0>();
 }
@@ -219,8 +265,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
 
     extern __shared__ char wksp_buf[];
     SharedMemoryPlan &plan = *reinterpret_cast<SharedMemoryPlan*>(wksp_buf);
-    Tensor sK = make_tensor(make_smem_ptr(plan.u.k.data()), SmemLayoutK{});
-    Tensor sV = make_tensor(make_smem_ptr(plan.u.k.data()), SmemLayoutV{});   // K's nope dims, (8 SEG,TOPK,64)
+    uint8_t* sKbytes = plan.u.k.data();   // raw cache bytes: [nope e4m3][rope bf16]
     Tensor sS = make_tensor(make_smem_ptr(plan.s.data()), SmemLayoutS{});
     Tensor sOBuf = make_tensor(make_smem_ptr(plan.u.oBuf.data()), SmemLayoutOBuf{});
     float* sM = plan.sM;
@@ -289,9 +334,15 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
     // make_tiled_copy_B requires; retile_D reinterprets the fragment.
     auto ldsm_PV = make_tiled_copy_B(Copy_Atom<SM75_U16x4_LDSM_T, bf16>{}, tiled_mma_PV);
     auto thr_ldsm_PV = ldsm_PV.get_slice(idx_in_warpgroup);
-    // element (d,t) lives at t*K_ROW_PAD + d in the untouched plane
-    static constexpr auto kTransposedView =
+    // element (d,t) lives at t*K_ROW_PAD + d bytes in the raw plane; the scale of
+    // a whole 64-dim segment is one value per token (V4's last segment is rope,
+    // in bf16, and takes the ldmatrix path instead).
+    static constexpr auto kTransposedView8 =
         Layout<Shape<Int<D_QK_SEG>, Int<TOPK_BLOCK_SIZE>>, Stride<_1, Int<K_ROW_PAD>>>{};
+    static constexpr auto kTransposedViewBf16 =
+        Layout<Shape<Int<D_QK_SEG>, Int<TOPK_BLOCK_SIZE>>, Stride<_1, Int<K_ROW_PAD_BF16>>>{};
+    static constexpr auto kScaleTransposedView =
+        Layout<Shape<Int<D_QK_SEG>, Int<TOPK_BLOCK_SIZE>>, Stride<_0, Int<NUM_SCALES>>>{};
 
     float rL[2], rM[2];
     // PV output: 4 independent 64-col C fragments (one 64x64
@@ -303,6 +354,24 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
         partition_fragment_C(tiled_mma_PV, Shape<Int<BLOCK_M>, _64>{}),
         partition_fragment_C(tiled_mma_PV, Shape<Int<BLOCK_M>, _64>{}),
     };
+
+    // One PV segment: V is the fp8 nope plane, dequantized at the fragment load;
+    // V4's last segment is the rope plane and keeps the ldmatrix.trans read.
+    auto pv_seg = [&](auto const &rSv, int abs_seg, int local_seg) {
+        if (abs_seg*D_QK_SEG + D_QK_SEG <= HEAD_DIM_NOPE) {
+            Tensor sB = make_tensor(sKbytes + abs_seg*D_QK_SEG, kTransposedView8);
+            Tensor rVb = thr_mma_PV.partition_fragment_B(sB);
+            dequant_b_frag<false>(rVb, thr_mma_PV, sB,
+                make_tensor(plan.sScales + abs_seg*D_QK_SEG/QUANT_TILE_SIZE, kScaleTransposedView));
+            cute::gemm(tiled_mma_PV, rSv, rVb, rO[local_seg]);
+        } else {
+            Tensor sB = make_tensor((bf16*)(sKbytes + HEAD_DIM_NOPE), kTransposedViewBf16);
+            Tensor rVb = thr_mma_PV.partition_fragment_B(sB);
+            cute::copy(ldsm_PV, thr_ldsm_PV.partition_S(sB), thr_ldsm_PV.retile_D(rVb));
+            cute::gemm(tiled_mma_PV, rSv, rVb, rO[local_seg]);
+        }
+    };
+
     Tensor rP = partition_fragment_C(tiled_mma_QK, Shape<Int<BLOCK_M>, Int<TOPK_BLOCK_SIZE>>{});
     Tensor rS = make_tensor<bf16>(partition_shape_A(tiled_mma_PV, Shape<Int<BLOCK_M>, Int<TOPK_BLOCK_SIZE>>{}));
 
@@ -356,22 +425,66 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
             }
 #endif
 
-            // -------- phase 2 (WG0): QK + mask/softmax -> rS/sS --------
-            if (warpgroup_idx == 0) {
+            // -------- phase 2: QK, dim steps split across the warpgroups --------
+            // WG1 idled through the whole QK phase. Both warpgroups now run the
+            // same 64x64 tile over disjoint halves of the k steps (a step never
+            // straddles nope/rope, HEAD_DIM_NOPE being a multiple of 16, so the
+            // split point is free); WG1 publishes its partial to sP and WG0 adds
+            // it before the mask/softmax - the only cross-warpgroup reduction.
+            {
+                constexpr int QK_SPLIT = (HEAD_DIM_K/16) / 2;
+                const int k_begin = (warpgroup_idx == 0 ? 0 : QK_SPLIT) * 16;
+                const int k_end = (warpgroup_idx == 0 ? QK_SPLIT : HEAD_DIM_K/16) * 16;
                 cute::clear(rP);
+                // 16 dims at a time: the source is either e4m3 bytes that need
+                // the token scale or plain bf16 (the rope dims).
                 CUTE_NO_UNROLL
-                for (int seg = 0; seg < NUM_QK_SEG; ++seg) {
-                    Tensor gQseg = local_tile(gQ, Shape<Int<BLOCK_M>, _64>{}, make_coord(_0{}, seg));
-                    // (SEG,TOKEN,COL64) -> standalone (64,64) NKContig stride (K_ROW_PAD,1) per segment
-                    Tensor sKseg = make_tensor(
-                        sK.data() + seg*K_ROW_PAD*TOPK_BLOCK_SIZE,
-                        Layout<Shape<Int<TOPK_BLOCK_SIZE>, Int<D_QK_SEG>>, Stride<Int<K_ROW_PAD>, _1>>{});
-                    Tensor rQa = thr_mma_QK.partition_fragment_A(gQseg);
-                    Tensor rKb = thr_mma_QK.partition_fragment_B(sKseg);
-                    cute::copy(thr_mma_QK.partition_A(gQseg), rQa);
-                    cute::copy(thr_mma_QK.partition_B(sKseg), rKb);
-                    cute::gemm(tiled_mma_QK, rQa, rKb, rP);
+                for (int k = k_begin; k < k_end; k += 16) {
+                    Tensor gQk = local_tile(gQ, Shape<Int<BLOCK_M>, _16>{}, make_coord(_0{}, k/16));
+                    Tensor rQa = thr_mma_QK.partition_fragment_A(gQk);
+                    cute::copy(thr_mma_QK.partition_A(gQk), rQa);
+                    uint8_t* p = sKbytes + k_dim_byte(k);
+                    Tensor sSc = make_tensor(
+                        plan.sScales + k/QUANT_TILE_SIZE,
+                        Layout<Shape<Int<TOPK_BLOCK_SIZE>, _16>, Stride<Int<NUM_SCALES>, _0>>{});
+                    if (k + 16 <= HEAD_DIM_NOPE) {
+                        Tensor sB = make_tensor(
+                            p, Layout<Shape<Int<TOPK_BLOCK_SIZE>, _16>, Stride<Int<K_ROW_PAD>, _1>>{});
+                        Tensor rKb = thr_mma_QK.partition_fragment_B(sB);
+                        dequant_b_frag<true>(rKb, thr_mma_QK, sB, sSc, 2*(idx_in_warpgroup & 3));
+                        cute::gemm(tiled_mma_QK, rQa, rKb, rP);
+                    } else {
+                        Tensor sB = make_tensor(
+                            (bf16*)p, Layout<Shape<Int<TOPK_BLOCK_SIZE>, _16>, Stride<Int<K_ROW_PAD_BF16>, _1>>{});
+                        Tensor rKb = thr_mma_QK.partition_fragment_B(sB);
+                        cute::copy(thr_mma_QK.partition_B(sB), rKb);
+                        cute::gemm(tiled_mma_QK, rQa, rKb, rP);
+                    }
                 }
+            }
+            __syncthreads();
+            // rP registers carry the C-fragment (row, col) map of save_rS_to_sS
+            const int prow_base = 16*(idx_in_warpgroup/32) + (idx_in_warpgroup%32)/4;
+            if (warpgroup_idx == 1) {
+                CUTE_UNROLL
+                for (int nb = 0; nb < TOPK_BLOCK_SIZE/8; ++nb)
+                    CUTE_UNROLL
+                    for (int lut = 0; lut < 2; ++lut)
+                        CUTE_UNROLL
+                        for (int cp = 0; cp < 2; ++cp)
+                            plan.sP[(prow_base + 8*lut)*TOPK_BLOCK_SIZE + 8*nb + 2*(idx_in_warpgroup%4) + cp] =
+                                rP(4*nb + 2*lut + cp);
+            }
+            __syncthreads();
+            if (warpgroup_idx == 0) {
+                CUTE_UNROLL
+                for (int nb = 0; nb < TOPK_BLOCK_SIZE/8; ++nb)
+                    CUTE_UNROLL
+                    for (int lut = 0; lut < 2; ++lut)
+                        CUTE_UNROLL
+                        for (int cp = 0; cp < 2; ++cp)
+                            rP(4*nb + 2*lut + cp) +=
+                                plan.sP[(prow_base + 8*lut)*TOPK_BLOCK_SIZE + 8*nb + 2*(idx_in_warpgroup%4) + cp];
 
                 // softmax on segment 0; every segment rescales its own 64 cols
                 float scale_for_olds[2];
@@ -406,14 +519,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 Tensor rSv = thr_mma_PV.partition_fragment_A(sS);
                 cute::copy(thr_mma_PV.partition_A(sS), rSv);
                 CUTE_NO_UNROLL
-                for (int seg = 0; seg < 4; ++seg) {
-                    Tensor sVseg = make_tensor(
-                        sV.data() + seg*K_ROW_PAD*TOPK_BLOCK_SIZE, kTransposedView);
-                    Tensor rVb = thr_mma_PV.partition_fragment_B(sVseg);
-                    cute::copy(ldsm_PV, thr_ldsm_PV.partition_S(sVseg),
-                               thr_ldsm_PV.retile_D(rVb));
-                    cute::gemm(tiled_mma_PV, rSv, rVb, rO[seg]);
-                }
+                for (int seg = 0; seg < 4; ++seg)
+                    pv_seg(rSv, seg, seg);
             } else {
                 // scale historical O by this block's scale_for_old, then PV over V dims [256,512)
                 float cur_scales[2];
@@ -427,14 +534,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 Tensor rSv = thr_mma_PV.partition_fragment_A(sS);
                 cute::copy(thr_mma_PV.partition_A(sS), rSv);
                 CUTE_NO_UNROLL
-                for (int seg = 0; seg < 4; ++seg) {
-                    Tensor sVseg = make_tensor(
-                        sV.data() + (4 + seg)*K_ROW_PAD*TOPK_BLOCK_SIZE, kTransposedView);
-                    Tensor rVb = thr_mma_PV.partition_fragment_B(sVseg);
-                    cute::copy(ldsm_PV, thr_ldsm_PV.partition_S(sVseg),
-                               thr_ldsm_PV.retile_D(rVb));
-                    cute::gemm(tiled_mma_PV, rSv, rVb, rO[seg]);
-                }
+                for (int seg = 0; seg < 4; ++seg)
+                    pv_seg(rSv, 4 + seg, seg);
             }
             __syncthreads();
 #if FLASH_MLA_SM120_PHASE_TIME
