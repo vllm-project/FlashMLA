@@ -44,25 +44,31 @@ static constexpr int NUM_SCALES = MODEL_TYPE == ModelType::V32 ? 4 : 8;  // For 
 // 64x64 gemm = 32 A + 32 B + 32 C regs/thread, no register spill.
 static constexpr int D_QK_SEG = 64;
 static constexpr int NUM_QK_SEG = HEAD_DIM_K / D_QK_SEG;
-// 8-column pad per token (144 B token stride, bank rotation 4): the PV
-// ldmatrix reads and the QK B copies are conflict free, and 16 B stores stay
-// aligned because 144 is a multiple of 16.
-static constexpr int K_ROW_PAD = 72;
+// K is resident as *raw cache bytes*: the nope dims are e4m3 (1 B) and the rope
+// dims bf16 (2 B), exactly as they sit in global memory, so the copy never
+// converts and the plane halves. A row is [nope fp8][rope bf16][pad]; the 16 B
+// pad keeps the token stride a 16 B multiple (16 B cp.async destinations, 16 B
+// ldmatrix rows) and rotates the banks.
+static constexpr int K_ROW_BYTES = HEAD_DIM_NOPE + HEAD_DIM_ROPE*2;
+static constexpr int K_ROW_PAD = K_ROW_BYTES + 16;
+// byte offset of dim d inside its own row
+static constexpr int k_dim_byte(int d) {
+    return d < HEAD_DIM_NOPE ? d : HEAD_DIM_NOPE + (d - HEAD_DIM_NOPE)*2;
+}
+// The row is 640 B (V32) / 576 B (V4) of data + 16 B pad. A row is addressed
+// whole; the 64-dim segments the gemms work in are column ranges inside it.
+static constexpr int K_BYTES = TOPK_BLOCK_SIZE * K_ROW_PAD;
+static constexpr int K_ROW_PAD_BF16 = K_ROW_PAD/2;   // bf16-element row stride
 
-// K/V shared layout: (SEG, TOKEN, COL64) -- each 64-col segment is a
-// standalone (64,64) NKContig stride (64,1), the mma.sync B-operand layout
-// verified on sm_120a. A single 576-stride K row does NOT
-// work for B reads, so the producer
-// scatters per-segment int128 stores (segment stride = 64*64, token stride 64,
-// col stride 1). V is NOT stored separately: in MLA decode the shared-buffer
-// value is the dequantized nope part of K, i.e. segments 0..7 of the K buffer.
-using SmemLayoutK = Layout<
-    Shape<Int<NUM_QK_SEG>, Int<TOPK_BLOCK_SIZE>, Int<D_QK_SEG>>,
-    Stride<Int<TOPK_BLOCK_SIZE*K_ROW_PAD>, Int<K_ROW_PAD>, _1>
->;
+// Segments stay the gemm unit, but they are read as *bytes* out of the flat
+// plane through k_dim_byte(); only a wholly-nope segment is a contiguous
+// (TOPK, 64) byte tile, and those are the ones that build a SmemLayoutV segment.
+//
+// The V of the PV gemm is the nope part of this same buffer - no copy, no
+// transpose, and no dequant until the fragment load.
 using SmemLayoutV = Layout<
     Shape<Int<HEAD_DIM_V/D_QK_SEG>, Int<TOPK_BLOCK_SIZE>, Int<D_QK_SEG>>,
-    Stride<Int<TOPK_BLOCK_SIZE*K_ROW_PAD>, Int<K_ROW_PAD>, _1>
+    Stride<Int<D_QK_SEG>, Int<K_ROW_PAD>, _1>
 >;
 
 using SmemLayoutS = decltype(coalesce(tile_to_shape(
@@ -80,9 +86,16 @@ using SmemLayoutOBuf = decltype(tile_to_shape(
 
 struct SharedMemoryPlan {
     CUTE_ALIGNAS(1024) union {
-        array_aligned<bf16, cosize_v<SmemLayoutK>> k;        // K (then used as V, first 512 dims)
+        array_aligned<uint8_t, K_BYTES> k;                   // K (then used as V, first 512 dims)
         array_aligned<bf16, cosize_v<SmemLayoutOBuf>> oBuf;  // O staging for no-split TMA store
     } u;
+    // Per-token dequant scales, so the fragment load can convert without the
+    // producer having done it. NUM_SCALES per token, indexed dim/QUANT_TILE_SIZE.
+    bf16 sScales[TOPK_BLOCK_SIZE * NUM_SCALES];
+    // WG1's QK partial, published for WG0 to add before the softmax. fp32:
+    // rounding the partial to bf16 shifts lse by ~2e-4, and the sparse lse gate
+    // is 1e-6 abs / 1.2e-4 rel.
+    float sP[BLOCK_M * TOPK_BLOCK_SIZE];
     CUTE_ALIGNAS(1024) array_aligned<bf16, cosize_v<SmemLayoutS>> s;
     bool is_kv_valid[TOPK_BLOCK_SIZE];
 
