@@ -32,7 +32,7 @@
 
 #include <kerutils/kerutils.cuh>
 
-#include "cuda_kernels/sm120/cp_async.cuh"
+#include <cute/arch/copy_sm90_tma.hpp>
 #include "cuda_kernels/legacy/defines.h"
 #include "params.h"
 #include "config.h"
@@ -70,7 +70,8 @@ template<typename InputT, int HEAD_DIM_K>
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200 && __CUDA_ARCH__ < 1300)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
 __device__ __forceinline__
 #endif
-void KernelTemplate<InputT, HEAD_DIM_K>::devfunc(const DenseAttnDecodeParams &params) {
+void KernelTemplate<InputT, HEAD_DIM_K>::devfunc(const DenseAttnDecodeParams &params,
+                                                const DenseTMAParams &tma_params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200 && __CUDA_ARCH__ < 1300)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
     using K = KernelTemplate<InputT, HEAD_DIM_K>;
     // [nvcc] class-template static constexpr members can't be odr-used in device
@@ -81,6 +82,8 @@ void KernelTemplate<InputT, HEAD_DIM_K>::devfunc(const DenseAttnDecodeParams &pa
     constexpr int HEAD_DIM_V = K::HEAD_DIM_V;
     constexpr int NUM_QK_SEG_ = K::NUM_QK_SEG;
     constexpr int D_QK_SEG_ = K::D_QK_SEG;
+    using SlabLayout = typename K::SlabLayout;
+    using VTransposedView = typename K::VTransposedView;
 
     const int m_block_idx = blockIdx.x;
     const int k_head_idx = blockIdx.y;
@@ -120,30 +123,16 @@ void KernelTemplate<InputT, HEAD_DIM_K>::devfunc(const DenseAttnDecodeParams &pa
     // the per-block transpose and its barrier window disappear.
     auto ldsm_PV = make_tiled_copy_B(Copy_Atom<SM75_U16x4_LDSM_T, InputT>{}, tiled_mma_PV);
     auto thr_ldsm_PV = ldsm_PV.get_slice(idx_in_warpgroup);
-    // (dim, token) view over the untouched (token, dim) segment: element (d,t)
-    // lives at t*K_ROW_PAD + d, so the fast axis is dim and each lane's 8
-    // contiguous elements are 8 dims of one token.
-    static constexpr auto kTransposedView =
-        Layout<Shape<Int<D_QK_SEG_>, Int<PAGE_BLOCK_SIZE>>, Stride<_1, Int<K_ROW_PAD>>>{};
-
+    // PV reads each slab through VTransposedView: element (d, t) lives at
+    // t*64 + d behind the slab's XOR, so the fast axis is dim and each lane's
+    // 16 B are 8 dims of one token -- one swizzle chunk, which the layout keeps
+    // physically contiguous and addresses correctly.
     DecodingSchedMeta sched_meta = params.tile_scheduler_metadata_ptr[partition_idx];
     if (sched_meta.begin_req_idx >= params.b) return;
-    // Zero-fill pad columns [64,72) of plan.k (K_ROW_PAD stride): any stray
-    // PV/C fragment read of the padding then sees deterministic zeros instead
-    // of uninitialized smem. Defensive; the dense path never writes these
-    // columns, so this is a determinism guarantee, not a semantic one.
-    {
-        constexpr int PW = K_ROW_PAD - D_QK_SEG_;
-        const int npad = NUM_QK_SEG_ * PAGE_BLOCK_SIZE * PW;
-        unsigned short* kdu = (unsigned short*)(const void*)plan.k.data();
-        for (int i = threadIdx.x; i < npad; i += (int)NUM_THREADS) {
-            const int s = i / (PAGE_BLOCK_SIZE * PW);
-            const int rem = i % (PAGE_BLOCK_SIZE * PW);
-            const int t = rem / PW;
-            const int c = D_QK_SEG_ + rem % PW;
-            kdu[s*PAGE_BLOCK_SIZE*K_ROW_PAD + t*K_ROW_PAD + c] = 0;
-        }
-    }
+    // Page-load barrier. One arrival: the single thread that issues the page's
+    // TMA boxes. The slot table is re-armed per page by arrive_and_expect_tx.
+    if (threadIdx.x == 0) cutlass::arch::ClusterTransactionBarrier::init(&plan.mbar, 1);
+    uint32_t load_phase = 0;
     __syncthreads();
 
 #if FLASH_MLA_SM120_PHASE_TIME
@@ -205,40 +194,43 @@ void KernelTemplate<InputT, HEAD_DIM_K>::devfunc(const DenseAttnDecodeParams &pa
 
         CUTE_NO_UNROLL
         for (int block_idx = start_block_idx; block_idx < end_block_idx; ++block_idx) {
-            // -------- phase 1: copy K page (raw InputT, all 256 threads) --------
-            // Coalesced reload: 8 threads stream one token's 8 groups of 16 B, so
-            // a warp covers 4 tokens with 128 B sectors and the threads walk the
-            // page in token order. Smem destination: (SEG,TOKEN,COL64), 16 B
-            // stores at 8-element-aligned cols.
+            // -------- phase 1: TMA-fetch K page (one 64-dim box per segment) --------
+            // One `cp.async.bulk.tensor` per segment replaces the whole scattered
+            // page copy: no per-token address math, no 16 B issue per thread, and
+            // the destination is the swizzled slab itself. The page is OOB-guarded
+            // by the scheduler; kcache rows are [page][token][d] with token the
+            // IN-PAGE position (0..63) and the page covers one 64-token block of
+            // the request. Validity is per GLOBAL token: the last page of a request
+            // is partial, and its rows beyond seqlen_k must be zero-filled (their
+            // QK has no effect and V contributes 0). TMA cannot zero-fill inside a
+            // box, and the rows are always allocated, so those rows are stored
+            // after the wait -- one page per request.
             {
                 const int page = __ldg(block_table_b + block_idx);
-                // Page is OOB-guarded by the scheduler; kcache rows are [page][token][d]
-                // with token the IN-PAGE position (0..63); the page covers one 64-token
-                // block of the request. Validity is per GLOBAL token: the last page of
-                // a request is partial (seqlen_k % 64 != 0), and rows beyond seqlen_k
-                // must be zero-filled (their QK then has no effect and V contributes 0).
-                // (Rows are read anyway -- the page's 64 slots are always allocated.)
                 const int gtok_base = block_idx*PAGE_BLOCK_SIZE;            // GLOBAL token (validity only)
-                constexpr int GROUPS_PER_SEG = PAGE_BLOCK_SIZE * (D_QK_SEG_ / 8);   // 512
-                const InputT* gK_row_base = (const InputT*)params.k_ptr
-                    + (int64_t)page*params.k_batch_stride + (int64_t)k_head_idx*params.k_head_stride;
-                constexpr int SEG_STRIDE = PAGE_BLOCK_SIZE * K_ROW_PAD;
-                // One commit group per K segment, issued oldest first, so the QK
-                // below can wait for segment s alone and let the rest of the page
-                // land underneath it (the copy no longer blocks the whole page).
-                CUTE_UNROLL
-                for (int seg = 0; seg < NUM_QK_SEG_; ++seg) {
+                if (threadIdx.x == 0) {
+                    cutlass::arch::ClusterTransactionBarrier::arrive_and_expect_tx(
+                        &plan.mbar, NUM_QK_SEG_ * K_SLAB * sizeof(InputT));
                     CUTE_UNROLL
-                    for (int k = 0; k < GROUPS_PER_SEG / NUM_THREADS; ++k) {
-                        const int g = threadIdx.x + k*NUM_THREADS;
-                        const int tok = g / (D_QK_SEG_ / 8);        // PAGE-LOCAL token
-                        const int dim8 = seg*D_QK_SEG_ + (g % (D_QK_SEG_ / 8))*8;
-                        cp_async16(
-                            plan.k.data() + (dim8 / D_QK_SEG_)*SEG_STRIDE + tok*K_ROW_PAD + dim8 % D_QK_SEG_,
-                            gK_row_base + (int64_t)tok*params.k_row_stride + dim8,
-                            gtok_base + tok < seqlen_k ? 16 : 0);
+                    for (int seg = 0; seg < NUM_QK_SEG_; ++seg)
+                        SM90_TMA_LOAD_4D::copy(
+                            &tma_params.tensor_map_K, &plan.mbar,
+                            (uint64_t)cute::TMA::CacheHintSm90::EVICT_NORMAL,
+                            plan.k.data() + seg*K_SLAB,
+                            seg*D_QK_SEG_, 0, k_head_idx, page);
+                }
+                cutlass::arch::ClusterTransactionBarrier::wait(&plan.mbar, load_phase);
+                load_phase ^= 1;
+                const int valid_rows = min(PAGE_BLOCK_SIZE, seqlen_k - gtok_base);
+                if (valid_rows < PAGE_BLOCK_SIZE) {
+                    const int tail = PAGE_BLOCK_SIZE - valid_rows;
+                    for (int j = threadIdx.x; j < tail*D_QK_SEG_; j += (int)NUM_THREADS) {
+                        const int row = valid_rows + j / D_QK_SEG_;
+                        const int dim = j % D_QK_SEG_;
+                        CUTE_UNROLL
+                        for (int s = 0; s < NUM_QK_SEG_; ++s) sK(s*PAGE_BLOCK_SIZE + row, dim) = InputT(0);
                     }
-                    cp_commit();
+                    __syncthreads();
                 }
             }
 #if FLASH_MLA_SM120_PHASE_TIME
@@ -258,16 +250,13 @@ void KernelTemplate<InputT, HEAD_DIM_K>::devfunc(const DenseAttnDecodeParams &pa
                 constexpr int QK_SPLIT = (NUM_QK_SEG_ + 1) / 2;
                 const int seg_begin = warpgroup_idx == 0 ? 0 : QK_SPLIT;
                 const int seg_end   = warpgroup_idx == 0 ? QK_SPLIT : NUM_QK_SEG_;
-                cp_wait<0>();
                 __syncthreads();
                 cute::clear(rP);
                 CUTE_NO_UNROLL
                 for (int seg = seg_begin; seg < seg_end; ++seg) {
                     Tensor gQseg = local_tile(gQ_b, Shape<Int<BLOCK_M>, _64>{}, make_coord(_0{}, seg));
-                    // (SEG,TOKEN,COL64) -> standalone (64,64) NKContig stride (K_ROW_PAD,1) per segment
-                    Tensor sKseg = make_tensor(
-                        sK.data() + seg*K_ROW_PAD*PAGE_BLOCK_SIZE,
-                        Layout<Shape<Int<PAGE_BLOCK_SIZE>, Int<D_QK_SEG_>>, Stride<Int<K_ROW_PAD>, _1>>{});
+                    // (SEG,TOKEN,COL64) -> standalone (64,64) swizzled slab per segment
+                    Tensor sKseg = make_tensor(sK.data() + seg*K_SLAB, SlabLayout{});
                     Tensor rQa = thr_mma_QK.partition_fragment_A(gQseg);
                     Tensor rKb = thr_mma_QK.partition_fragment_B(sKseg);
                     cute::copy(thr_mma_QK.partition_A(gQseg), rQa);
@@ -333,7 +322,7 @@ void KernelTemplate<InputT, HEAD_DIM_K>::devfunc(const DenseAttnDecodeParams &pa
                 CUTE_NO_UNROLL
                 for (int seg = 0; seg < 4; ++seg) {
                     Tensor sVseg = make_tensor(
-                        sV.data() + seg*K_ROW_PAD*PAGE_BLOCK_SIZE, kTransposedView);
+                        sV.data() + seg*K_SLAB, VTransposedView{});
                     Tensor rVb = thr_mma_PV.partition_fragment_B(sVseg);
                     cute::copy(ldsm_PV, thr_ldsm_PV.partition_S(sVseg),
                                thr_ldsm_PV.retile_D(rVb));
@@ -354,7 +343,7 @@ void KernelTemplate<InputT, HEAD_DIM_K>::devfunc(const DenseAttnDecodeParams &pa
                 CUTE_NO_UNROLL
                 for (int seg = 0; seg < 4; ++seg) {
                     Tensor sVseg = make_tensor(
-                        sV.data() + (4 + seg)*K_ROW_PAD*PAGE_BLOCK_SIZE, kTransposedView);
+                        sV.data() + (4 + seg)*K_SLAB, VTransposedView{});
                     Tensor rVb = thr_mma_PV.partition_fragment_B(sVseg);
                     cute::copy(ldsm_PV, thr_ldsm_PV.partition_S(sVseg),
                                thr_ldsm_PV.retile_D(rVb));
@@ -513,8 +502,9 @@ void KernelTemplate<InputT, HEAD_DIM_K>::devfunc(const DenseAttnDecodeParams &pa
 
 template<typename InputT, int HEAD_DIM_K>
 __global__ void __launch_bounds__(KernelTemplate<InputT, HEAD_DIM_K>::NUM_THREADS, 1)
-flash_fwd_splitkv_mla_kernel(__grid_constant__ const DenseAttnDecodeParams params) {
-    KernelTemplate<InputT, HEAD_DIM_K>::devfunc(params);
+flash_fwd_splitkv_mla_kernel(__grid_constant__ const DenseAttnDecodeParams params,
+                             __grid_constant__ const DenseTMAParams tma_params) {
+    KernelTemplate<InputT, HEAD_DIM_K>::devfunc(params, tma_params);
 }
 
 template<typename InputT, int HEAD_DIM_K>
@@ -522,6 +512,36 @@ void KernelTemplate<InputT, HEAD_DIM_K>::run(const DenseAttnDecodeParams &params
     const int num_m_block = cute::ceil_div(params.q_seq_per_hk, BLOCK_M);
     dim3 grid_dim((long)num_m_block, params.h_k, params.num_sm_parts);
     auto kernel = &flash_fwd_splitkv_mla_kernel<InputT, HEAD_DIM_K>;
+    // KV-cache descriptor for the page loads: (dim, token-in-page, kv head,
+    // page), one 64-dim x 64-token box per segment, 128 B swizzle to match the
+    // slab layout. Rebuilt per launch (one driver call).
+    DenseTMAParams tma_params{};
+    {
+        uint64_t size[4] = {(unsigned long)HEAD_DIM_K, (unsigned long)PAGE_BLOCK_SIZE,
+                            (unsigned long)params.h_k, (unsigned long)params.num_blocks};
+        uint64_t stride[3] = {(uint64_t)params.k_row_stride*sizeof(InputT),
+                              (uint64_t)params.k_head_stride*sizeof(InputT),
+                              (uint64_t)params.k_batch_stride*sizeof(InputT)};
+        uint32_t box_size[4] = {D_QK_SEG, PAGE_BLOCK_SIZE, 1, 1};
+        uint32_t elem_stride[4] = {1, 1, 1, 1};
+        CUresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
+            &tma_params.tensor_map_K,
+            std::is_same_v<InputT, cutlass::half_t>
+                ? CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT16
+                : CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+            4,
+            params.k_ptr,
+            size,
+            stride,
+            box_size,
+            elem_stride,
+            CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+            CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        );
+        KU_ASSERT(res == CUresult::CUDA_SUCCESS);
+    }
     {
         cudaError_t sattr = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(SharedMemoryPlan));
         if (sattr != cudaSuccess) {
@@ -545,7 +565,7 @@ void KernelTemplate<InputT, HEAD_DIM_K>::run(const DenseAttnDecodeParams &params
         kernel_attributes,
         1
     };
-    cudaLaunchKernelEx(&kernel_config, kernel, params);
+    cudaLaunchKernelEx(&kernel_config, kernel, params, tma_params);
     auto err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "[sm120 dense decode run] launch failed: %s (grid=(%d,%d,%d) smem=%zu num_threads=%d)\n",

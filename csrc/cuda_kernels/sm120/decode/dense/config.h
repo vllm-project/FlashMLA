@@ -2,6 +2,7 @@
 
 #include <math_constants.h>
 #include <cute/tensor.hpp>
+#include <cute/arch/copy_sm90_tma.hpp>
 #include <cutlass/cluster_launch.hpp>
 #include <cutlass/arch/reg_reconfig.h>
 #include <cutlass/arch/arch.h>
@@ -14,11 +15,14 @@ namespace sm120::decode::dense {
 
 using namespace cute;
 
-// Padded per-token row stride (elements) for the K/V smem layout: 64 -> 72
-// (144B) makes the m16n8k16 TN B-fragment reads fully conflict-free (bank =
-// (4q+r)%32 covers all 32 banks; at stride 64 it was 8-way). K/V smem grows
-// 73.7KB -> 82.9KB, still under the optin max (~99KB).
-static constexpr int K_ROW_PAD = 72;
+// K/V smem layout: one standalone (64 token, 64 dim) slab per K segment, 128 B
+// per token row, swizzled with the GMMA SW128 pattern. The 72-element pad the
+// cp.async copy used (144 B rows) is gone: a TMA destination is always packed
+// at the box width and must be 128 B aligned (probe 10), so the row has to be
+// exactly 64 elements and the bank spread the pad provided now comes from the
+// XOR. Every reader goes through the swizzled layout, so no reader knows.
+static constexpr int K_ROW_STRIDE = 64;     // elements; 128 B
+static constexpr int K_SLAB = 64*K_ROW_STRIDE;   // one segment, 8 KB (BOX_TOKENS=64)
 
 // mma.sync atom per InputT, shared by QK and PV. Both consume the element type
 // InputT (raw KV for QK, softmax output P for PV -- upstream sm90 dense also
@@ -43,6 +47,11 @@ static __forceinline__ __device__ auto make_input_tiled_mma() {
             Layout<Shape<_1, _1, _1>>{});
 }
 #endif  // __CUDA_ARCH__ >= 1200
+
+// Grid-constant TMA descriptor of the KV cache. Built on the host per launch;
+// the tensor is (dim, token-in-page, kv head, page) and one box is a whole
+// 64-token page slab of 64 dims, so a page costs NUM_QK_SEG boxes.
+struct DenseTMAParams { CUtensorMap tensor_map_K; };
 
 template<typename InputT, int HEAD_DIM_K>
 class KernelTemplate {
@@ -72,20 +81,33 @@ static constexpr int D_QK_SEG = 64;
 static constexpr int NUM_QK_SEG = HEAD_DIM_K / D_QK_SEG;
 
 // K/V shared layout: (SEG, TOKEN, COL64) -- each 64-col segment is a standalone
-// (64,64) contiguous tile, the mma.sync B-operand layout verified on sm_120a
-// (a single HEAD_DIM_K-stride K row is wrong for B reads). The producer
-// scatters per-segment int128 stores (segment stride 64*72, token stride
-// K_ROW_PAD=72, col stride 1). V is the nope part of K, segments 0..7 of the K
-// buffer: dense raw KV carries no RoPE section, and even for HEAD_DIM_K==576 V
-// only reads the first 512 dims.
-using SmemLayoutK = Layout<
-    Shape<Int<NUM_QK_SEG>, Int<PAGE_BLOCK_SIZE>, Int<D_QK_SEG>>,
-    Stride<Int<PAGE_BLOCK_SIZE*K_ROW_PAD>, Int<K_ROW_PAD>, _1>
->;
-using SmemLayoutV = Layout<
-    Shape<Int<HEAD_DIM_V/D_QK_SEG>, Int<PAGE_BLOCK_SIZE>, Int<D_QK_SEG>>,
-    Stride<Int<PAGE_BLOCK_SIZE*K_ROW_PAD>, Int<K_ROW_PAD>, _1>
->;
+// (64,64) SW128-swizzled tile, i.e. exactly one TMA box. The mma.sync B operand
+// and the PV ldmatrix.trans view both read through this layout, so the XOR is
+// transparent to them. V is the nope part of K, segments 0..7 of the K buffer:
+// dense raw KV carries no RoPE section, and even for HEAD_DIM_K==576 V only
+// reads the first 512 dims.
+// TMA's 128 B swizzle is defined on the destination *byte* address (16 B
+// chunks XORed by the row within 128 B), so in bf16 elements it is <3,3,3>:
+// bits 3..5 of the element index are the 16 B chunk, bits 6..8 the row.
+// (GMMA's Layout_K_SW128_Atom carries a bit-based flag that does this scaling
+// inside make_tensor; composing by hand keeps the element offsets plain.)
+static constexpr auto kSwizzle = Swizzle<3,3,3>{};
+using SlabLayout = decltype(composition(
+    kSwizzle,
+    Layout<Shape<Int<PAGE_BLOCK_SIZE>, Int<D_QK_SEG>>, Stride<Int<K_ROW_STRIDE>, _1>>{}
+));
+using SmemLayoutK = decltype(composition(
+    kSwizzle,
+    Layout<Shape<Int<NUM_QK_SEG*PAGE_BLOCK_SIZE>, Int<D_QK_SEG>>, Stride<Int<K_ROW_STRIDE>, _1>>{}
+));
+// (dim, token) view of a slab for PV: k is the token axis, 128 B away; the
+// composition keeps the slab's swizzle, so the address still XORs.
+using VTransposedView = decltype(composition(
+    kSwizzle,
+    Layout<Shape<Int<D_QK_SEG>, Int<PAGE_BLOCK_SIZE>>, Stride<_1, Int<K_ROW_STRIDE>>>{}
+));
+// V shares K's buffer (segments 0..7), so its element layout is K's.
+using SmemLayoutV = SmemLayoutK;
 
 using SmemLayoutS = decltype(coalesce(tile_to_shape(
     GMMA::Layout_K_SW128_Atom<InputT>{},
@@ -98,6 +120,9 @@ struct SharedMemoryPlan {
     // WG1's QK partial tile (bf16): the K segments are split across the two
     // warpgroups, so WG1 publishes here and WG0 adds before the softmax.
     CUTE_ALIGNAS(1024) array_aligned<InputT, BLOCK_M*PAGE_BLOCK_SIZE> sP;   // P in InputT (softmax output)
+    // Page-load transaction barrier: one arrival (the issuing thread) plus the
+    // page's byte count, waited on by the whole CTA before QK.
+    CUTE_ALIGNAS(8) uint64_t mbar;
 
     float sM[BLOCK_M], sL[BLOCK_M], sScale[BLOCK_M], sOScale[BLOCK_M];
 };
@@ -226,7 +251,7 @@ static __forceinline__ __device__ void scale_softmax(
 }
 
 static __device__ __forceinline__ void
-devfunc(const DenseAttnDecodeParams &params);
+devfunc(const DenseAttnDecodeParams &params, const DenseTMAParams &tma_params);
 
 static void run(const DenseAttnDecodeParams &params);
 
