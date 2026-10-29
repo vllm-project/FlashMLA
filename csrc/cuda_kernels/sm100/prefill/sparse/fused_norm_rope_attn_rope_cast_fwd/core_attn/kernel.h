@@ -25,7 +25,7 @@ struct ParamsTemplate : Base {
     float rms_norm_eps;
 
     // Q/O RoPE
-    uint32_t* __restrict__ token_positions;   // [s_q]
+    int64_t* __restrict__ token_positions;    // [s_q]
     bool is_rope_neox_style;    // Must be false
     uint32_t rope_dim;          // Must be 64
     float* __restrict__ cos_sin_cache;  // [*, rope_dim], must be contiguous, from vllm.RotaryEmbedding.cos_sin_cache
