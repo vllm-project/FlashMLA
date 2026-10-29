@@ -320,6 +320,17 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Decodin
 
     flash::Softmax<2 * size<1>(tOrO)> softmax;
 
+    // When seqlen_k == 0, skip the block_table[-1] loads below
+    if (n_block_max <= n_block_min) {
+        cute::fill(softmax.row_max, -INFINITY);
+        cute::fill(softmax.row_sum, 0.f);
+        if (NoSplit)
+            store<Kernel_traits, false>(params, bidb, bidh, m_block, n_split_idx, shared_storage, tOrO, softmax, descale_k, scale_softmax);
+        else
+            store<Kernel_traits, true>(params, bidb, bidh, m_block, n_split_idx, shared_storage, tOrO, softmax, descale_k, scale_softmax);
+        return;
+    }
+
     int warp_group_idx = cutlass::canonical_warp_group_idx();
     if (warp_group_idx == 0) {
         typename Kernel_traits::TiledMma tiled_mma;
