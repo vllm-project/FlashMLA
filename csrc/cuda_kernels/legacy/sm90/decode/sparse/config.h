@@ -16,8 +16,8 @@ template<ModelType MODEL_TYPE, int NUM_HEADS>
 class KernelTemplate {
 public:
 
-static_assert(NUM_HEADS == 64 || NUM_HEADS == 128);
-static constexpr int NUM_M_BLOCKS = NUM_HEADS / 64;
+static_assert(NUM_HEADS == 32 || NUM_HEADS == 64 || NUM_HEADS == 128);
+static constexpr int NUM_M_BLOCKS = (NUM_HEADS + 63) / 64;
 static constexpr int CLUSTER_SIZE = NUM_M_BLOCKS;
 
 static constexpr int HEAD_DIM_K = MODEL_TYPE == ModelType::V32 ? 576 : 512;
@@ -144,7 +144,10 @@ enum NamedBarriers : uint32_t {
 // Synchronize all threads within the cluster (which processes one q token)
 static __forceinline__ __device__ void sync_all_threads_in_cluster() {
     if constexpr (CLUSTER_SIZE == 1) {
-        __syncthreads();
+        if constexpr (NUM_HEADS == 32)
+            cutlass::arch::NamedBarrier::arrive_and_wait(NUM_THREADS, NamedBarriers::batch_loop_sync);
+        else
+            __syncthreads();
     } else {
         ku::barrier_cluster_arrive_relaxed();
         ku::barrier_cluster_wait_acquire();
