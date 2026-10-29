@@ -23,7 +23,15 @@
 #define FLASH_MLA_SM120_PHASE_TIME 0
 #endif
 
+// Row-7 probe: convert each page to E4M3 in registers right after it lands, so
+// the instruction cost sits inside the TMA stall instead of before QK. Nothing
+// is written back; the point is the wall, not the values.
+#ifndef FLASH_MLA_SM120_QUANT_PROBE
+#define FLASH_MLA_SM120_QUANT_PROBE 0
+#endif
+
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <math_constants.h>
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
@@ -232,6 +240,33 @@ void KernelTemplate<InputT, HEAD_DIM_K>::devfunc(const DenseAttnDecodeParams &pa
                     }
                     __syncthreads();
                 }
+#if FLASH_MLA_SM120_QUANT_PROBE
+                // Probe only: can an E4M3 conversion of the whole page hide in the
+                // TMA stall the page load leaves behind? Reads every element the way
+                // a converting copy would (16 B, one swizzle chunk), converts with a
+                // per-token scale exactly as row 7 would, and folds the bytes into a
+                // checksum so nothing is elided. No second plane yet.
+                {
+                    uint32_t acc = 0;
+                    constexpr int CHUNKS = NUM_QK_SEG_ * PAGE_BLOCK_SIZE * (D_QK_SEG_ / 8);
+                    for (int g = threadIdx.x; g < CHUNKS; g += (int)NUM_THREADS) {
+                        const int s = g / (PAGE_BLOCK_SIZE * (D_QK_SEG_ / 8));
+                        const int rem = g % (PAGE_BLOCK_SIZE * (D_QK_SEG_ / 8));
+                        const int row = rem / (D_QK_SEG_ / 8);
+                        const int c = (rem % (D_QK_SEG_ / 8)) * 8;
+                        const float qs = 1.0f / (float)(1 + (row & 3));
+                        const __nv_bfloat162* v = (const __nv_bfloat162*)&sK(s*PAGE_BLOCK_SIZE + row, c);
+                        __nv_fp8x4_e4m3 lo, hi;
+                        float2 a0 = __bfloat1622float2(v[0]), a1 = __bfloat1622float2(v[1]);
+                        float2 a2 = __bfloat1622float2(v[2]), a3 = __bfloat1622float2(v[3]);
+                        lo = __nv_fp8x4_e4m3(make_float4(a0.x*qs, a0.y*qs, a1.x*qs, a1.y*qs));
+                        hi = __nv_fp8x4_e4m3(make_float4(a2.x*qs, a2.y*qs, a3.x*qs, a3.y*qs));
+                        acc ^= *(uint32_t*)&lo;
+                        acc ^= (*(uint32_t*)&hi) << 8;
+                    }
+                    if (acc == 0xdeadbeefu) plan.sScale[0] = 1.f;
+                }
+#endif
             }
 #if FLASH_MLA_SM120_PHASE_TIME
             if (threadIdx.x == 0) {
