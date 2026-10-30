@@ -31,6 +31,12 @@ tail; a flat token axis is off by one row per block, so the coordinate is
 tokens needs its own block and rel. The engine's per-op price, not its issue
 count, is what made the row 8% slower.
 
+Row 16 then kept the plane and put `cp.async` back (1.00x, also reverted) and
+answered the attribution question: only 4.1% of row 10's 16% QK gain is the
+layout, the rest is the gather keeping the copy off the LSU/L1 - the QK phase
+re-reads Q from gmem and feels it. The producer is archived verbatim in
+`row16_cpasync_into_kslice.snippet.cuh`.
+
 Consequences for the implementation, to carry into the design step:
 
 - A sub-byte KV page cannot be tightly packed at 576 B per row for TMA: every
