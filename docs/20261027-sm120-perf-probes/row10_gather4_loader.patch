@@ -1,0 +1,562 @@
+diff --git a/csrc/cuda_kernels/sm120/decode/sparse/config.h b/csrc/cuda_kernels/sm120/decode/sparse/config.h
+index 7b44e92..6a357d6 100644
+--- a/csrc/cuda_kernels/sm120/decode/sparse/config.h
++++ b/csrc/cuda_kernels/sm120/decode/sparse/config.h
+@@ -16,6 +16,18 @@ namespace sm120::decode::sparse {
+ 
+ using namespace cute;
+ 
++// Slice layouts at namespace scope: a `make_tensor(ptr, L{})` with a *class
++// member* typedef puts L{} in a dependent context, where cute's overload set
++// stops recognizing it as a layout (namespace-scope types are fine).
++namespace kslice {
++static constexpr int W = 128;      // == K_TMA_W
++static constexpr int TOPK = 64;    // == TOPK_BLOCK_SIZE
++static constexpr auto sw = Swizzle<3,4,3>{};
++static constexpr auto swb = Swizzle<3,3,3>{};
++using Bytes = decltype(composition(sw, Layout<Shape<Int<TOPK>, Int<W>>, Stride<Int<W>, _1>>{}));
++using Bf16 = decltype(composition(swb, Layout<Shape<Int<TOPK>, Int<W/2>>, Stride<Int<W/2>, _1>>{}));
++}  // namespace kslice
++
+ template<ModelType MODEL_TYPE, int NUM_HEADS>
+ class KernelTemplate {
+ public:
+@@ -48,11 +60,31 @@ static constexpr int D_QK_SEG = 64;
+ static constexpr int NUM_QK_SEG = HEAD_DIM_K / D_QK_SEG;
+ // K is resident as *raw cache bytes*: the nope dims are e4m3 (1 B) and the rope
+ // dims bf16 (2 B), exactly as they sit in global memory, so the copy never
+-// converts and the plane halves. A row is [nope fp8][rope bf16][pad]; the 16 B
+-// pad keeps the token stride a 16 B multiple (16 B cp.async destinations, 16 B
+-// ldmatrix rows) and rotates the banks.
++// converts and the plane halves.
++// ----- row 10: the plane is sliced for `tile::gather4` -----
++// A TMA destination is packed at the box width, so a token's row can no longer
++// be one padded run: the plane is `K_TMA_W`-byte slices of all 64 tokens, and
++// one gather4 fills four tokens of one slice. Slice s of token t lives at
++// s*K_SLICE_BYTES + t*K_TMA_W, so the row stride inside a slice is the box
++// width itself. 128 B is both the probe's box and a full swizzle period; the
++// slice's 128 B are XOR-swizzled within the row (see k_byte).
++// Every nope segment (64 dims) sits wholly inside one slice, so a segment base
++// is (slice, half) = two affine parts and the readers stay stride-based.
++// The rope dims get their own slice (K_ROPE_SLICE) so that they never straddle
++// a box boundary: V32's rope starts at gmem byte 528 (behind its in-row fp32
++// scale field) and would otherwise split across slices 4 and 5.
++static constexpr int K_TMA_W = 128;
++static constexpr int NOPE_SLICES = (HEAD_DIM_NOPE + K_TMA_W - 1) / K_TMA_W;   // 4
++static constexpr int K_ROPE_SLICE = NOPE_SLICES;
++static constexpr int NUM_K_SLICES = NOPE_SLICES + 1;
++static constexpr int K_SLICE_BYTES = TOPK_BLOCK_SIZE * K_TMA_W;
++// gmem x of each box: nope boxes at 0,128,256,384; the rope box behind the
++// row's scale field on V32
++static constexpr int K_ROPE_X = HEAD_DIM_NOPE + (MODEL_TYPE == ModelType::V32 ? 16 : 0);
++static constexpr int k_slice_x(int s) { return s < NOPE_SLICES ? s*K_TMA_W : K_ROPE_X; }
++
+ static constexpr int K_ROW_BYTES = HEAD_DIM_NOPE + HEAD_DIM_ROPE*2;
+-static constexpr int K_ROW_PAD = K_ROW_BYTES + 16;
++static constexpr int K_ROW_PAD = K_ROW_BYTES;
+ // Q is resident the same way, and for the same reason: the fp8 QK mma wants its
+ // A operand in e4m3, so Q is quantized per (row, 128-dim tile) once per block
+ // instead of per segment. Only the nope dims live here - the rope segment keeps
+@@ -60,25 +92,43 @@ static constexpr int K_ROW_PAD = K_ROW_BYTES + 16;
+ static constexpr int Q_ROW_BYTES = HEAD_DIM_NOPE;
+ static constexpr int Q_ROW_PAD = Q_ROW_BYTES + 16;
+ static constexpr int Q_BYTES = BLOCK_M * Q_ROW_PAD;
+-// byte offset of dim d inside its own row
+-static constexpr int k_dim_byte(int d) {
+-    return d < HEAD_DIM_NOPE ? d : HEAD_DIM_NOPE + (d - HEAD_DIM_NOPE)*2;
++// A nope segment (64 dims) sits inside one slice: base = its slice plus a
++// half-offset, and both are affine. This is the plane's segment base, in bytes.
++static constexpr int k_seg_base(int d) {
++    return (d / K_TMA_W) * K_SLICE_BYTES + ((d / D_QK_SEG) & 1) * D_QK_SEG;
++}
++static constexpr int K_BYTES = NUM_K_SLICES * K_SLICE_BYTES;
++
++// Slice tile as the TMA writes it: 64 tokens of 128 B, XOR-swizzled over an
++// 8-row period. The element is a byte here, so the swizzle is <3,4,3> (bits
++// 4..5 are the 16 B chunk) where the dense bf16 plane needs <3,3,3>.
++static constexpr auto kSwizzle = Swizzle<3,4,3>{};
++static constexpr auto kSwizzleBf16 = Swizzle<3,3,3>{};   // same pattern, element is bf16
++using SmemLayoutKSlice = decltype(composition(
++    kSwizzle,
++    Layout<Shape<Int<TOPK_BLOCK_SIZE>, Int<K_TMA_W>>, Stride<Int<K_TMA_W>, _1>>{}
++));
++using SmemLayoutKSliceBf16 = decltype(composition(
++    kSwizzleBf16,
++    Layout<Shape<Int<TOPK_BLOCK_SIZE>, Int<K_TMA_W/2>>, Stride<Int<K_TMA_W/2>, _1>>{}
++));
++// Absolute byte of (token, dim-in-slice); the XOR has to be applied to the
++// absolute chunk, so a window inside a slice is a `local_tile` of the slice,
++// never a tensor built at the window's own base.
++static __device__ __forceinline__ const uint8_t* k_row_ptr(const uint8_t* slice, int tok, int c) {
++    return slice + tok*K_TMA_W + ((((c >> 4) ^ (tok & 7)) << 4) | (c & 15));
+ }
+-// The row is 640 B (V32) / 576 B (V4) of data + 16 B pad. A row is addressed
+-// whole; the 64-dim segments the gemms work in are column ranges inside it.
+-static constexpr int K_BYTES = TOPK_BLOCK_SIZE * K_ROW_PAD;
+-static constexpr int K_ROW_PAD_BF16 = K_ROW_PAD/2;   // bf16-element row stride
+ 
+-// Segments stay the gemm unit, but they are read as *bytes* out of the flat
+-// plane through k_dim_byte(); only a wholly-nope segment is a contiguous
+-// (TOPK, 64) byte tile, and those are the ones that build a SmemLayoutV segment.
+-//
+ // The V of the PV gemm is the nope part of this same buffer - no copy, no
+-// transpose, and no dequant until the fragment load.
+-using SmemLayoutV = Layout<
+-    Shape<Int<HEAD_DIM_V/D_QK_SEG>, Int<TOPK_BLOCK_SIZE>, Int<D_QK_SEG>>,
+-    Stride<Int<D_QK_SEG>, Int<K_ROW_PAD>, _1>
+->;
++// transpose, and no dequant until the fragment load. Indexed by (slice, half,
++// token, dim-in-segment); a 64-dim segment never crosses a slice.
++using SmemLayoutV = decltype(composition(
++    kSwizzle,
++    Layout<
++        Shape<Int<NOPE_SLICES>, _2, Int<TOPK_BLOCK_SIZE>, Int<D_QK_SEG>>,
++        Stride<Int<K_SLICE_BYTES>, Int<D_QK_SEG>, Int<K_TMA_W>, _1>
++    >{}
++));
+ 
+ using SmemLayoutS = decltype(coalesce(tile_to_shape(
+     GMMA::Layout_K_SW128_Atom<bf16>{},
+@@ -116,6 +166,8 @@ struct SharedMemoryPlan {
+     __half sP[BLOCK_M * TOPK_BLOCK_SIZE];
+     CUTE_ALIGNAS(1024) array_aligned<bf16, cosize_v<SmemLayoutS>> s;
+     bool is_kv_valid[TOPK_BLOCK_SIZE];
++    // Page-gather transaction barrier (NUM_K_SLICES*16 arrivals + their bytes).
++    CUTE_ALIGNAS(8) uint64_t mbar_load;
+ 
+     float sM[BLOCK_M], sL[BLOCK_M], sScale[BLOCK_M], sOScale[BLOCK_M];
+ };
+diff --git a/csrc/cuda_kernels/sm120/decode/sparse/splitkv_mla.cuh b/csrc/cuda_kernels/sm120/decode/sparse/splitkv_mla.cuh
+index a7d7a22..10fb5c0 100644
+--- a/csrc/cuda_kernels/sm120/decode/sparse/splitkv_mla.cuh
++++ b/csrc/cuda_kernels/sm120/decode/sparse/splitkv_mla.cuh
+@@ -45,8 +45,8 @@ __device__ __forceinline__ void ldm_b8x2(uint32_t const *addr, uint32_t (&r)[4])
+ // lanes are (t & ~3) | (j>>1) and (t & ~3) | (2 + (j>>1)), j = t%4, and the
+ // wanted bytes sit at (j&1)*2 of their word.
+ template<class TFrag, int TOPK, int SEG, int ROWPAD, int NSC>
+-__device__ __forceinline__ void pv_dequant_ldsm(TFrag &rVb, const uint8_t* seg_base,
+-                                                const bf16* sSc, int lane) {
++__device__ __forceinline__ void pv_dequant_ldsm(TFrag &rVb, const uint8_t* slice_base,
++                                                const bf16* sSc, int lane, int half) {
+     const int j = lane & 3, grp = lane & ~3;
+     const int src[2] = {grp | (j >> 1), grp | (2 + (j >> 1))};
+     const int sh = (j & 1)*16;   // bit offset of the byte pair
+@@ -55,7 +55,11 @@ __device__ __forceinline__ void pv_dequant_ldsm(TFrag &rVb, const uint8_t* seg_b
+         CUTE_UNROLL
+         for (int dwin = 0; dwin < SEG; dwin += 16) {
+             uint32_t raw[4];
+-            ldm_b8x2((const uint32_t*)(seg_base + (twin + lane)*ROWPAD + dwin), raw);
++            // chunk half*4 + dwin/16 of row twin+lane, XORed by the row's phase
++            // in the slice's 8-row swizzle period. The XOR is on the ABSOLUTE
++            // chunk, so the base is the slice and the half rides in the chunk.
++            ldm_b8x2((const uint32_t*)(slice_base + (twin + lane)*ROWPAD
++                                       + (((half*4 + (dwin>>4)) ^ ((twin + lane) & 7)) << 4)), raw);
+             CUTE_UNROLL
+             for (int q = 0; q < 4; ++q) {
+                 // q = a + 2*s: a picks the dim half (r0/r2 -> +0, r1/r3 -> +8),
+@@ -145,9 +149,43 @@ __device__ __forceinline__ void dequant_b_frag(TFrag &rB, TThr const &thr,
+     }
+ }
+ 
+-// Host-side parameters handed to the kernel through __grid_constant__: only the
+-// O store descriptor is needed (Q is read directly by the compute threads).
+-struct TMAParams { CUtensorMap tensor_map_O; };
++// Host-side parameters handed to the kernel through __grid_constant__: the O
++// store descriptor and the two page-gather descriptors (`extra_kv` is a separate
++// tensor with its own stride, so it needs its own map). Q is read directly from
++// global memory by the compute threads, no map.
++struct TMAParams { CUtensorMap tensor_map_O, tensor_map_K, tensor_map_K_extra; };
++
++// ---- mbarrier / gather4 primitives (see docs/20261027-sm120-perf-probes) ----
++__device__ __forceinline__ uint32_t smem_u32(const void* p) {
++    return (uint32_t)__cvta_generic_to_shared(p);
++}
++__device__ __forceinline__ void mbar_arrive_expect(uint64_t* mbar, uint32_t bytes) {
++    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_u32(mbar)),
++                 "r"(bytes));
++}
++__device__ __forceinline__ void mbar_init(uint64_t* mbar, uint32_t count) {
++    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(smem_u32(mbar)), "r"(count));
++}
++__device__ __forceinline__ void mbar_wait(uint64_t* mbar, uint32_t phase) {
++    asm volatile(
++        "{\n"
++        ".reg .pred P%=;\n"
++        "LAB%=:\n"
++        "mbarrier.try_wait.parity.shared::cta.b64 P%=, [%0], %1;\n"
++        "@!P%= bra LAB%=;\n"
++        "}\n" ::"r"(smem_u32(mbar)),
++        "r"(phase));
++}
++// Plain form: the `.cta_group::1` token does not assemble at sm_120a (probe 10).
++__device__ __forceinline__ void tma_gather4_plain(const void* map, void* smem,
++                                                  uint64_t* mbar, int32_t col,
++                                                  int r0, int r1, int r2, int r3) {
++    asm volatile(
++        "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::"
++        "complete_tx::bytes [%0], [%1, {%2, %3, %4, %5, %6}], [%7];" ::"r"(smem_u32(smem)),
++        "l"(map), "r"(col), "r"(r0), "r"(r1), "r"(r2), "r"(r3), "r"(smem_u32(mbar))
++        : "memory");
++}
+ 
+ struct MainloopArgs {
+     int start_block_idx, end_block_idx;
+@@ -170,13 +208,15 @@ struct MainloopArgs {
+ template<ModelType MODEL_TYPE, int NUM_HEADS>
+ __device__ __forceinline__ void dequant_k_block(
+     const SparseAttnDecodeParams &params,
++    const TMAParams &tma_params,
+     typename KernelTemplate<MODEL_TYPE, NUM_HEADS>::SharedMemoryPlan &plan,
+     int batch_idx,
+     int s_q_idx,
+     int block_idx,
+     const MainloopArgs &args,
+     bool use_extra,           // V4 only: block lives in the extra KV cache
+-    [[maybe_unused]] bool is_first_extra_block
++    [[maybe_unused]] bool is_first_extra_block,
++    uint32_t &load_phase
+ ) {
+     using Kernel = KernelTemplate<MODEL_TYPE, NUM_HEADS>;
+     constexpr int HEAD_DIM_NOPE = Kernel::HEAD_DIM_NOPE;
+@@ -184,6 +224,10 @@ __device__ __forceinline__ void dequant_k_block(
+     constexpr int NUM_SCALES = Kernel::NUM_SCALES;
+     constexpr int TOPK_BLOCK_SIZE = Kernel::TOPK_BLOCK_SIZE;
+     constexpr int K_ROW_PAD = Kernel::K_ROW_PAD;
++    constexpr int K_ROW_BYTES = Kernel::K_ROW_BYTES;
++    constexpr int K_TMA_W = Kernel::K_TMA_W;
++    constexpr int K_SLICE_BYTES = Kernel::K_SLICE_BYTES;
++    constexpr int NUM_K_SLICES = Kernel::NUM_K_SLICES;
+ 
+     const int token = threadIdx.x & 63;
+     const int tg = threadIdx.x >> 6;    // 0..3 -> one of the 4 dim strips handled per token
+@@ -261,44 +305,98 @@ __device__ __forceinline__ void dequant_k_block(
+     for (int i = 0; i < NUM_SCALES; ++i)
+         plan.sScales[token*NUM_SCALES + i] = scales[i];
+ 
+-    // Row addressing: dim d of token t lives at t*K_ROW_PAD + k_dim_byte(d). The
+-    // 16 B pad keeps the tokens apart for the fragment reads and keeps every
+-    // 16 B chunk of a row aligned.
+-    auto sk_addr = [&](int dim) -> uint8_t* {
+-        return plan.u.k.data() + token*K_ROW_PAD + Kernel::k_dim_byte(dim);
+-    };
+-
+-    // ----- nope dims (e4m3, byte copy): 8 x (16 dims) per thread -----
+-    // Alignment: V32 rows are 656 B and V4 data rows 576 B, both 16 B-aligned
+-    // (and the V4 block stride is a multiple of 576), so 16 B copies are safe.
+-    // Invalid tokens take the zero-fill form of cp.async.
+-    fp8* gK_nope = gK_base;
+-    CUTE_UNROLL
+-    for (int i = 0; i < 8; ++i) {
+-        int dim16 = (tg*8 + i)*16;
+-        if (dim16 >= HEAD_DIM_NOPE) break;
+-        cp_async16(sk_addr(dim16), gK_nope + dim16, is_valid ? 16 : 0);
+-    }
+-
+-    // ----- rope dims (bf16, byte copy): 16 dims per thread -----
++    // ----- the page: one `tile::gather4` per (slice, 4-token group) -----
++    // K_SLICE_BYTES * NUM_K_SLICES = 40 KB, and there are 80 work items
++    // (5 slices x 16 groups), so 80 of the 256 threads each issue one gather of
++    // four tokens. Each issuer arrives on the barrier for its own 4*128 B before
++    // issuing, which makes the expect/issue order safe without a barrier in
++    // between; the barrier's arrival count is 80 (set at init).
++    // A gather row is a token row of the map, whose y axis is the whole cache
++    // laid out at the data row step: a page block is not necessarily exactly
++    // page_block_size rows (the sparse test allocates one extra), so the block
++    // step in rows is block_stride/row_step and the coordinate is block*that +
++    // rel - the same address the scalar path computes above. An invalid token
++    // gathers row 0 and is zeroed after the wait.
++    constexpr int GROUPS = TOPK_BLOCK_SIZE / 4;
++    const int slice = threadIdx.x / GROUPS;
++    const int group = threadIdx.x % GROUPS;
++    // Map row unit: a V4 map row is the 576 data bytes (see the host), every
++    // other format's row is the whole token.
++    const int64_t row_unit = MODEL_TYPE == ModelType::V4 ? K_ROW_BYTES : k_row_stride;
++    int rows[4];
+     {
+-        int dim16 = tg*16;   // 0..48 (HEAD_DIM_ROPE == 64, 4 threads x 16)
+-        bf16* gK_rope;
+-        if constexpr (MODEL_TYPE == ModelType::V32) {
+-            // layout: [512 nope fp8][16B fp32 scales][64 rope bf16]
+-            gK_rope = (bf16*)(gK_base + HEAD_DIM_NOPE + NUM_SCALES*sizeof(float));
+-        } else {
+-            // layout: [448 nope fp8][64 rope bf16], scales are NOT in the row
+-            gK_rope = (bf16*)(gK_base + HEAD_DIM_NOPE);
++        if (threadIdx.x < NUM_K_SLICES*GROUPS) {
++            // the extra plane has its own index table, addressed relative to its
++            // first block (see the is_valid check above)
++            int* gSrc = use_extra ? gExtraIndices : gIndices;
++            const int rel_block = use_extra ? block_idx - args.num_orig_kv_blocks : block_idx;
++            const int rows_per_block = (int)(k_block_stride / row_unit);
++            // A group's four tokens are four arbitrary tokens of the cache, so
++            // each needs its own block and rel - the thread's own token_index
++            // (which drives the scales above) is only right for its own row.
++            CUTE_UNROLL
++            for (int j = 0; j < 4; ++j) {
++                int idx = __ldg(gSrc + rel_block*TOPK_BLOCK_SIZE + group*4 + j);
++                int blk = idx == -1 ? 0 : (int)((uint32_t)idx / (uint32_t)page_block_size);
++                int rel = idx == -1 ? 0 : (int)((uint32_t)idx % (uint32_t)page_block_size);
++                rows[j] = blk*rows_per_block + rel;
++            }
++            mbar_arrive_expect(&plan.mbar_load, 4*K_TMA_W);
++            tma_gather4_plain(
++                use_extra ? (const void*)&tma_params.tensor_map_K_extra
++                          : (const void*)&tma_params.tensor_map_K,
++                plan.u.k.data() + slice*K_SLICE_BYTES + group*4*K_TMA_W,
++                &plan.mbar_load, Kernel::k_slice_x(slice),
++                rows[0], rows[1], rows[2], rows[3]);
+         }
++        mbar_wait(&plan.mbar_load, load_phase);
++        load_phase ^= 1;
++    }
++    // Rows a gather of row 0 left behind for an invalid token (`is_valid` is the
++    // same on all four tg threads of a token, so one of them fills).
++    if (tg == 0 && !is_valid) {
++        uint8_t* p = plan.u.k.data() + token*K_TMA_W;
+         CUTE_UNROLL
+-        for (int j = 0; j < 2; ++j)
+-            cp_async16(sk_addr(HEAD_DIM_NOPE + dim16 + j*8),
+-                       gK_rope + dim16 + j*8, is_valid ? 16 : 0);
++        for (int s = 0; s < NUM_K_SLICES; ++s)
++            CUTE_UNROLL
++            for (int c = 0; c < K_TMA_W; c += 16)
++                *(uint4*)(p + s*K_SLICE_BYTES + c) = make_uint4(0, 0, 0, 0);
+     }
+-    // One commit group for the whole block; the block barrier publishes it.
+-    cp_commit();
+-    cp_wait<0>();
++#if FLASH_MLA_SM120_DBG_K
++    // Diagnostic (compile with -DFLASH_MLA_SM120_DBG_K=1): the same logical cell
++    // read back through the scalar path (g) and out of the gathered plane (s).
++    if (blockIdx.x == 0 && batch_idx == 0 && block_idx == args.start_block_idx &&
++        (threadIdx.x < 2 || (threadIdx.x >= 64 && threadIdx.x < 66))) {
++        const int sl = slice, gr = group;
++        if (threadIdx.x == 0) {
++            __nv_fp8x2_e4m3 pv;
++            *(uint16_t*)&pv = *(uint16_t*)(plan.u.k.data() + K_TMA_W + ((0 ^ 1) << 4));
++            __nv_bfloat162 s2 = __bfloat162bfloat162(*(const __nv_bfloat16*)&plan.sScales[NUM_SCALES]);
++            __nv_bfloat162 dv = cvt_fp8x2_bf16x2(pv, s2);
++            printf("CV raw=%04x -> %g,%g\n", *(uint16_t*)&pv, __bfloat162float(dv.x),
++                   __bfloat162float(dv.y));
++        }
++        if (threadIdx.x == 0)
++            printf("KV pbs=%d nblk=%d blkst=%lld rowst=%lld rpb=%lld topk=%d ti=%d,%d\n",
++                   page_block_size, params.num_blocks, (long long)k_block_stride,
++                   (long long)k_row_stride, (long long)(k_block_stride / row_unit),
++                   params.topk,
++                   __ldg(gIndices + block_idx*TOPK_BLOCK_SIZE),
++                   __ldg(gIndices + block_idx*TOPK_BLOCK_SIZE + 1));
++        for (int c = 0; c < 2; ++c) {
++            const int ch = c * 6;   // chunks 0 and 6
++            for (int j = 0; j < 4; ++j) {
++                const int tok = gr*4 + j;
++                const uint32_t gs = *(const uint32_t*)(k_ptr + (int64_t)rows[j]*k_row_stride
++                                                       + Kernel::k_slice_x(sl) + ch*16);
++                const uint32_t ss = *(const uint32_t*)(plan.u.k.data() + sl*K_SLICE_BYTES
++                                                       + tok*K_TMA_W + ((ch ^ (tok & 7)) << 4));
++                printf("KD sl=%d row=%d tok=%d ch=%d g=%08x s=%08x sc=%f\n", sl, rows[j], tok,
++                       ch, gs, ss, (float)scales[0]);
++            }
++        }
++    }
++#endif
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -350,6 +448,12 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
+         sched_meta.is_last_req_splitted = false;
+     }
+ 
++    // Page-gather barrier: NUM_K_SLICES*16 issuers arrive, each for its own
++    // 4*K_TMA_W bytes. Parity flips once per page.
++    if (threadIdx.x == 0) mbar_init(&plan.mbar_load, NUM_K_SLICES*TOPK_BLOCK_SIZE/4);
++    uint32_t load_phase = 0;
++    __syncthreads();
++
+     auto get_cur_req_info = [&](int batch_idx) -> MainloopArgs {
+         MainloopArgs args;
+         int total_topk_padded;
+@@ -396,13 +500,15 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
+     // make_tiled_copy_B requires; retile_D reinterprets the fragment.
+     auto ldsm_PV = make_tiled_copy_B(Copy_Atom<SM75_U16x4_LDSM_T, bf16>{}, tiled_mma_PV);
+     auto thr_ldsm_PV = ldsm_PV.get_slice(idx_in_warpgroup);
+-    // element (d,t) lives at t*K_ROW_PAD + d bytes in the raw plane; the scale of
+-    // a whole 64-dim segment is one value per token (V4's last segment is rope,
+-    // in bf16, and takes the ldmatrix path instead).
+-    static constexpr auto kTransposedView8 =
+-        Layout<Shape<Int<D_QK_SEG>, Int<TOPK_BLOCK_SIZE>>, Stride<_1, Int<K_ROW_PAD>>>{};
+-    static constexpr auto kTransposedViewBf16 =
+-        Layout<Shape<Int<D_QK_SEG>, Int<TOPK_BLOCK_SIZE>>, Stride<_1, Int<K_ROW_PAD_BF16>>>{};
++    // element (d,t) lives at t*K_TMA_W + d bytes inside the segment's slice; the
++    // scale of a whole 64-dim segment is one value per token (V4's last segment
++    // is rope, in bf16, and takes the ldmatrix path instead).
++    static constexpr auto kTransposedView128 = composition(
++        kSwizzle,
++        Layout<Shape<Int<K_TMA_W>, Int<TOPK_BLOCK_SIZE>>, Stride<_1, Int<K_TMA_W>>>{});
++    static constexpr auto kTransposedViewBf16 = composition(
++        kSwizzleBf16,   // the view's element is bf16, the plane's swizzle is bytes
++        Layout<Shape<Int<D_QK_SEG>, Int<TOPK_BLOCK_SIZE>>, Stride<_1, Int<K_TMA_W/2>>>{});
+     static constexpr auto kScaleTransposedView =
+         Layout<Shape<Int<D_QK_SEG>, Int<TOPK_BLOCK_SIZE>>, Stride<_0, Int<NUM_SCALES>>>{};
+ 
+@@ -420,15 +526,23 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
+     // One PV segment: V is the fp8 nope plane, dequantized at the fragment load;
+     // V4's last segment is the rope plane and keeps the ldmatrix.trans read.
+     auto pv_seg = [&](auto const &rSv, int abs_seg, int local_seg) {
++        // Two segments share a 128 B slice; the swizzle's XOR is on the absolute
++        // chunk, so both the layout and the hand reads hang off the slice base
++        // and carry the half in the chunk index.
++        uint8_t* slice_base = sKbytes + (abs_seg/2)*K_SLICE_BYTES;
++        const int half = abs_seg % 2;
+         if (abs_seg*D_QK_SEG + D_QK_SEG <= HEAD_DIM_NOPE) {
+-            Tensor sB = make_tensor(sKbytes + abs_seg*D_QK_SEG, kTransposedView8);
++            Tensor sB = local_tile(
++                make_tensor(make_smem_ptr((fp8*)slice_base), kTransposedView128),
++                Shape<Int<D_QK_SEG>, Int<TOPK_BLOCK_SIZE>>{},
++                make_coord(half, _0{}));
+             Tensor rVb = thr_mma_PV.partition_fragment_B(sB);
+-            pv_dequant_ldsm<decltype(rVb), TOPK_BLOCK_SIZE, D_QK_SEG, K_ROW_PAD, NUM_SCALES>(
+-                rVb, sKbytes + abs_seg*D_QK_SEG,
+-                plan.sScales + abs_seg*D_QK_SEG/QUANT_TILE_SIZE, idx_in_warpgroup % 32);
++            pv_dequant_ldsm<decltype(rVb), TOPK_BLOCK_SIZE, D_QK_SEG, K_TMA_W, NUM_SCALES>(
++                rVb, slice_base,
++                plan.sScales + abs_seg*D_QK_SEG/QUANT_TILE_SIZE, idx_in_warpgroup % 32, half);
+             cute::gemm(tiled_mma_PV, rSv, rVb, rO[local_seg]);
+         } else {
+-            Tensor sB = make_tensor((bf16*)(sKbytes + HEAD_DIM_NOPE), kTransposedViewBf16);
++            Tensor sB = make_tensor(make_smem_ptr((bf16*)(sKbytes + K_ROPE_SLICE*K_SLICE_BYTES)), kTransposedViewBf16);
+             Tensor rVb = thr_mma_PV.partition_fragment_B(sB);
+             cute::copy(ldsm_PV, thr_ldsm_PV.partition_S(sB), thr_ldsm_PV.retile_D(rVb));
+             cute::gemm(tiled_mma_PV, rSv, rVb, rO[local_seg]);
+@@ -503,12 +617,12 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
+         for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; ++block_idx) {
+             // -------- phase 1: dequant K (all 256 threads) --------
+             if constexpr (MODEL_TYPE == ModelType::V32) {
+-                dequant_k_block<MODEL_TYPE, NUM_HEADS>(params, plan, batch_idx, s_q_idx, block_idx, args, false, false);
++                dequant_k_block<MODEL_TYPE, NUM_HEADS>(params, tma_params, plan, batch_idx, s_q_idx, block_idx, args, false, false, load_phase);
+             } else {
+                 if (block_idx < min(args.num_orig_kv_blocks, args.end_block_idx))
+-                    dequant_k_block<MODEL_TYPE, NUM_HEADS>(params, plan, batch_idx, s_q_idx, block_idx, args, false, false);
++                    dequant_k_block<MODEL_TYPE, NUM_HEADS>(params, tma_params, plan, batch_idx, s_q_idx, block_idx, args, false, false, load_phase);
+                 else
+-                    dequant_k_block<MODEL_TYPE, NUM_HEADS>(params, plan, batch_idx, s_q_idx, block_idx, args, true, true);
++                    dequant_k_block<MODEL_TYPE, NUM_HEADS>(params, tma_params, plan, batch_idx, s_q_idx, block_idx, args, true, true, load_phase);
+             }
+             __syncthreads();
+ #if FLASH_MLA_SM120_PHASE_TIME
+@@ -555,7 +669,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
+                 int pending_tile = -1;
+                 CUTE_NO_UNROLL
+                 for (int k = k_begin; k < k_end; k += 32) {
+-                    uint8_t* p = sKbytes + k_dim_byte(k);
++                    uint8_t* slice = sKbytes + (k/K_TMA_W)*K_SLICE_BYTES;
+                     if (k + 32 <= HEAD_DIM_NOPE) {
+                         if ((int)(k/QUANT_TILE_SIZE) != pending_tile) {
+                             if (pending_tile >= 0) apply_k_tile_scale(pending_tile);
+@@ -572,14 +686,22 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
+                         *(uint32_t*)&rQa(4)  = *(const uint32_t*)(qa + 8*Q_ROW_PAD);
+                         *(uint32_t*)&rQa(8)  = *(const uint32_t*)(qa + 16);
+                         *(uint32_t*)&rQa(12) = *(const uint32_t*)(qa + 8*Q_ROW_PAD + 16);
++                        // layout-only (the fragment is filled by hand below), so
++                        // it needs no swizzle
+                         Tensor sB = make_tensor(
+-                            (fp8*)p, Layout<Shape<Int<TOPK_BLOCK_SIZE>, _32>, Stride<Int<K_ROW_PAD>, _1>>{});
++                            (fp8*)slice, Layout<Shape<Int<TOPK_BLOCK_SIZE>, _32>, Stride<Int<K_TMA_W>, _1>>{});
+                         Tensor rKb = thr_mma_QK8.partition_fragment_B(sB);
+-                        const uint8_t* kb = p + (uint64_t)(qk_lane/4)*K_ROW_PAD + qk_k0;
++                        // the fragment's row is the token; each lane reads the 4 B
++                        // at its k0 and at k0+16. Two chunks, so two XOR'd
++                        // pointers - the +16 is not a physical +16.
++                        const int tok0 = qk_lane/4;
++                        const int c0 = (k%K_TMA_W) + qk_k0;
++                        const uint8_t* kb0 = k_row_ptr(slice, tok0, c0);
++                        const uint8_t* kb1 = k_row_ptr(slice, tok0, c0 + 16);
+                         CUTE_UNROLL
+                         for (int a = 0; a < TOPK_BLOCK_SIZE/8; ++a) {
+-                            *(uint32_t*)&rKb(8*a)     = *(const uint32_t*)(kb + 8*a*K_ROW_PAD);
+-                            *(uint32_t*)&rKb(8*a + 4) = *(const uint32_t*)(kb + 8*a*K_ROW_PAD + 16);
++                            *(uint32_t*)&rKb(8*a)     = *(const uint32_t*)(kb0 + 8*a*K_TMA_W);
++                            *(uint32_t*)&rKb(8*a + 4) = *(const uint32_t*)(kb1 + 8*a*K_TMA_W);
+                         }
+                         cute::gemm(tiled_mma_QK8, rQa, rKb, rP);
+                     } else {
+@@ -591,9 +713,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
+                             Tensor gQk = local_tile(gQ, Shape<Int<BLOCK_M>, _16>{}, make_coord(_0{}, kk/16));
+                             Tensor rQa = thr_mma_QK.partition_fragment_A(gQk);
+                             cute::copy(thr_mma_QK.partition_A(gQk), rQa);
+-                            Tensor sB = make_tensor(
+-                                (bf16*)(sKbytes + k_dim_byte(kk)),
+-                                Layout<Shape<Int<TOPK_BLOCK_SIZE>, _16>, Stride<Int<K_ROW_PAD_BF16>, _1>>{});
++                            Tensor sB = local_tile(
++                                make_tensor(make_smem_ptr((bf16*)(sKbytes + K_ROPE_SLICE*K_SLICE_BYTES)), kslice::Bf16{}),
++                                Shape<Int<TOPK_BLOCK_SIZE>, _16>{},
++                                make_coord(_0{}, (kk - HEAD_DIM_NOPE)/16));
+                             Tensor rKb = thr_mma_QK.partition_fragment_B(sB);
+                             cute::copy(thr_mma_QK.partition_B(sB), rKb);
+                             cute::gemm(tiled_mma_QK, rQa, rKb, rP);
+@@ -602,6 +725,16 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
+                 }
+                 if (pending_tile >= 0) apply_k_tile_scale(pending_tile);
+             }
++#if FLASH_MLA_SM120_DBG_K
++            if (blockIdx.x == 0 && batch_idx == 0 && block_idx == args.start_block_idx &&
++                (threadIdx.x == 0 || threadIdx.x == 128)) {
++                int nnan = 0;
++                for (int i = 0; i < (int)size(rP); ++i) nnan += isnan((float)rP(i)) ? 1 : 0;
++                printf("RP wg=%d nan=%d/%d first=%g,%g,%g sc0=%g,sc1=%g\n", warpgroup_idx, nnan,
++                       (int)size(rP), (float)rP(0), (float)rP(1), (float)rP(2),
++                       (float)plan.sScales[0], (float)plan.sScales[NUM_SCALES]);
++            }
++#endif
+             __syncthreads();
+             // rP registers carry the C-fragment (row, col) map of save_rS_to_sS
+             const int prow_base = 16*(idx_in_warpgroup/32) + (idx_in_warpgroup%32)/4;
+@@ -883,7 +1016,48 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &pa
+         KU_ASSERT(res == CUresult::CUDA_SUCCESS);
+     }
+ 
+-    TMAParams tma_params{tensor_map_O};
++    // Page-gather descriptors: 2D, x = one 128 B slice of a cache row, y = the
++    // token rows of the whole cache at the data row step (h_kv == 1, asserted
++    // above). One map per cache, because extra_kv is a separate tensor with its
++    // own row stride. y counts every row of every page block - a block is not
++    // necessarily page_block_size rows, so its rows are block_stride/row_step
++    // and the block step is taken on the device. Rows past the extent are
++    // zero-filled (unused - invalid tokens are zeroed explicitly).
++    // V4's per-token scales sit behind the data and are read scalar-wise, so a
++    // V4 map row is the 576 data bytes and no box can reach the scale tail.
++    constexpr int64_t ROW_STEP = MODEL_TYPE == ModelType::V4 ? K_ROW_BYTES : 0;
++    auto encode_k_map = [](CUtensorMap* map, void* base, int64_t blocks, int64_t block_bytes,
++                           int64_t row_bytes) {
++        KU_ASSERT(block_bytes % row_bytes == 0, "block stride must be whole rows");
++        uint64_t size[2] = {(uint64_t)row_bytes, (uint64_t)(blocks * (block_bytes / row_bytes))};
++        uint64_t stride[1] = {(uint64_t)row_bytes};
++        uint32_t box_size[2] = {K_TMA_W, 1};
++        uint32_t elem_stride[2] = {1, 1};
++        CUresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
++            map,
++            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
++            2,
++            base,
++            size,
++            stride,
++            box_size,
++            elem_stride,
++            CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
++            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
++            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
++            CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
++        );
++        KU_ASSERT(res == CUresult::CUDA_SUCCESS);
++    };
++    CUtensorMap tensor_map_K, tensor_map_K_extra;
++    encode_k_map(&tensor_map_K, params.kv, params.num_blocks, params.stride_kv_block,
++                 ROW_STEP != 0 ? ROW_STEP : params.stride_kv_row);
++    if (params.extra_kv != nullptr)
++        encode_k_map(&tensor_map_K_extra, params.extra_kv, params.extra_num_blocks,
++                     params.stride_extra_kv_block,
++                     ROW_STEP != 0 ? ROW_STEP : params.stride_extra_kv_row);
++
++    TMAParams tma_params{tensor_map_O, tensor_map_K, tensor_map_K_extra};
+ 
+     auto kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE, NUM_HEADS>, TMAParams>;
+ 
