@@ -46,3 +46,19 @@ Consequences for the implementation, to carry into the design step:
   fine at offsets 0, 128, ... .
 - The proxy fence matched on all 6000 iterations here; that is one schedule on
   one driver, so keep it in the code and keep the 6000-run gate.
+
+Row 18 (PV on the fp8 atom, S re-quantized per 128-dim tile) closed negative
+at 0.995x / 0.984x, four pairs of five lost in each order, and it re-prices a
+phase reading rather than adding a producer: PV's inner loop halves its
+instructions, spills disappear (187 registers, `LOCAL:0`, from 255 with a
+spill) and PV's cycles do not move - 15.8-16.9k/page against base's
+15.8-16.2k, with the softmax's 4x S stores and a 16 KB/page smem round-trip
+for the A operand as the visible new costs. The loop is `LDS`/`LDSM`- and
+mma-bound, not issue-bound. The exact fp8 B-fragment lane map it produced
+(`v0 + 4*v1 + 8*(dwin/8 + q%2) + 64*(twin/32)`, k extent = the 64-token block)
+is reusable for any later PV work.
+
+The patch is `row18_pv_fp8.patch`, the accuracy probe (real cache bytes, real
+S, unnormalized kernel-shaped values with a fixed power-of-two P scale) is
+`row18_p_quant_probe.py`. It measures abs 1.4e-3 / cos 5e-7 against the fp8
+gates of 3e-2 / 1e-2, so accuracy was never the blocker here.
