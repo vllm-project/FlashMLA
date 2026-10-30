@@ -1,0 +1,13 @@
+diff --git a/setup.py b/setup.py
+--- a/setup.py
++++ b/setup.py
+@@ -173,4 +173,9 @@
+                 "--ptxas-options=-v,--register-usage-level=10,--warn-on-spills,--warn-on-local-memory-usage,--warn-on-double-precision-use",
+                 "-lineinfo",
+                 "--source-in-ptx",
++                # [THROWAWAY - SM120 probe] Pre-define CUTLASS SM100 family so the
++                # tcgen05 / TMA / TMEM code paths engage when compiling -arch=compute_120a.
++                "-DCUTLASS_ARCH_MMA_SM100_ENABLED",
++                "-DCUTLASS_ARCH_MMA_SM100A_ENABLED",
++                "-DCUTLASS_ARCH_MMA_SM100F_ENABLED",
+             ] + get_features_args() + get_arch_flags() + get_nvcc_thread_args(),

@@ -160,25 +160,33 @@ def test_flash_attention(b, mean_sq, mean_sk, varlen, h, h_k, d, dv, causal, win
 
 
 if __name__ == "__main__":
-    dtype = torch.bfloat16
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", type=str, default="cuda:0", help="CUDA device to run on")
+    parser.add_argument("--dtype", type=str, choices=["bf16", "fp16"], default="bf16")
+    args = parser.parse_args()
+
+    dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
     torch.set_default_dtype(dtype)
-    device = torch.device("cuda:0")
+    device = torch.device(args.device)
     torch.set_default_device(device)
     torch.cuda.set_device(device)
     torch.set_float32_matmul_precision("high")
 
     b = 2
     window = 0
-    has_bwd = False
+    # sm_120a has forward dense prefill but no FMHA backward yet.
+    cc_major = torch.cuda.get_device_capability(torch.cuda.current_device())[0]
+    has_bwd = cc_major != 12
 
     for (mean_sq, mean_sk) in [(4096, 4096), (8192, 8192)]:
         for varlen in [False, True]:
             for (h, h_k) in [(128, 128), (32, 4)]:
                 if h != h_k:
-                    has_bwd = False
+                    cur_has_bwd = False
                 else:
-                    has_bwd = True
+                    cur_has_bwd = has_bwd
                 for (d, dv) in [(128, 128), (192, 128)]:
                     for causal in [False, True]:
                         skip_correctness_check = mean_sq == 8192 and mean_sk == 8192 and h == 128
-                        test_flash_attention(b, mean_sq, mean_sk, varlen, h, h_k, d, dv, causal, window, has_bwd, not skip_correctness_check)
+                        test_flash_attention(b, mean_sq, mean_sk, varlen, h, h_k, d, dv, causal, window, cur_has_bwd, not skip_correctness_check)

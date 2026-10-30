@@ -10,6 +10,8 @@
 #include "cuda_kernels/legacy/sm100/prefill/sparse/fwd/head128/phase1.h"
 #include "cuda_kernels/legacy/sm100/prefill/sparse/fwd/head64/phase1.h"
 
+#include "cuda_kernels/sm120/prefill/sparse/fwd.h"
+
 enum class FwdFeatures : int {
     SMALL_HEADS,
     HEAD_64,
@@ -44,6 +46,29 @@ protected:
             DISPATCH_BOOLEAN_FLAG(params.topk_length != nullptr, HAVE_TOPK_LENGTH, [&]() {
                 legacy::sm90::prefill::sparse_fwd::run_fwd_phase1_kernel<HEAD_DIM_QK, HAVE_TOPK_LENGTH>(params);
             });
+        });
+    }
+};
+
+// =============================================================================
+// SM120 (sm_120a): register-file mma.sync kernels, self-contained under
+// cuda_kernels/sm120/. They serve both d_qk = 512 and d_qk = 576.
+// =============================================================================
+
+class Fwd_Sm120_Impl : public FwdImplBase {
+    DECLARE_SUPPORTED_FEATURES(
+        FwdFeatures::HEAD_64,
+        FwdFeatures::HEAD_128,
+        FwdFeatures::HEAD_DIM_512,
+        FwdFeatures::HEAD_DIM_576,
+        FwdFeatures::ATTN_SINK,
+        FwdFeatures::TOPK_LENGTH
+    )
+
+protected:
+    void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
+        DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
+            sm120::prefill::sparse::run_sparse_fwd_kernel<HEAD_DIM_QK>(params);
         });
     }
 };
@@ -145,7 +170,8 @@ std::vector<Tensor> sparse_attn_prefill_interface(
     Arch arch = Arch();
     bool is_sm90a = arch.is_sm90a();
     bool is_sm100f = arch.is_sm100f();
-    STD_TORCH_CHECK(is_sm90a || is_sm100f, "Sparse Attention Forward Kernel is only supported on SM90a and SM100f architectures.");
+    bool is_sm120 = arch.is_sm120();
+    STD_TORCH_CHECK(is_sm90a || is_sm100f || is_sm120, "Sparse Attention Forward Kernel is only supported on SM90a, SM100f and SM120 architectures.");
 
     KU_CHECK_NDIM(q, 3);
     KU_CHECK_NDIM(kv, 3);
@@ -163,7 +189,7 @@ std::vector<Tensor> sparse_attn_prefill_interface(
     const bool small_heads = is_sm90a && is_sm90_small_heads_h_q(h_q);
     STD_TORCH_CHECK(small_heads || h_q == 64 || h_q == 128,
                     "Unsupported h_q: ", h_q,
-                    ". SM90a supports 8, 16, 32, 64 and 128 heads; SM100f supports 64 and 128.");
+                    ". SM90a supports 8, 16, 32, 64 and 128 heads; SM100f and SM120 support 64 and 128.");
     STD_TORCH_CHECK(h_kv == 1, "Sparse prefill requires h_kv == 1, got ", h_kv);
 
     STD_TORCH_CHECK(d_qk == 576 || d_qk == 512, "Invalid d_qk: ", d_qk);
@@ -269,6 +295,9 @@ std::vector<Tensor> sparse_attn_prefill_interface(
 
     if (is_sm90a) {
         Fwd_Sm90_Impl fwd_impl;
+        fwd_impl.run(params, required_features);
+    } else if (is_sm120) {
+        Fwd_Sm120_Impl fwd_impl;
         fwd_impl.run(params, required_features);
     } else if (is_sm100f) {
         if (h_q == 64) {

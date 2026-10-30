@@ -1,0 +1,259 @@
+diff --git a/csrc/cuda_kernels/sm120/decode/sparse/config.h b/csrc/cuda_kernels/sm120/decode/sparse/config.h
+index 7b44e92..11573ae 100644
+--- a/csrc/cuda_kernels/sm120/decode/sparse/config.h
++++ b/csrc/cuda_kernels/sm120/decode/sparse/config.h
+@@ -41,6 +41,11 @@ static constexpr int HEAD_DIM_NOPE = HEAD_DIM_K - HEAD_DIM_ROPE;
+ 
+ static constexpr int QUANT_TILE_SIZE = MODEL_TYPE == ModelType::V32 ? 128 : 64;
+ static constexpr int NUM_SCALES = MODEL_TYPE == ModelType::V32 ? 4 : 8;  // For DeepSeek-V4: 7 fp8_e4m3 + 1 padding
++// Row 18: S for PV's A operand is stored as e4m3, one copy per 128-dim tile (a
++// tile's scale is one value per token, so a tile needs its own), and P_QSCALE
++// keeps S|sV off e4m3's 2^-9 floor; the epilogue divides it back out.
++static constexpr int NUM_V_TILES = HEAD_DIM_V / QUANT_TILE_SIZE;
++static constexpr float P_QSCALE = 32.0f;
+ 
+ // QK runs in HEAD_DIM_K/64 segments of 64 dims (9 for V32 / 8 for V4):
+ // 64x64 gemm = 32 A + 32 B + 32 C regs/thread, no register spill.
+@@ -113,8 +118,18 @@ struct SharedMemoryPlan {
+     // WG1's QK partial, published for WG0 to add before the softmax. fp16: the
+     // Q plane costs 33 KB, so the fp32 form (16 KB) no longer fits the 99 KB cap;
+     // fp16 lands at 91 KB and keeps the 1.2e-4 rel gate, where bf16's 2e-4 does not.
+-    __half sP[BLOCK_M * TOPK_BLOCK_SIZE];
+-    CUTE_ALIGNAS(1024) array_aligned<bf16, cosize_v<SmemLayoutS>> s;
++    union {
++        // WG1's QK partial: live from the gemm until WG0 has added it, i.e. the
++        // first half of the softmax's inputs.
++        __half sP[BLOCK_M * TOPK_BLOCK_SIZE];
++        // S for PV's A operand, written after the softmax and read in PV, so it
++        // shares the storage. V32 (row 18) keeps it as e4m3, NUM_V_TILES copies
++        // so every 128-dim tile carries its own V scale folded in; V4 keeps the
++        // bf16 sS below and the copy is 1 byte.
++        array_aligned<uint8_t,
++            (MODEL_TYPE == ModelType::V32 ? NUM_V_TILES*BLOCK_M*TOPK_BLOCK_SIZE : 1)> s8;
++    } sp;
++    array_aligned<bf16, (MODEL_TYPE == ModelType::V4 ? cosize_v<SmemLayoutS> : 1)> s;
+     bool is_kv_valid[TOPK_BLOCK_SIZE];
+ 
+     float sM[BLOCK_M], sL[BLOCK_M], sScale[BLOCK_M], sOScale[BLOCK_M];
+@@ -147,6 +162,42 @@ using TMMA_SM120_FP8 = decltype(make_tiled_mma(
+ using TiledMMA_QK8 = TMMA_SM120_FP8;
+ using TiledMMA_PV_LocalP = TMMA_SM120;   // WG0: rS stays in registers (gemm_rs)
+ using TiledMMA_PV_RemoteP = TMMA_SM120;  // WG1: rS re-read from sS (gemm_ss)
++// Row 18: PV on the same fp8 atom, V32 only. V32's V is entirely nope dims, so
++// the whole PV gemm can run e4m3 x e4m3 with V's per-token scale folded into the
++// quantized S; V4's last V segment is the bf16 rope plane and keeps the bf16
++// atom, so V4 stays on the old path.
++using TiledMMA_PV8 = TMMA_SM120_FP8;
++
++// Row 18: rS -> sS8, same scatter map as save_rS_to_sS, but each of the
++// NUM_V_TILES copies carries its own 128-dim tile's V scale and the constant
++// P_QSCALE; the pair of tokens a register pair covers is packed into one 16-bit
++// store. The epilogue divides P_QSCALE back out.
++template<typename Tensor0>
++static __forceinline__ __device__ void save_rS_to_sS8(
++    Tensor0 const &rS,
++    uint8_t* sS8,
++    const bf16* scales,
++    int idx_in_warpgroup
++) {
++    const int base = 16*(idx_in_warpgroup/32) + (idx_in_warpgroup%32)/4;
++    constexpr int TILE = BLOCK_M * TOPK_BLOCK_SIZE;
++    CUTE_UNROLL
++    for (int nb = 0; nb < 8; ++nb) {
++        CUTE_UNROLL
++        for (int lut = 0; lut < 2; ++lut) {
++            const int row = base + 8*lut;
++            const int token = 8*nb + 2*(idx_in_warpgroup%4);
++            const int g = 4*nb + 2*lut;
++            CUTE_UNROLL
++            for (int t = 0; t < NUM_V_TILES; ++t) {
++                const __nv_fp8x2_e4m3 q = __nv_fp8x2_e4m3(make_float2(
++                    (float)rS(g)     * (float)scales[token*NUM_SCALES + t] * P_QSCALE,
++                    (float)rS(g + 1) * (float)scales[(token + 1)*NUM_SCALES + t] * P_QSCALE));
++                *(uint16_t*)(sS8 + t*TILE + row*TOPK_BLOCK_SIZE + token) = *(uint16_t*)&q;
++            }
++        }
++    }
++}
+ 
+ // Same reg->(row,col) map as the old GMMA layout (homomorphic, verified on sm_120a).
+ static __forceinline__ __device__ int get_AorC_row_idx(int local_row_idx, int idx_in_warpgroup) {
+diff --git a/csrc/cuda_kernels/sm120/decode/sparse/splitkv_mla.cuh b/csrc/cuda_kernels/sm120/decode/sparse/splitkv_mla.cuh
+index a7d7a22..0047344 100644
+--- a/csrc/cuda_kernels/sm120/decode/sparse/splitkv_mla.cuh
++++ b/csrc/cuda_kernels/sm120/decode/sparse/splitkv_mla.cuh
+@@ -388,6 +388,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
+     auto thr_mma_QK8 = tiled_mma_QK8.get_slice(idx_in_warpgroup);
+     TiledMMA_PV_LocalP tiled_mma_PV{};
+     auto thr_mma_PV = tiled_mma_PV.get_slice(idx_in_warpgroup);
++    TiledMMA_PV8 tiled_mma_PV8{};                       // V32 only (row 18)
++    auto thr_mma_PV8 = tiled_mma_PV8.get_slice(idx_in_warpgroup);
+ 
+     // PV's B operand is V read DIM-major (K axis = token, stride 1). ldmatrix.trans
+     // reads the stored (token, dim) plane through a transposed view and returns
+@@ -435,6 +437,60 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
+         }
+     };
+ 
++    // Row 18, V32 only: the same segment on the fp8 atom. A comes from one of the
++    // NUM_V_TILES sS8 copies (V's per-token tile scale folded in, P_QSCALE
++    // applied), so V is consumed raw: the mma converts nothing, keeps half the
++    // instructions of the bf16 path, and neither operand goes through a shfl.
++    auto load_rA8 = [&](auto &rAv, int tile) {
++        Tensor sA = make_tensor((fp8*)(plan.sp.s8.data() + (size_t)tile*BLOCK_M*TOPK_BLOCK_SIZE),
++                                Layout<Shape<Int<BLOCK_M>, Int<TOPK_BLOCK_SIZE>>,
++                                       Stride<Int<TOPK_BLOCK_SIZE>, _1>>{});
++        cute::copy(thr_mma_PV8.partition_A(sA), rAv);
++    };
++    auto pv_seg8 = [&](auto const &rAv, int abs_seg, int local_seg) {
++        // V is stored (token, dim) while the atom's B is (dim, token): the k quad
++        // is four tokens at one dim, which is exactly what `ldmatrix.trans.b8`
++        // hands a lane (rows 4*(l&3)+{0..3}), so one x2 gives four registers with
++        // no exchange and no conversion. Four byte loads per quad (the cute::copy
++        // form) cost 4-way bank conflicts; this is half the instructions of the
++        // bf16 path. Register map (element index): k atom (k/32) at 64, dim block
++        // (n/8) at 8, then the two properties of a raw word - its k half (k/16) at
++        // 4 and its column half (n/8 within the window) at 8 - from the eight raw
++        // words `ldm_b8x2` filled.
++        Tensor sB = make_tensor((fp8*)(sKbytes + abs_seg*D_QK_SEG),
++                                Layout<Shape<Int<D_QK_SEG>, Int<TOPK_BLOCK_SIZE>>,
++                                       Stride<_1, Int<K_ROW_PAD>>>{});
++        Tensor rVb = thr_mma_PV8.partition_fragment_B(sB);
++        const uint8_t* seg = sKbytes + abs_seg*D_QK_SEG;
++        const int lane = idx_in_warpgroup % 32;
++        CUTE_UNROLL
++        for (int twin = 0; twin < TOPK_BLOCK_SIZE; twin += 32)
++            CUTE_UNROLL
++            for (int dwin = 0; dwin < D_QK_SEG; dwin += 16) {
++                uint32_t raw[4];
++                ldm_b8x2((const uint32_t*)(seg + (uint64_t)(twin + lane)*K_ROW_PAD + dwin), raw);
++                CUTE_UNROLL
++                for (int q = 0; q < 4; ++q)
++                    *(uint32_t*)&rVb(64*(twin/32) + 8*(dwin/8) + 8*(q & 1) + 4*(q >> 1)) = raw[q];
++            }
++#if FLASH_MLA_SM120_DBG_K
++        // Diagnostic: print, for lane 0, the (token, dim) source of every
++        // fragment index in cute's own reference partition.
++        if (blockIdx.x == 0 && blockIdx.y == 0 && abs_seg == 0 && idx_in_warpgroup == 0) {
++            Tensor pB = thr_mma_PV8.partition_B(sB);
++            printf("B8 size=%d psize=%d\n", (int)size(rVb), (int)size(pB));
++            for (int i = 0; i < (int)size(pB); ++i) {
++                long off = (const uint8_t*)&pB(i) - seg;
++                printf("B8 i=%3d token=%2ld dim=%3ld\n", i, off / K_ROW_PAD, off % K_ROW_PAD);
++            }
++        }
++#endif
++        cute::gemm(tiled_mma_PV8, rAv, rVb, rO[local_seg]);
++    };
++    using RA8 = decltype(thr_mma_PV8.partition_fragment_A(
++        make_tensor((fp8*)nullptr, Layout<Shape<Int<BLOCK_M>, Int<TOPK_BLOCK_SIZE>>,
++                                           Stride<Int<TOPK_BLOCK_SIZE>, _1>>{})));
++
+     Tensor rP = partition_fragment_C(tiled_mma_QK, Shape<Int<BLOCK_M>, Int<TOPK_BLOCK_SIZE>>{});
+     Tensor rS = make_tensor<bf16>(partition_shape_A(tiled_mma_PV, Shape<Int<BLOCK_M>, Int<TOPK_BLOCK_SIZE>>{}));
+ 
+@@ -612,7 +668,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
+                     for (int lut = 0; lut < 2; ++lut)
+                         CUTE_UNROLL
+                         for (int cp = 0; cp < 2; ++cp)
+-                            plan.sP[(prow_base + 8*lut)*TOPK_BLOCK_SIZE + 8*nb + 2*(idx_in_warpgroup%4) + cp] =
++                            plan.sp.sP[(prow_base + 8*lut)*TOPK_BLOCK_SIZE + 8*nb + 2*(idx_in_warpgroup%4) + cp] =
+                                 (__half)rP(4*nb + 2*lut + cp);
+             }
+             __syncthreads();
+@@ -624,7 +680,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
+                         CUTE_UNROLL
+                         for (int cp = 0; cp < 2; ++cp)
+                             rP(4*nb + 2*lut + cp) +=
+-                                (float)plan.sP[(prow_base + 8*lut)*TOPK_BLOCK_SIZE + 8*nb + 2*(idx_in_warpgroup%4) + cp];
++                                (float)plan.sp.sP[(prow_base + 8*lut)*TOPK_BLOCK_SIZE + 8*nb + 2*(idx_in_warpgroup%4) + cp];
+ 
+                 // softmax on segment 0; every segment rescales its own 64 cols
+                 float scale_for_olds[2];
+@@ -632,7 +688,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
+                 for (int s = 0; s < 4; ++s)
+                     scale_softmax(rP, rS, rO[s], params.sm_scale_div_log2, sScale, rM, rL, plan.is_kv_valid, block_idx, idx_in_warpgroup, scale_for_olds, s == 0);
+ 
+-                save_rS_to_sS(rS, sS, idx_in_warpgroup);
++                if constexpr (MODEL_TYPE == ModelType::V32)
++                    save_rS_to_sS8(rS, plan.sp.s8.data(), plan.sScales, idx_in_warpgroup);
++                else
++                    save_rS_to_sS(rS, sS, idx_in_warpgroup);
+                 fence_view_async_shared();
+ #if FLASH_MLA_SM120_PHASE_TIME
+                 if (threadIdx.x == 0) {
+@@ -656,11 +715,20 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
+                 // fills rS with C-fragment indices but cute::gemm decodes the A operand
+                 // with the MMA A-fragment layout, which pairs a different (row,token)
+                 // set; both warpgroups must go through sS.
+-                Tensor rSv = thr_mma_PV.partition_fragment_A(sS);
+-                cute::copy(thr_mma_PV.partition_A(sS), rSv);
+-                CUTE_NO_UNROLL
+-                for (int seg = 0; seg < 4; ++seg)
+-                    pv_seg(rSv, seg, seg);
++                if constexpr (MODEL_TYPE == ModelType::V32) {
++                    RA8 rAv;
++                    CUTE_NO_UNROLL
++                    for (int seg = 0; seg < 4; ++seg) {
++                        if ((seg & 1) == 0) load_rA8(rAv, seg/2);
++                        pv_seg8(rAv, seg, seg);
++                    }
++                } else {
++                    Tensor rSv = thr_mma_PV.partition_fragment_A(sS);
++                    cute::copy(thr_mma_PV.partition_A(sS), rSv);
++                    CUTE_NO_UNROLL
++                    for (int seg = 0; seg < 4; ++seg)
++                        pv_seg(rSv, seg, seg);
++                }
+             } else {
+                 // scale historical O by this block's scale_for_old, then PV over V dims [256,512)
+                 float cur_scales[2];
+@@ -671,11 +739,20 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
+                     for (int g = 0; g < (int)size(rO[s]); ++g)
+                         rO[s](g) *= cur_scales[(g%4)/2];
+ 
+-                Tensor rSv = thr_mma_PV.partition_fragment_A(sS);
+-                cute::copy(thr_mma_PV.partition_A(sS), rSv);
+-                CUTE_NO_UNROLL
+-                for (int seg = 0; seg < 4; ++seg)
+-                    pv_seg(rSv, 4 + seg, seg);
++                if constexpr (MODEL_TYPE == ModelType::V32) {
++                    RA8 rAv;
++                    CUTE_NO_UNROLL
++                    for (int seg = 0; seg < 4; ++seg) {
++                        if ((seg & 1) == 0) load_rA8(rAv, 2 + seg/2);
++                        pv_seg8(rAv, 4 + seg, seg);
++                    }
++                } else {
++                    Tensor rSv = thr_mma_PV.partition_fragment_A(sS);
++                    cute::copy(thr_mma_PV.partition_A(sS), rSv);
++                    CUTE_NO_UNROLL
++                    for (int seg = 0; seg < 4; ++seg)
++                        pv_seg(rSv, 4 + seg, seg);
++                }
+             }
+             __syncthreads();
+ #if FLASH_MLA_SM120_PHASE_TIME
+@@ -708,7 +785,9 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
+                 }
+             }
+ 
+-            // final o_scales for THIS wg (and published to WG1 through sOScale)
++            // final o_scales for THIS wg (and published to WG1 through sOScale);
++            // V32's P was quantized with P_QSCALE folded in, so it divides out here.
++            constexpr float PSC = MODEL_TYPE == ModelType::V32 ? P_QSCALE : 1.0f;
+             int row0 = get_AorC_row_idx(0, idx_in_warpgroup);
+             int row1 = get_AorC_row_idx(1, idx_in_warpgroup);
+             float o_scales[2];
+@@ -718,9 +797,9 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
+                 float cur_L = (i == 0 ? rL[0] : rL[1]);
+                 float cur_M = (i == 0 ? rM[0] : rM[1]);
+                 if (args.is_no_split) {
+-                    o_scales[i] = cur_L == 0.0f ? 0.0f : __fdividef(1.0f, cur_L + exp2f(rAttn_sink[i] - cur_M));
++                    o_scales[i] = cur_L == 0.0f ? 0.0f : __fdividef(1.0f, (cur_L + exp2f(rAttn_sink[i] - cur_M)) * PSC);
+                 } else {
+-                    o_scales[i] = cur_L == 0.0f ? 0.0f : __fdividef(1.0f, cur_L);
++                    o_scales[i] = cur_L == 0.0f ? 0.0f : __fdividef(1.0f, cur_L * PSC);
+                 }
+                 if (idx_in_warpgroup%4 == 0)
+                     plan.sOScale[row] = o_scales[i];
