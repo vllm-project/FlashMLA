@@ -1026,6 +1026,14 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const DenseAttnDecodeParams param
     __syncthreads();
     bool cur_phase_Q = 0, cur_phase_K0 = 0, cur_phase_K1 = 0;
 
+    // This kernel is launched with programmaticStreamSerializationAllowed, so it may start
+    // before the previous kernel in the stream has finished (in vLLM's Kimi-K3 decode path the
+    // q-concat / KV-insert kernel, which triggers launch_dependents early). Everything above only
+    // uses kernel parameters and shared memory (smem layout, TMA descriptor prefetch, mbarrier
+    // init) and can overlap with it. Everything below reads global memory the previous kernel may
+    // write: the scheduler metadata, seqlens, block table, the query and the new token's KV row.
+    // PTX ISA 9.7.15.14: the dependent grid must use griddepcontrol.wait before such reads.
+    cudaGridDependencySynchronize();
     
     DecodingSchedMeta sched_meta = params.tile_scheduler_metadata_ptr[partition_idx];
     if (sched_meta.begin_req_idx >= params.b) return;
