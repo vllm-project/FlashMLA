@@ -1026,6 +1026,9 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const DenseAttnDecodeParams param
     __syncthreads();
     bool cur_phase_Q = 0, cur_phase_K0 = 0, cur_phase_K1 = 0;
 
+    // Launched with PDL, so this may start before the producer kernel finishes. Wait here:
+    // everything above uses only params/smem, everything below reads global memory it writes.
+    cudaGridDependencySynchronize();
     
     DecodingSchedMeta sched_meta = params.tile_scheduler_metadata_ptr[partition_idx];
     if (sched_meta.begin_req_idx >= params.b) return;
