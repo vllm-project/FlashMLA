@@ -62,3 +62,29 @@ The patch is `row18_pv_fp8.patch`, the accuracy probe (real cache bytes, real
 S, unnormalized kernel-shaped values with a fixed power-of-two P scale) is
 `row18_p_quant_probe.py`. It measures abs 1.4e-3 / cos 5e-7 against the fp8
 gates of 3e-2 / 1e-2, so accuracy was never the blocker here.
+
+Probe 18 (2026-10-30, GPU 0) - does the 2:4 sparse fp8 atom buy throughput on
+sm_120a? **No.** One `QMMA.SP.16864` and the two `QMMA.16832` it replaces take
+the same time per k64 output tile: 7.293 vs 7.297 cycles at one warp, 1.007 vs
+1.008 at eight. So the sparse atom's whole payoff is bytes and issues, not the
+pipe - and the compressible operand is **A** (PV's A is S, QK's A is Q), never
+B. The numeric arm pins the encoding: with A = B = 1.0 the sparse tile sums 32
+of the dense 64 under metadata `0x11` (nibble pair = keep elements 0 and 1 of
+each group of four). Cells: dense 5.5 / 39.5 TFLOPS, sparse the same.
+
+`row19_s24_prune_probe.py` then priced the accuracy of both A-side candidates
+against the dequantized-V reference, gates 3e-2 abs / 1e-2 cos:
+
+| arm | cos worst | abs worst |
+|---|---|---|
+| exact (no e4m3) | 1.19e-07 | 1.76e-01 |
+| dense e4m3 (row 18) | 7.75e-07 | 1.76e-01 |
+| S 2:4, keep top 2 of 4 | 7.75e-07 | 1.77e-01 |
+| S 2:4, keep fixed positions 0,1 | 1.55e-06 | 1.77e-01 |
+| Q 2:4, keep top 2 of 4 | 9.54e-07 | 8.61e-04 |
+| Q 2:4, keep fixed positions 0,1 | 2.27e-06 | 1.27e-03 |
+
+Both sides keep their group's mass exactly (the kept pair is rescaled by
+sum(group)/sum(kept)), so pruning costs at most one bit of cosine against the
+unpruned quantized arm - 4 orders of margin under the gate. Fixed-position
+selection is cheaper in the softmax and still passes.

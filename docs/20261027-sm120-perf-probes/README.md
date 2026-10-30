@@ -38,6 +38,9 @@ records those too - a failure there is a result, not a broken probe.
 | 09 | default | capture, instantiate and two replays all PASS |
 | 10 | default (plain gather4) | runtime PASS |
 | 10 | `-DCTA_GROUP` | expected ptxas FAIL (`.cta_group::1` not supported at `sm_120a`) |
+| 17 | default | runtime PASS, and multicast must beat the same fetch issued per CTA |
+| 18 | default | runtime PASS; sparse must cost the same as two dense k32 per k64 tile, numeric arm must read 64 / 32 |
+| 19 | default | runtime PASS; L2-pinned replay must be no slower than the plain one |
 
 ## Measured outcomes
 
@@ -53,4 +56,5 @@ except the two expected-negative cells.
 
 `common.h` - error checks, mbarrier/TMA/fence inline PTX, tensor-map builder.
 `probeNN_*.cu` - one probe each, numbered as in the research note §6.
+`rowNN_*_probe.py` - torch probes for a row's accuracy question (`row18_p_quant_probe.py`, `row19_s24_prune_probe.py`).
 `run_all.sh` - build/run/check driver, results in `results/<probe>.<cell>.log`.
