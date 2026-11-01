@@ -1,10 +1,14 @@
 #pragma once
 
+#include <cstdlib>
+#include <cstring>
+
 #include "config.h"
 
 #include "cuda_kernels/legacy/utils.h"
 #include "../../helpers.h"
 #include "small_heads.cuh"
+#include "etap.cuh"
 
 namespace legacy::sm90::prefill::sparse_fwd {
 
@@ -639,10 +643,22 @@ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::run(const SparseAttnFwdParams &para
     KU_CHECK_KERNEL_LAUNCH();
 }
 
+// Small heads run the transposed (ETAP) kernel. USE_MMA_FOR_SMALL_N_HEAD=1
+// selects the previous mma.sync kernel instead, which is kept for comparison;
+// the variable is read on every call so a test can switch between the two.
+inline bool use_mma_for_small_n_head() {
+    const char* value = std::getenv("USE_MMA_FOR_SMALL_N_HEAD");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
 template<int D_QK, bool HAVE_TOPK_LENGTH>
 void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
     if (is_sm90_small_heads_h_q(params.h_q)) {
-        run_small_heads<D_QK, HAVE_TOPK_LENGTH>(params);
+        if (use_mma_for_small_n_head()) {
+            run_small_heads<D_QK, HAVE_TOPK_LENGTH>(params);
+            return;
+        }
+        run_etap<D_QK, HAVE_TOPK_LENGTH>(params);
     } else {
         KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::run(params);
     }
