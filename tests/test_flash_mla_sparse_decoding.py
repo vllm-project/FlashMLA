@@ -3,6 +3,8 @@ import dataclasses
 from typing import Tuple, List, Dict, Optional
 import copy
 
+import pytest
+
 import rich.console
 import rich.table
 
@@ -224,6 +226,187 @@ class Result:
     achieved_gBps: float
 
 _counter = kk.Counter()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
+    reason="SM90 small-head decode",
+)
+@pytest.mark.parametrize("heads", [8, 16, 32])
+@pytest.mark.parametrize("dim", [512, 576])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "plain",
+        "length",
+        "extra",
+        "empty",
+        "unsplit",
+        "invariant",
+        "unaligned",
+        "unaligned_output",
+        "persistent",
+        "persistent_extra",
+        "persistent_empty",
+        "persistent_invalid",
+        "persistent_length",
+        "persistent_multiquery",
+        "persistent_unaligned",
+        "persistent_split",
+    ],
+)
+@torch.inference_mode()
+def test_small_heads_decode_preserves_sparse_attention(heads, dim, case):
+    """Native heads preserve FP8 attention, sink, empty-row and strided-output semantics."""
+    with torch.device("cuda"):
+        # generate_testcase_for_decode uses the caller's default floating dtype.
+        previous_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(torch.bfloat16)
+        try:
+            persistent = case.startswith("persistent")
+            extra = case in ("extra", "persistent_extra", "persistent_split")
+            lengths = case in ("length", "extra", "invariant", "persistent_length")
+            p = RawTestParam(
+                b=(
+                    4
+                    if case == "persistent_split"
+                    else (16 if case == "persistent_multiquery" else 128)
+                )
+                if persistent
+                else (64 if case == "unsplit" else 2),
+                h_q=heads,
+                s_q=3
+                if case == "persistent_multiquery"
+                else (1 if persistent or case == "unsplit" else 3),
+                h_kv=1,
+                s_kv=257,
+                is_varlen=True,
+                topk=127 if case == "extra" else 128,
+                d_qk=dim,
+                block_size=64 if persistent else 69,
+                have_topk_length=lengths,
+                enable_attn_sink=case != "plain",
+                is_all_indices_invalid=case
+                in ("empty", "persistent_empty", "persistent_invalid"),
+                extra_s_k=257 if extra else None,
+                extra_topk=(512 if persistent else 509) if extra else None,
+                extra_block_size=(64 if persistent else 61) if extra else None,
+                have_extra_topk_length=case == "extra",
+                seed=42,
+                num_runs=0,
+            ).to_test_param()
+            t = lib.generate_testcase_for_decode(p)
+        finally:
+            torch.set_default_dtype(previous_dtype)
+        if case == "persistent_invalid":
+            indices = t.kv_scope.indices_in_kvcache
+            indices[..., ::2] = 2**31 - 1
+            indices[..., 1::2] = -17
+        if case in ("unaligned", "persistent_unaligned"):
+            cache = t.kv_scope.get_kvcache_for_flash_mla()
+            pages = cache.shape[0]
+            raw = cache.view(torch.uint8).reshape(pages, -1)
+            backing = torch.empty((pages, raw.shape[1] + 1), dtype=torch.uint8)
+            backing[:, 1:].copy_(raw)
+            t.kv_scope.blocked_k_quantized = backing[:, 1:].view(cache.shape)
+            q_storage = torch.empty((*t.q.shape[:-1], dim + 1), dtype=torch.bfloat16)
+            t.q = q_storage[..., 1:].copy_(t.q)
+        # Match slices of vLLM's padded Q/output buffers; guards catch over-writes.
+        storage = torch.full(
+            (*t.q.shape[:2], 64, 512), float("nan"), dtype=torch.bfloat16
+        )
+        out = storage[:, :, 8 : 8 + heads]
+        if case == "unaligned_output":
+            storage = torch.full(
+                (*t.q.shape[:2], 64, 513), float("nan"), dtype=torch.bfloat16
+            )
+            out = storage[:, :, 8 : 8 + heads, 1:]
+        meta, _ = flash_mla.get_mla_metadata()
+
+        def run():
+            return flash_mla.flash_mla_with_kvcache(
+                t.q,
+                t.kv_scope.get_kvcache_for_flash_mla(),
+                None,
+                None,
+                512,
+                meta,
+                softmax_scale=t.sm_scale,
+                is_fp8_kvcache=True,
+                indices=t.kv_scope.indices_in_kvcache,
+                attn_sink=t.attn_sink,
+                topk_length=t.kv_scope.topk_length,
+                extra_k_cache=t.extra_kv_scope.get_kvcache_for_flash_mla()
+                if extra
+                else None,
+                extra_indices_in_kvcache=t.extra_kv_scope.indices_in_kvcache
+                if extra
+                else None,
+                extra_topk_length=t.extra_kv_scope.topk_length if extra else None,
+                out=out,
+                enable_batch_invariant=case in ("invariant", "unsplit"),
+            )
+
+        actual = run()
+        if persistent and heads == 32:
+            uses_persistent = (
+                (dim == 512 or not extra)
+                and not lengths
+                and case != "persistent_unaligned"
+            )
+            assert (meta.tile_scheduler_metadata is not None) == uses_persistent
+        expected = (
+            (torch.zeros_like(actual[0]), torch.full_like(actual[1], float("inf")))
+            if case == "persistent_invalid"
+            else ref.ref_sparse_attn_decode(p, t)
+        )
+        assert actual[0].data_ptr() == out.data_ptr()
+        assert kk.check_is_allclose(
+            "out",
+            actual[0],
+            expected[0],
+            abs_tol=1e-3,
+            rel_tol=2.01 / 128,
+            cos_diff_tol=5e-6,
+        )
+        torch.testing.assert_close(actual[1], expected[1], atol=1e-5, rtol=8.01 / 65536)
+        assert torch.isnan(storage[:, :, :8]).all()
+        assert torch.isnan(storage[:, :, 8 + heads :]).all()
+        if case == "unaligned_output":
+            assert torch.isnan(storage[..., 0]).all()
+        saved = tuple(value.clone() for value in actual)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = run()
+        graph.replay()
+        torch.testing.assert_close(captured[0], saved[0], atol=0, rtol=0)
+        torch.testing.assert_close(captured[1], saved[1], atol=0, rtol=0)
+        if case == "invariant":
+            single_meta, _ = flash_mla.get_mla_metadata()
+            single = flash_mla.flash_mla_with_kvcache(
+                t.q[:1],
+                t.kv_scope.get_kvcache_for_flash_mla(),
+                None,
+                None,
+                512,
+                single_meta,
+                softmax_scale=t.sm_scale,
+                is_fp8_kvcache=True,
+                indices=t.kv_scope.indices_in_kvcache[:1],
+                attn_sink=t.attn_sink,
+                topk_length=t.kv_scope.topk_length[:1],
+                enable_batch_invariant=True,
+            )
+            torch.testing.assert_close(single[0], saved[0][:1], atol=0, rtol=0)
+            torch.testing.assert_close(single[1], saved[1][:1], atol=0, rtol=0)
+        if lengths:
+            t.kv_scope.topk_length.zero_()
+            if extra:
+                t.extra_kv_scope.topk_length.zero_()
+            graph.replay()
+            assert (captured[0] == 0).all()
+            assert torch.isposinf(captured[1]).all()
+
 
 @torch.inference_mode()
 def test_flash_mla(p: TestParam) -> Result:

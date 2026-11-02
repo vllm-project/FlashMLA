@@ -59,7 +59,7 @@ enum class SparseAttnFwdMode {
 template<SparseAttnFwdMode FWD_MODE>
 inline constexpr bool is_decode_v = FWD_MODE == SparseAttnFwdMode::Decode || FWD_MODE == SparseAttnFwdMode::DecodeWithSplitKV;
 
-// Head counts handled by the SM90 small-heads prefill kernel.
+// Head counts handled by the SM90 small-heads prefill and decode kernels.
 inline constexpr bool is_sm90_small_heads_h_q(int h_q) {
     return h_q == 8 || h_q == 16 || h_q == 32;
 }
