@@ -41,6 +41,7 @@ enum class DecodeFeatures : int {
     TOPK_LENGTH,
     EXTRA_KVCACHE,
     EXTRA_TOPK_LENGTH,
+    ROW_MASK,
 
     // Results must not depend on how the batch is partitioned, which rules out split-KV.
     // The kernels that have no unsplit path do not declare it.
@@ -159,7 +160,8 @@ class Decode_Sm90_Impl : public DecodeImplBase {
         DecodeFeatures::ATTN_SINK,
         DecodeFeatures::TOPK_LENGTH,
         DecodeFeatures::EXTRA_KVCACHE,
-        DecodeFeatures::EXTRA_TOPK_LENGTH
+        DecodeFeatures::EXTRA_TOPK_LENGTH,
+        DecodeFeatures::ROW_MASK
         // No BATCH_INVARIANT: this kernel always splits the KV
     )
 
@@ -301,7 +303,8 @@ class Decode_Sm100_Head64_Nvfp4_Impl : public DecodeImplBase {
         DecodeFeatures::ATTN_SINK,
         DecodeFeatures::TOPK_LENGTH,
         DecodeFeatures::EXTRA_KVCACHE,
-        DecodeFeatures::EXTRA_TOPK_LENGTH
+        DecodeFeatures::EXTRA_TOPK_LENGTH,
+        DecodeFeatures::ROW_MASK
         // No BATCH_INVARIANT: this kernel always splits the KV
     )
 
@@ -377,7 +380,10 @@ sparse_attn_decode_interface(
     int64_t d_v,
     double sm_scale,
     const std::optional<Tensor> &out_,
-    bool enable_batch_invariant
+    bool enable_batch_invariant,
+    const std::optional<Tensor> &indices_mask,
+    const std::optional<Tensor> &extra_indices_mask,
+    int64_t rows_per_slot
 ) {
     using bf16 = cutlass::bfloat16_t;
 
@@ -500,6 +506,22 @@ sparse_attn_decode_interface(
     KU_CHECK_SHAPE(extra_indices, b, s_q, extra_topk);
     KU_CHECK_SHAPE(extra_topk_length, b);
 
+    bool have_row_mask = indices_mask.has_value() || extra_indices_mask.has_value();
+    if (have_row_mask) {
+        STD_TORCH_CHECK(rows_per_slot > 0 && h_q % rows_per_slot == 0 && h_q / rows_per_slot <= 8, "rows_per_slot must divide h_q into at most 8 slots");
+        STD_TORCH_CHECK(indices_mask.has_value() && extra_indices_mask.has_value() == have_extra_kcache, "row masks must be given for indices and, when present, extra_indices");
+        auto check_mask = [&](const Tensor &mask, const Tensor &idx) {
+            KU_CHECK_DEVICE(mask);
+            STD_TORCH_CHECK(mask.scalar_type() == ScalarType::Byte, "row masks must be uint8");
+            STD_TORCH_CHECK(mask.dim() == 3 && mask.size(0) == idx.size(0) && mask.size(1) == idx.size(1) && mask.size(2) == idx.size(2), "row mask must match its indices in shape");
+            STD_TORCH_CHECK(mask.stride(0) == idx.stride(0) && mask.stride(1) == idx.stride(1) && mask.stride(2) == 1, "row mask must share the strides of its indices");
+        };
+        check_mask(*indices_mask, indices);
+        if (have_extra_kcache) check_mask(*extra_indices_mask, *extra_indices);
+    } else {
+        STD_TORCH_CHECK(rows_per_slot == 0, "rows_per_slot requires row masks");
+    }
+
     torch::stable::accelerator::DeviceGuard device_guard(q.get_device_index());
 
     Tensor out;
@@ -539,6 +561,9 @@ sparse_attn_decode_interface(
     }
     if (have_extra_topk_length) {
         features.push_back(DecodeFeatures::EXTRA_TOPK_LENGTH);
+    }
+    if (have_row_mask) {
+        features.push_back(DecodeFeatures::ROW_MASK);
     }
     if (enable_batch_invariant) {
         features.push_back(DecodeFeatures::BATCH_INVARIANT);
@@ -628,6 +653,10 @@ sparse_attn_decode_interface(
 
         enable_split_kv,
     };
+
+    params.indices_mask = ku::get_optional_tensor_ptr<uint8_t>(indices_mask);
+    params.extra_indices_mask = ku::get_optional_tensor_ptr<uint8_t>(extra_indices_mask);
+    params.rows_per_slot = (int)rows_per_slot;
 
     Tensor o_accum, lse_accum;
     if (enable_split_kv) {

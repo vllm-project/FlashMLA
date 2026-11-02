@@ -75,6 +75,9 @@ def flash_mla_with_kvcache(
     extra_topk_length: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     enable_batch_invariant: bool = False,
+    indices_mask: Optional[torch.Tensor] = None,
+    extra_indices_mask: Optional[torch.Tensor] = None,
+    rows_per_slot: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -95,6 +98,8 @@ def flash_mla_with_kvcache(
                     where t is the k-th token of the j-th q-sequence in the i-th batch.
         attn_sink: Optional[torch.Tensor], (num_heads_q, ), torch.float32. If presented, the final output will be scaled by exp(lse) / (exp(lse) + exp(attn_sink)). Have no affect on the returned softmax_lse. +inf will cause the result to become 0.
         extra_k_cache and extra_indices_in_kvcache: If provided, will attend to these extra tokens in addition to those in k_cache and indices_in_kvcache. Their format requirements are the same as k_cache and indices_in_kvcache respectively.
+        indices_mask/extra_indices_mask: uint8, same shape and strides as indices/extra_indices_in_kvcache (SM90 only). Packs several queries into one head tile: head row r belongs to slot r // rows_per_slot, which attends key i only if bit slot of mask[..., i] is set.
+        rows_per_slot: rows of the head dimension per slot; required with the masks, at most 8 slots.
         topk_length/extra_topk_length: (batch_size, ), torch.int32. If provided, only the leftmost topk_length indices will be processed. Useful when the actual topk for different queries are different so that we can save some computation, compared to masking.
         enable_batch_invariant: bool. If True, split-KV decoding is disabled so that the result does not
                 depend on how the batch is partitioned. It must keep the same value across every reuse of
@@ -193,7 +198,8 @@ def flash_mla_with_kvcache(
             q, k_cache, indices_in_kvcache, topk_length, attn_sink,
             sched_meta.tile_scheduler_metadata, sched_meta.num_splits,
             extra_k_cache, extra_indices_in_kvcache, extra_topk_length,
-            head_dim_v, softmax_scale, out, enable_batch_invariant
+            head_dim_v, softmax_scale, out, enable_batch_invariant,
+            indices_mask, extra_indices_mask, rows_per_slot
         )
     else:
         # Dense attention
