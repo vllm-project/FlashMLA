@@ -592,6 +592,9 @@ sparse_attn_decode_interface(
     }
 
     DecodeImplMeta impl_meta = impl->get_meta(h_q, s_q);
+    if (!must_split_kv && impl_meta.num_sm_parts == 1) {
+        enable_split_kv = false;
+    }
 
     SparseAttnDecodeParams params = {
         b, s_q, h_q, h_kv, d_qk, d_v,
