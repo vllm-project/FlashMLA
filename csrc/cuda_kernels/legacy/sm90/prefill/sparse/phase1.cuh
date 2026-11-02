@@ -193,7 +193,7 @@ __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttn
             rL[1] += __shfl_xor_sync(0xffffffff, rL[1], 2);
             if (idx_in_warpgroup%4 == 0)
                 plan.sL[threadIdx.x/4] = *(float2*)(rL);
-            NamedBarrier::arrive_and_wait(256, NamedBarriers::sL_ready);
+            NamedBarrier(256, NamedBarriers::sL_ready).arrive_and_wait_unaligned();
             float2 peer_L = plan.sL[(threadIdx.x/4)^32];
             rL[0] += peer_L.x;
             rL[1] += peer_L.y;
@@ -240,7 +240,7 @@ __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttn
                     );
                 }
                 fence_view_async_shared();
-                NamedBarrier::arrive_and_wait(128, warpgroup_idx ? NamedBarriers::warpgroup1_sync : NamedBarriers::warpgroup0_sync);
+                NamedBarrier(128, warpgroup_idx ? NamedBarriers::warpgroup1_sync : NamedBarriers::warpgroup0_sync).arrive_and_wait_unaligned();
                 // S -> G
                 if (s2g_pred) {
                     int g_tile_idx = warpgroup_idx*4 + tile_idx;
@@ -321,7 +321,7 @@ __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttn
                 
                 
                 online_softmax_and_rescale_o(Warpgroup0{});
-                NamedBarrier::arrive(256, NamedBarriers::wg0_bunch_0_ready);
+                NamedBarrier(256, NamedBarriers::wg0_bunch_0_ready).arrive_unaligned();
 
                 // Issue rO0 += rS0 @ sV0l
                 gemm_rs(false, TiledMMA_PV_LocalP{}, rS, sV0l, rO, idx_in_warpgroup);
@@ -332,7 +332,7 @@ __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttn
                 plan.bar_k0_free[0].arrive();
 
                 // Wait for new sM, scale rS, save, inform WG1
-                NamedBarrier::arrive_and_wait(256, NamedBarriers::wg1_bunch_0_ready);
+                NamedBarrier(256, NamedBarriers::wg1_bunch_0_ready).arrive_and_wait_unaligned();
                 float new_rM[2], scale_factors[2];
                 *(float2*)new_rM = plan.sM[idx_in_warpgroup/4];
                 CUTE_UNROLL
@@ -343,10 +343,10 @@ __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttn
                 scale_rS(scale_factors);
                 save_rS_to_sS(rS, sS0, idx_in_warpgroup);
                 fence_view_async_shared();
-                NamedBarrier::arrive(256, NamedBarriers::wg0_s0_ready);
+                NamedBarrier(256, NamedBarriers::wg0_s0_ready).arrive_unaligned();
 
                 // Wait for sS1
-                NamedBarrier::arrive_and_wait(256, NamedBarriers::wg1_s1_ready);
+                NamedBarrier(256, NamedBarriers::wg1_s1_ready).arrive_and_wait_unaligned();
 
                 // Rescale rO0, Issue rO0 += sS1 @ sV1L
                 rescale_rO(scale_factors);
@@ -408,9 +408,9 @@ __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttn
 
 
                 // Wait for WG0 (for sM), online softmax, Notify WG0 (sM ready)
-                NamedBarrier::arrive_and_wait(256, NamedBarriers::wg0_bunch_0_ready);
+                NamedBarrier(256, NamedBarriers::wg0_bunch_0_ready).arrive_and_wait_unaligned();
                 online_softmax_and_rescale_o(Warpgroup1{});
-                NamedBarrier::arrive(256, NamedBarriers::wg1_bunch_0_ready);
+                NamedBarrier(256, NamedBarriers::wg1_bunch_0_ready).arrive_unaligned();
 
 
                 // Issue rO1 += rS1 @ sV1R
@@ -419,13 +419,13 @@ __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttn
                 
                 // Wait for WG0 (for sS0), Issue rO1 += rS0 @ sV0R
                 save_rS_to_sS(rS, sS1, idx_in_warpgroup);   // Put it here is faster
-                NamedBarrier::arrive_and_wait(256, NamedBarriers::wg0_s0_ready);
+                NamedBarrier(256, NamedBarriers::wg0_s0_ready).arrive_and_wait_unaligned();
                 gemm_ss(false, TiledMMA_PV_RemoteP{}, sS0, sV0r, rO, idx_in_warpgroup);
                 warpgroup_commit_batch();
                 
                 // Save rS1, inform WG0
                 fence_view_async_shared();
-                NamedBarrier::arrive(256, NamedBarriers::wg1_s1_ready);
+                NamedBarrier(256, NamedBarriers::wg1_s1_ready).arrive_unaligned();
 
                 // Wait for GEMM, and inform that sV1R is free
                 warpgroup_wait<1>();
@@ -452,7 +452,7 @@ __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttn
                 fence_view_async_shared();
             }
 
-            NamedBarrier::arrive_and_wait(128, NamedBarriers::warpgroup1_sync);
+            NamedBarrier(128, NamedBarriers::warpgroup1_sync).arrive_and_wait_unaligned();
             if (idx_in_warpgroup == 0) {
                 int g_offset = s_q_idx*params.h_q + q_h_idx*B_H;
                 SM90_BULK_COPY_S2G::copy(plan.final_max_logits, params.max_logits + g_offset, B_H*sizeof(float));
