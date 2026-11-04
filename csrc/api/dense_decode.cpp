@@ -5,6 +5,7 @@
 #include "params.h"
 
 #include "cuda_kernels/legacy/sm90/decode/dense/splitkv_mla.h"
+#include "cuda_kernels/sm120/decode/dense/splitkv_mla.h"
 #include "cuda_kernels/legacy/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
 #include "cuda_kernels/legacy/smxx/decode/combine/combine.h"
 
@@ -23,9 +24,14 @@ dense_attn_decode_interface(
 ) {
     // Check arch
     Arch arch = Arch();
-    if (!arch.is_sm90a()) {
-        STD_TORCH_CHECK(false, "Dense decode MLA is only supported on SM90a architecture");
+    if (!arch.is_sm90a() && !arch.is_sm120()) {
+        STD_TORCH_CHECK(false, "Dense decode MLA is only supported on SM90a / SM120a architecture");
     }
+#if defined(FLASH_MLA_DISABLE_SM90_DENSE_DECODE)
+    if (arch.is_sm90a()) {
+        STD_TORCH_CHECK(false, "This build disables SM90 dense decode (FLASH_MLA_DISABLE_SM90_DENSE_DECODE); only SM120a is supported");
+    }
+#endif
 
     // Check data types
     auto q_dtype = q.scalar_type();
@@ -181,24 +187,45 @@ dense_attn_decode_interface(
 
     params.stream = get_current_cuda_stream(q);
 
+    const bool is_sm90 = arch.is_sm90a();
     if (q_dtype == ScalarType::BFloat16) {
-        if (head_size_k == 576) {
-            legacy::sm90::decode::dense::run_flash_splitkv_mla_kernel<cutlass::bfloat16_t, 576>(params);
+        if (is_sm90) {
+#if !defined(FLASH_MLA_DISABLE_SM90_DENSE_DECODE)
+            if (head_size_k == 576) {
+                legacy::sm90::decode::dense::run_flash_splitkv_mla_kernel<cutlass::bfloat16_t, 576>(params);
+            } else {
+                legacy::sm90::decode::dense::run_flash_splitkv_mla_kernel<cutlass::bfloat16_t, 512>(params);
+            }
+#endif
         } else {
-            legacy::sm90::decode::dense::run_flash_splitkv_mla_kernel<cutlass::bfloat16_t, 512>(params);
+            if (head_size_k == 576) {
+                sm120::decode::dense::run_flash_splitkv_mla_kernel<cutlass::bfloat16_t, 576>(params);
+            } else {
+                sm120::decode::dense::run_flash_splitkv_mla_kernel<cutlass::bfloat16_t, 512>(params);
+            }
         }
     } else if (q_dtype == ScalarType::Half) {
 #ifdef FLASH_MLA_DISABLE_FP16
         STD_TORCH_CHECK(false, "FlashMLA is compiled with -DFLASH_MLA_DISABLE_FP16. Please remove this flag from your environment and re-compile FlashMLA.");
 #else
-        if (head_size_k == 576) {
-            legacy::sm90::decode::dense::run_flash_splitkv_mla_kernel<cutlass::half_t, 576>(params);
+        if (is_sm90) {
+#if !defined(FLASH_MLA_DISABLE_SM90_DENSE_DECODE)
+            if (head_size_k == 576) {
+                legacy::sm90::decode::dense::run_flash_splitkv_mla_kernel<cutlass::half_t, 576>(params);
+            } else {
+                legacy::sm90::decode::dense::run_flash_splitkv_mla_kernel<cutlass::half_t, 512>(params);
+            }
+#endif
         } else {
-            legacy::sm90::decode::dense::run_flash_splitkv_mla_kernel<cutlass::half_t, 512>(params);
+            if (head_size_k == 576) {
+                sm120::decode::dense::run_flash_splitkv_mla_kernel<cutlass::half_t, 576>(params);
+            } else {
+                sm120::decode::dense::run_flash_splitkv_mla_kernel<cutlass::half_t, 512>(params);
+            }
         }
 #endif
     } else {
-        STD_TORCH_CHECK(false, "Unsupported dtype for dense MLA on SM90");
+        STD_TORCH_CHECK(false, "Unsupported dtype for dense MLA");
     }
 
     CombineParams combine_params = {

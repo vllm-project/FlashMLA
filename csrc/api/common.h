@@ -53,6 +53,10 @@ struct Arch {
     bool is_sm100f() const {
         return major == 10;
     }
+
+    bool is_sm120() const {
+        return major == 12;
+    }
 };
 
 // Convert int64_t stride to int32_t, with overflow check.
