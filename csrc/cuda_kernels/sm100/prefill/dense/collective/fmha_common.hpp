@@ -30,6 +30,7 @@
  **************************************************************************************************/
 #pragma once
 
+#include "cuda_kernels/sm110a_reg_reconfig.h"
 #include "cutlass/kernel_hardware_info.h"
 #include "cutlass/arch/reg_reconfig.h"
 #include "cute/tensor.hpp"

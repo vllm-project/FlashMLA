@@ -11,6 +11,7 @@ Grid: [s_q, 1, 1]
 I/O: See SparseAttnFwdParams in csrc/params.h
 */
 #pragma once
+#include "cuda_kernels/sm110a_reg_reconfig.h"
 #include "phase1.h"
 
 #include <math_constants.h>

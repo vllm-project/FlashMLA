@@ -1,3 +1,4 @@
+#include "cuda_kernels/sm110a_reg_reconfig.h"
 #include "kernel.h"
 
 #include <math_constants.h>

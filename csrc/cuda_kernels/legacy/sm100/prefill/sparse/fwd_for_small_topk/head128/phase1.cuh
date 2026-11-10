@@ -16,6 +16,7 @@ NUM_THREADS=512 (4 warpgroups)
 I/O: See SparseAttnFwdParams or SparseAttnDecodeParams in kernels/params.h
 */
 #pragma once
+#include "cuda_kernels/sm110a_reg_reconfig.h"
 #include "phase1.h"
 
 #include <math_constants.h>
