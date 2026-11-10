@@ -273,6 +273,8 @@ if __name__ == '__main__':
     torch.cuda.set_device(device)
     torch.set_float32_matmul_precision('high')
 
+    # SM110a has no h_q 128 kernel for d_qk 512
+    is_sm110 = torch.cuda.get_device_capability()[0] == 11
     head_counts = [128, 64]
     if torch.cuda.get_device_capability()[0] == 9:
         head_counts += [8, 16, 32]
@@ -282,6 +284,7 @@ if __name__ == '__main__':
         TestParam(s_q, s_kv, topk, h_q=h_q, num_runs=0, d_qk=d_qk)
         for d_qk in [512, 576]
         for h_q in head_counts
+        if not (is_sm110 and h_q == 128 and d_qk == 512)
         for s_kv, topk in [
             # Regular shapes
             (128, 128),
@@ -308,6 +311,7 @@ if __name__ == '__main__':
         TestParam(s_q, s_kv, topk, h_q=h_q, num_runs=0, have_attn_sink=have_attn_sink, have_topk_length=have_topk_length, d_qk=d_qk)
         for d_qk in [512, 576]
         for h_q in head_counts
+        if not (is_sm110 and h_q == 128 and d_qk == 512)
         for s_kv, topk in [
             (592, 128),
             (1840, 256),
@@ -327,6 +331,7 @@ if __name__ == '__main__':
         TestParam(s_q, s_kv, topk, h_q=h_q, is_all_indices_invalid=True, num_runs=0, have_attn_sink=True, have_topk_length=True, d_qk=d_qk)
         for d_qk in [512, 576]
         for h_q in head_counts
+        if not (is_sm110 and h_q == 128 and d_qk == 512)
         for s_q, s_kv, topk in [
             (1, 128, 128),
             (1, 256, 256),
@@ -338,6 +343,7 @@ if __name__ == '__main__':
         TestParam(s_q, s_kv, topk, h_q=h_q, is_all_indices_invalid=False, num_runs=0, have_attn_sink=True, have_topk_length=True, d_qk=d_qk)
         for d_qk in [512, 576]
         for h_q in head_counts
+        if not (is_sm110 and h_q == 128 and d_qk == 512)
         for s_kv, topk in [
             (32, 2048),
             (64, 8192)
@@ -348,6 +354,7 @@ if __name__ == '__main__':
         TestParam(70000, 256, 256, h_q=h_q, check_correctness=False, num_runs=0, have_attn_sink=True, have_topk_length=True, d_qk=d_qk)
         for d_qk in [512, 576]
         for h_q in head_counts
+        if not (is_sm110 and h_q == 128 and d_qk == 512)
     ]
 
     performance_case_templates = [
@@ -362,6 +369,7 @@ if __name__ == '__main__':
     performance_cases = [
         TestParam(s_q, s_kv, topk, h_q=h_q, d_qk=d_qk, have_attn_sink=True)
         for (d_qk, h_q, topk, s_kv_list) in performance_case_templates
+        if not (is_sm110 and h_q == 128 and d_qk == 512)
         for s_q in [4096]
         for s_kv in s_kv_list
     ]

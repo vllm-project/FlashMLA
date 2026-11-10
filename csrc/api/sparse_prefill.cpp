@@ -145,7 +145,8 @@ std::vector<Tensor> sparse_attn_prefill_interface(
     Arch arch = Arch();
     bool is_sm90a = arch.is_sm90a();
     bool is_sm100f = arch.is_sm100f();
-    STD_TORCH_CHECK(is_sm90a || is_sm100f, "Sparse Attention Forward Kernel is only supported on SM90a and SM100f architectures.");
+    bool is_sm110a = arch.is_sm110a();
+    STD_TORCH_CHECK(is_sm90a || is_sm100f || is_sm110a, "Sparse Attention Forward Kernel is only supported on SM90a, SM100f and SM110a architectures.");
 
     KU_CHECK_NDIM(q, 3);
     KU_CHECK_NDIM(kv, 3);
@@ -300,6 +301,23 @@ std::vector<Tensor> sparse_attn_prefill_interface(
                     regular_impl.run(params, required_features);
                 }
             }
+        } else {
+            STD_TORCH_CHECK(false, "Unsupported h_q: ", h_q);
+        }
+    } else if (is_sm110a) {
+        // The h_q 128, d_qk 512 kernels have not been run on SM110a.
+        if (h_q == 64) {
+            if (d_qk == 576) {
+                Fwd_Sm100_Head64_HeadDim576_Impl fwd_impl;
+                fwd_impl.run(params, required_features);
+            } else {
+                Fwd_Sm100_Head64_Impl fwd_impl;
+                fwd_impl.run(params, required_features);
+            }
+        } else if (h_q == 128) {
+            STD_TORCH_CHECK(d_qk == 576, "Sparse prefill on SM110a with h_q == 128 supports only d_qk == 576, got ", d_qk);
+            Fwd_Sm100_Head128_HeadDim576_Impl fwd_impl;
+            fwd_impl.run(params, required_features);
         } else {
             STD_TORCH_CHECK(false, "Unsupported h_q: ", h_q);
         }

@@ -53,6 +53,12 @@ struct Arch {
     bool is_sm100f() const {
         return major == 10;
     }
+
+    // Thor. Only the SM100 sparse kernels validated on it are dispatched, see
+    // sparse_decode.cpp and sparse_prefill.cpp.
+    bool is_sm110a() const {
+        return major == 11 && minor == 0;
+    }
 };
 
 // Convert int64_t stride to int32_t, with overflow check.
