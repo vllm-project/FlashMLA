@@ -37,7 +37,8 @@ __forceinline__ __device__ void scale_softmax(
     float sScale[],
     float rM[2],
     float rL[2],
-    bool is_kv_valid[],
+    uint8_t is_kv_valid[],
+    int row_slots[2],
     int block_idx,
     int idx_in_warpgroup
 ) {
@@ -51,7 +52,7 @@ __forceinline__ __device__ void scale_softmax(
         float cur_max = -INFINITY;
         CUTE_UNROLL
         for (int i = 0; i < size(cur_rP); ++i) {
-            if (!is_kv_valid[(i&1)+(i/2)*8+(idx_in_warpgroup%4)*2])
+            if (!((is_kv_valid[(i&1)+(i/2)*8+(idx_in_warpgroup%4)*2] >> row_slots[local_row_idx]) & 1))
                 cur_rP(i) = -INFINITY;
             cur_max = max(cur_max, cur_rP(i));
         }
@@ -196,6 +197,12 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
         Tensor rP = partition_fragment_C(TiledMMA_QK{}, Shape<Int<BLOCK_M>, Int<TOPK_BLOCK_SIZE>>{});
         Tensor rS = make_tensor<bf16>(partition_shape_A(TiledMMA_PV_LocalP{}, Shape<Int<BLOCK_M>, Int<TOPK_BLOCK_SIZE>>{}));
 
+        int rows_per_slot = params.rows_per_slot > 0 ? params.rows_per_slot : BLOCK_M;
+        int row_slots[2];
+        CUTE_UNROLL
+        for (int i = 0; i < 2; ++i)
+            row_slots[i] = get_AorC_row_idx(i, idx_in_warpgroup) / rows_per_slot;
+
         float rAttn_sink[2] = {-CUDART_INF_F, -CUDART_INF_F};
         if (params.attn_sink != nullptr) {
             for (int i = 0; i < 2; ++i) {
@@ -243,7 +250,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     NamedBarrier::arrive_and_wait(256, NamedBarriers::sScale_and_sS_free);  // Make sure that sScale and sS is free
 
                 // Since in our case TOPK_BLOCK_SIZE == BLOCK_M, so we only need to do OOB checking for the last 2 blocks
-                scale_softmax(rP, rS, rO, params.sm_scale_div_log2, sScale, rM, rL, plan.is_kv_valid[buf_idx], block_idx, idx_in_warpgroup);
+                scale_softmax(rP, rS, rO, params.sm_scale_div_log2, sScale, rM, rL, plan.is_kv_valid[buf_idx], row_slots, block_idx, idx_in_warpgroup);
 
                 // Store S into shared, inform warpgroup 1
                 save_rPb_to_sP(rS, sS, idx_in_warpgroup);
@@ -635,9 +642,16 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         }
                     };
                     int2 indices = __ldg((int2*)(indices_base + lane_idx*2));
-                    *(char2*)(&plan.is_kv_valid[buf_idx][lane_idx*2]) = {
-                        is_index_valid(indices.x, 0),
-                        is_index_valid(indices.y, 1)
+                    // The row mask shares the strides of its indices tensor.
+                    const uint8_t* mask = IS_EXTRA_BLOCK ? params.extra_indices_mask : params.indices_mask;
+                    uchar2 row_bits = {0xFF, 0xFF};
+                    if (mask != nullptr) {
+                        int64_t offset = indices_base - (IS_EXTRA_BLOCK ? params.extra_indices : params.indices);
+                        row_bits = __ldg((const uchar2*)(mask + offset + lane_idx*2));
+                    }
+                    *(uchar2*)(&plan.is_kv_valid[buf_idx][lane_idx*2]) = {
+                        (uint8_t)(is_index_valid(indices.x, 0) ? row_bits.x : 0),
+                        (uint8_t)(is_index_valid(indices.y, 1) ? row_bits.y : 0)
                     };
                 }
 

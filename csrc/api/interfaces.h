@@ -32,7 +32,10 @@ sparse_attn_decode_interface(
     int64_t d_v,
     double sm_scale,
     const std::optional<Tensor> &out_,
-    bool enable_batch_invariant);
+    bool enable_batch_invariant,
+    const std::optional<Tensor> &indices_mask,
+    const std::optional<Tensor> &extra_indices_mask,
+    int64_t rows_per_slot);
 
 std::tuple<Tensor, Tensor, std::optional<Tensor>, std::optional<Tensor>>
 dense_attn_decode_interface(

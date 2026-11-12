@@ -96,7 +96,8 @@ struct SharedMemoryPlan {
         array_aligned<float, cosize_v<SmemLayoutOAccumBuf>> oAccumBuf;
     } u;
     CUTE_ALIGNAS(1024) array_aligned<bf16, cosize_v<SmemLayoutS>> s;
-    bool is_kv_valid[NUM_K_BUFS][TOPK_BLOCK_SIZE];
+    // Bit s is set when row slot s may attend the key; 0xFF when no row mask is given.
+    uint8_t is_kv_valid[NUM_K_BUFS][TOPK_BLOCK_SIZE];
 
     float sM[BLOCK_M], sL[BLOCK_M], sScale[BLOCK_M], sOScale[BLOCK_M];
     transac_bar_t bar_q, bar_k_local_ready[NUM_K_BUFS], bar_k_remote_ready[NUM_K_BUFS], bar_k_avail[NUM_K_BUFS];
