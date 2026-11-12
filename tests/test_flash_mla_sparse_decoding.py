@@ -23,14 +23,16 @@ Generate testcase for unit test
 
 def gen_testcase() -> List[RawTestParam]:
     # The DeepSeek-V4.1 KV cache formats (V41 / V41_FP4) are only supported on SM100f
-    supports_v41 = torch.cuda.get_device_capability()[0] >= 10
+    supports_v41 = torch.cuda.get_device_capability()[0] == 10
+    # SM110a has no h_q 128 kernel for d_qk 512
+    is_sm110 = torch.cuda.get_device_capability()[0] == 11
     correctness_cases = []
     corner_cases = []
     for d_qk in [576, 512]:
         for have_extra_k in ([False, True] if d_qk == 512 else [False]):
             for have_extra_topk_len in ([False, True] if have_extra_k else [False]):
                 for have_topk_len in ([False, True] if d_qk == 512 else [False]):
-                    for h_q in [64, 128]:
+                    for h_q in ([64] if is_sm110 and d_qk == 512 else [64, 128]):
                         cur_correctness_cases = [
                             RawTestParam(b, h_q, s_q, 1, s_k, is_varlen, topk,
                                         have_topk_length=have_topk_len,
@@ -209,6 +211,13 @@ def gen_testcase() -> List[RawTestParam]:
                      kvcache_layout=quant.KVCacheLayout.V32_NVFP4_FP8ROPE)
         for h_q in [64, 128]
     ]
+    if is_sm110:
+        # SM110a dispatches neither h_q 128 at d_qk 512 nor the NVFP4 KV cache
+        performance_cases = [
+            p for p in performance_cases
+            if not (p.h_q == 128 and p.d_qk == 512)
+            and p.kvcache_layout != quant.KVCacheLayout.V32_NVFP4_FP8ROPE
+        ]
 
     return correctness_cases + corner_cases + performance_cases
 

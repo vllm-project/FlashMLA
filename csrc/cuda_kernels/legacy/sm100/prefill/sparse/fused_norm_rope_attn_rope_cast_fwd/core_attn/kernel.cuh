@@ -1,5 +1,6 @@
 #pragma once
 
+#include "cuda_kernels/sm110a_reg_reconfig.h"
 #include <cuda_fp8.h>
 #include <math_constants.h>   // CUDART_INF_F
 #include <cutlass/arch/reg_reconfig.h>

@@ -585,6 +585,15 @@ sparse_attn_decode_interface(
         } else {
             STD_TORCH_CHECK(false, "Unsupported h_q: ", h_q);
         }
+    } else if (arch.is_sm110a()) {
+        // The V4.1 kernels and Decode_Sm100_Head128_Legacy_Impl have not been validated on SM110a.
+        if (h_q == 64) {
+            impl = new Decode_Sm100_Head64_Legacy_Impl();
+        } else if (h_q == 128 && d_qk == 576) {
+            impl = new Decode_Sm100_Head64x2_Legacy_Impl();
+        } else {
+            STD_TORCH_CHECK(false, "Sparse decode on SM110a supports h_q == 64, or h_q == 128 with d_qk == 576; got h_q ", h_q, ", d_qk ", d_qk);
+        }
     } else if (arch.is_sm90a()) {
         impl = new Decode_Sm90_Impl();
     } else {
