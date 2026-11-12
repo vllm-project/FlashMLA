@@ -1,5 +1,7 @@
 #include "common.h"
 
+#include <memory>
+
 #include "params.h"
 
 // Current (DeepSeek V4.1) kernels and the shared decoding helpers
@@ -10,6 +12,7 @@
 
 // Kernels for the KV cache formats and the architecture that upstream dropped in 2026.09.30
 #include "cuda_kernels/legacy/sm90/decode/sparse/splitkv_mla.h"
+#include "cuda_kernels/legacy/sm90/decode/sparse/small_heads.h"
 #include "cuda_kernels/legacy/sm100/decode/sparse/head64/kernel.h"
 #include "cuda_kernels/legacy/sm100/decode/sparse/nvfp4_head64/kernel.h"
 #include "cuda_kernels/legacy/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
@@ -25,6 +28,7 @@ static constexpr SparseAttnFwdMode get_decode_fwd_mode() {
 
 // Feature set of sparse decoding kernels
 enum class DecodeFeatures : int {
+    HEAD_32,
     HEAD_64,
     HEAD_128,
 
@@ -58,6 +62,7 @@ class DecodeImplBase : public ImplBase<
     DecodeFeatures
 > {
 public:
+    virtual ~DecodeImplBase() = default;
     virtual DecodeImplMeta get_meta(int h_q, int s_q) = 0;
 };
 
@@ -150,6 +155,7 @@ protected:
 
 class Decode_Sm90_Impl : public DecodeImplBase {
     DECLARE_SUPPORTED_FEATURES(
+        DecodeFeatures::HEAD_32,
         DecodeFeatures::HEAD_64,
         DecodeFeatures::HEAD_128,
         DecodeFeatures::HEAD_DIM_512,
@@ -167,7 +173,7 @@ public:
     DecodeImplMeta get_meta(int h_q, int s_q) override {
         Arch arch = Arch();
         return {
-            std::max(arch.num_sms / s_q / (h_q/64), 1),
+            std::max(arch.num_sms / s_q / ((h_q + 63) / 64), 1),
             5,
             64
         };
@@ -176,6 +182,10 @@ public:
 protected:
     void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
         DISPATCH_MODEL_TYPE(params.model_type, MODEL_TYPE, [&]() {
+            if (params.h_q == 32) {
+                legacy::sm90::decode::sparse::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE, 32>(params);
+                return;
+            }
             DISPATCH_NUM_HEADS(params.h_q, NUM_HEADS, [&]() {
                 legacy::sm90::decode::sparse::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE, NUM_HEADS>(params);
             });
@@ -362,6 +372,67 @@ protected:
     }
 };
 
+namespace {
+
+// Select the implementation independently of tensor validation and buffer setup.
+// V4.1 uses the current SM100 kernels; V3.2 / V4 and all SM90 kernels are legacy.
+std::unique_ptr<DecodeImplBase> make_decode_impl(const Arch& arch, int h_q, int d_qk, ModelType model_type) {
+    const bool is_v41 = model_type == ModelType::V41;
+    if (arch.is_sm90a()) return std::make_unique<Decode_Sm90_Impl>();
+    STD_TORCH_CHECK(arch.is_sm100f(), "Unsupported architecture for sparse decode fwd");
+
+    if (h_q == 64) {
+        if (is_v41) return std::make_unique<Decode_Sm100_Head64_Impl>();
+        if (model_type == ModelType::V32_NVFP4_FP8ROPE)
+            return std::make_unique<Decode_Sm100_Head64_Nvfp4_Impl>();
+        return std::make_unique<Decode_Sm100_Head64_Legacy_Impl>();
+    }
+    STD_TORCH_CHECK(h_q == 128, "Unsupported h_q: ", h_q);
+    if (is_v41) return std::make_unique<Decode_Sm100_Head128_Impl>();
+    if (d_qk == 576) return std::make_unique<Decode_Sm100_Head64x2_Legacy_Impl>();
+    STD_TORCH_CHECK(d_qk == 512, "Unsupported d_qk: ", d_qk);
+    return std::make_unique<Decode_Sm100_Head128_Legacy_Impl>();
+}
+
+// Both schedulers feed the same combine kernel. Own the intermediate tensors
+// here so their storage stays alive until attention and combine are enqueued.
+struct SplitKVBuffers {
+    Tensor out, lse;
+
+    void allocate(const Tensor& q, int total_splits, SparseAttnDecodeParams& params) {
+        out = torch::stable::new_empty(q, {total_splits, params.s_q, params.h_q, params.d_v}, ScalarType::Float);
+        lse = torch::stable::new_empty(q, {total_splits, params.s_q, params.h_q}, ScalarType::Float);
+        params.o_accum = out.mutable_data_ptr<float>();
+        params.lse_accum = lse.mutable_data_ptr<float>();
+        params.stride_o_accum_split = int64_stride_to_int(out.stride(0));
+        params.stride_o_accum_s_q = int64_stride_to_int(out.stride(1));
+        params.stride_o_accum_h_q = int64_stride_to_int(out.stride(2));
+        params.stride_lse_accum_split = int64_stride_to_int(lse.stride(0));
+        params.stride_lse_accum_s_q = int64_stride_to_int(lse.stride(1));
+    }
+};
+
+void run_small_tile_decode(const Tensor& q, SparseAttnDecodeParams params, bool batch_invariant) {
+    using namespace legacy::sm90::decode::sparse;
+    const bool force_unsplit = batch_invariant || !small_heads_combine_output_is_aligned(params);
+    const int splits = small_heads_num_splits(
+        params.b * params.s_q, params.h_q, params.topk, params.extra_topk, force_unsplit);
+    params.enable_split_kv = splits > 1;
+
+    SplitKVBuffers buffers;
+    Tensor split_offsets;
+    if (params.enable_split_kv) {
+        buffers.allocate(q, params.b * splits, params);
+        split_offsets = torch::stable::new_empty(q, {params.b + 1}, ScalarType::Int);
+        params.num_splits_ptr = split_offsets.mutable_data_ptr<int>();
+        params.num_sm_parts = splits;
+    }
+    run_small_heads_decode(params, splits);
+    if (params.enable_split_kv) smxx::decode::run_flash_mla_combine_kernel(params);
+}
+
+}  // namespace
+
 std::tuple<Tensor, Tensor, std::optional<Tensor>, std::optional<Tensor>>
 sparse_attn_decode_interface(
     const Tensor &q,   // [b, s_q, h_q, d_qk]
@@ -483,8 +554,14 @@ sparse_attn_decode_interface(
     STD_TORCH_CHECK(model_type != ModelType::V41_FP4, "The fp4 KV cache is only supported as extra_kv");
     STD_TORCH_CHECK(is_valid_kv_format_pair(model_type, extra_model_type), "invalid kv format pair, ", get_dynamic_enum_name(model_type), " and ", get_dynamic_enum_name(extra_model_type));
 
-    // Split-KV only pays off when a request has enough work, but the SM90 kernels and the
-    // preserved NVFP4 kernel have no unsplit path and always consume the split metadata.
+    const bool small_heads = arch.is_sm90a() && is_sm90_small_heads_h_q(h_q);
+    if (small_heads) {
+        STD_TORCH_CHECK(model_type == ModelType::V4 || model_type == ModelType::V32,
+                        "SM90 small-head sparse decode requires V4 or V3.2 FP8 KV cache");
+    }
+
+    // The scheduled SM90 kernels and the preserved NVFP4 kernel always use
+    // split metadata. Small-tile SM90 decode chooses its own splits below.
     bool must_split_kv = arch.is_sm90a() || model_type == ModelType::V32_NVFP4_FP8ROPE;
     bool enable_split_kv = must_split_kv || (!enable_batch_invariant && !(topk + extra_topk <= 640));
 
@@ -514,12 +591,14 @@ sparse_attn_decode_interface(
     }
     Tensor lse = torch::stable::new_empty(q, {b, s_q, h_q}, ScalarType::Float);
     std::vector<DecodeFeatures> features;
-    if (h_q == 64) {
+    if (small_heads && h_q == 32) {
+        features.push_back(DecodeFeatures::HEAD_32);
+    } else if (h_q == 64) {
         features.push_back(DecodeFeatures::HEAD_64);
     } else if (h_q == 128) {
         features.push_back(DecodeFeatures::HEAD_128);
     } else {
-        STD_TORCH_CHECK(false, "Unsupported h_q: ", h_q);
+        STD_TORCH_CHECK(small_heads, "Unsupported h_q: ", h_q);
     }
     if (d_qk == 576) {
         features.push_back(DecodeFeatures::HEAD_DIM_576);
@@ -559,40 +638,6 @@ sparse_attn_decode_interface(
         }
     }
 
-    // Pick the implementation. V4.1 runs on the current kernels; V3.2 / V4 and everything on
-    // SM90 run on the ones kept under cuda_kernels/legacy/.
-    bool is_v41 = model_type == ModelType::V41;
-    DecodeImplBase* impl;
-    if (arch.is_sm100f()) {
-        if (h_q == 64) {
-            if (is_v41) {
-                impl = new Decode_Sm100_Head64_Impl();
-            } else if (model_type == ModelType::V32_NVFP4_FP8ROPE) {
-                impl = new Decode_Sm100_Head64_Nvfp4_Impl();
-            } else {
-                impl = new Decode_Sm100_Head64_Legacy_Impl();
-            }
-        } else if (h_q == 128) {
-            if (is_v41) {
-                impl = new Decode_Sm100_Head128_Impl();
-            } else if (d_qk == 576) {
-                impl = new Decode_Sm100_Head64x2_Legacy_Impl();
-            } else if (d_qk == 512) {
-                impl = new Decode_Sm100_Head128_Legacy_Impl();
-            } else {
-                STD_TORCH_CHECK(false, "Unsupported d_qk: ", d_qk);
-            }
-        } else {
-            STD_TORCH_CHECK(false, "Unsupported h_q: ", h_q);
-        }
-    } else if (arch.is_sm90a()) {
-        impl = new Decode_Sm90_Impl();
-    } else {
-        STD_TORCH_CHECK(false, "Unsupported architecture for sparse decode fwd");
-    }
-
-    DecodeImplMeta impl_meta = impl->get_meta(h_q, s_q);
-
     SparseAttnDecodeParams params = {
         b, s_q, h_q, h_kv, d_qk, d_v,
         sm_scale, sm_scale * LOG_2_E,
@@ -629,7 +674,17 @@ sparse_attn_decode_interface(
         enable_split_kv,
     };
 
-    Tensor o_accum, lse_accum;
+    if (small_heads && !legacy::sm90::decode::sparse::can_use_persistent_small_heads_decode(
+            params, have_extra_kcache, enable_batch_invariant)) {
+        run_small_tile_decode(q, params, enable_batch_invariant);
+        return {out, torch::stable::transpose(lse, 1, 2), std::nullopt, std::nullopt};
+    }
+
+    auto impl = make_decode_impl(arch, h_q, d_qk, model_type);
+
+    DecodeImplMeta impl_meta = impl->get_meta(h_q, s_q);
+
+    SplitKVBuffers split_buffers;
     if (enable_split_kv) {
         // Get MLA metadata if necessary
         if (!tile_scheduler_metadata.has_value()) {
@@ -668,25 +723,13 @@ sparse_attn_decode_interface(
         params.num_sm_parts = impl_meta.num_sm_parts;
         // Allocate intermediate buffers for split-KV
         const int total_num_splits = b + params.num_sm_parts;
-        lse_accum = torch::stable::new_empty(q, {total_num_splits, s_q, h_q}, ScalarType::Float);
-        o_accum = torch::stable::new_empty(q, {total_num_splits, s_q, h_q, d_v}, ScalarType::Float);
-        KU_CHECK_CONTIGUOUS(lse_accum);
-        KU_CHECK_CONTIGUOUS(o_accum);
-        params.lse_accum = lse_accum.mutable_data_ptr<float>();
-        params.o_accum = o_accum.mutable_data_ptr<float>();
-        params.stride_lse_accum_split = int64_stride_to_int(lse_accum.stride(0));
-        params.stride_lse_accum_s_q = int64_stride_to_int(lse_accum.stride(1));
-        params.stride_o_accum_split = int64_stride_to_int(o_accum.stride(0));
-        params.stride_o_accum_s_q = int64_stride_to_int(o_accum.stride(1));
-        params.stride_o_accum_h_q = int64_stride_to_int(o_accum.stride(2));
+        split_buffers.allocate(q, total_num_splits, params);
     }
 
     impl->run(params, features);
     if (enable_split_kv) {
         smxx::decode::run_flash_mla_combine_kernel(params);
     }
-
-    delete impl;
 
     return {out, torch::stable::transpose(lse, 1, 2), tile_scheduler_metadata, num_splits};
 }

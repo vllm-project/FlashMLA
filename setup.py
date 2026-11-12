@@ -68,8 +68,11 @@ LEGACY_KERNEL_SOURCES = [
     "csrc/cuda_kernels/legacy/sm90/decode/dense/instantiations/bf16.cu",
 
     # sm90 sparse decode
+    "csrc/cuda_kernels/legacy/sm90/decode/sparse/instantiations/small_heads.cu",
+    "csrc/cuda_kernels/legacy/sm90/decode/sparse/instantiations/v4_persistent_h32.cu",
     "csrc/cuda_kernels/legacy/sm90/decode/sparse/instantiations/v4_persistent_h64.cu",
     "csrc/cuda_kernels/legacy/sm90/decode/sparse/instantiations/v4_persistent_h128.cu",
+    "csrc/cuda_kernels/legacy/sm90/decode/sparse/instantiations/v32_persistent_h32.cu",
     "csrc/cuda_kernels/legacy/sm90/decode/sparse/instantiations/v32_persistent_h64.cu",
     "csrc/cuda_kernels/legacy/sm90/decode/sparse/instantiations/v32_persistent_h128.cu",
 
