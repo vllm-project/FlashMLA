@@ -666,6 +666,15 @@ sparse_attn_decode_interface(
         params.tile_scheduler_metadata_ptr = (DecodingSchedMeta*)tile_scheduler_metadata->data_ptr();
         params.num_splits_ptr = num_splits->mutable_data_ptr<int>();
         params.num_sm_parts = impl_meta.num_sm_parts;
+    }
+
+    // The SM90 kernel always takes the split-KV metadata, but with a single
+    // scheduler partition no request is split: it writes `out` / `lse` directly
+    // and the fp32 accumulators ((b + num_sm_parts) * s_q * h_q * d_v) are never
+    // read, so skip them and the combine.
+    const bool needs_split_workspace =
+        enable_split_kv && !(arch.is_sm90a() && impl_meta.num_sm_parts == 1);
+    if (needs_split_workspace) {
         // Allocate intermediate buffers for split-KV
         const int total_num_splits = b + params.num_sm_parts;
         lse_accum = torch::stable::new_empty(q, {total_num_splits, s_q, h_q}, ScalarType::Float);
@@ -682,7 +691,7 @@ sparse_attn_decode_interface(
     }
 
     impl->run(params, features);
-    if (enable_split_kv) {
+    if (needs_split_workspace) {
         smxx::decode::run_flash_mla_combine_kernel(params);
     }
 

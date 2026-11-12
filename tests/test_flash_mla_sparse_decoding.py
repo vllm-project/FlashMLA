@@ -320,6 +320,62 @@ def test_flash_mla(p: TestParam) -> Result:
     return performance_result
 
 
+@torch.inference_mode()
+def test_no_split_workspace_allocation():
+    """No-split sparse decode on SM90 must not allocate split-KV accumulators.
+
+    A query length equal to the SM count uses one scheduler partition, so
+    nothing is split and the kernel writes the output directly. Allocating
+    the split-KV scratch then only raises peak memory (it grows with s_q and
+    caused runtime OOMs in vLLM's mixed-batch layout, b=1 / s_q=num_tokens).
+    """
+    if torch.cuda.get_device_capability() != (9, 0):
+        return
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    for h_q, d_qk, kvcache_layout in [
+        (64, 576, None),
+        (128, 576, None),
+        (128, 512, quant.KVCacheLayout.V4_FP8Sparse),
+    ]:
+        p = RawTestParam(
+            b=1,
+            h_q=h_q,
+            s_q=num_sms,
+            h_kv=1,
+            s_kv=2046,
+            is_varlen=False,
+            topk=2048,
+            d_qk=d_qk,
+            kvcache_layout=kvcache_layout,
+            check_correctness=False,
+            num_runs=0,
+            seed=1,
+        ).to_test_param()
+        t = lib.generate_testcase_for_decode(p)
+        tile_scheduler_metadata, _ = flash_mla.get_mla_metadata()
+
+        def run_decode():
+            return lib.run_flash_mla_decode(p, t, tile_scheduler_metadata, None)
+
+        out, lse = run_decode()
+        torch.cuda.synchronize()
+        del out, lse
+        torch.cuda.empty_cache()
+
+        memory_before = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        out, lse = run_decode()
+        torch.cuda.synchronize()
+        peak_memory = torch.cuda.max_memory_allocated() - memory_before
+        output_memory = out.nbytes + lse.nbytes
+        assert peak_memory <= output_memory + 1024**2, (
+            f"No-split decode (h_q={h_q}, d_qk={d_qk}) allocated "
+            f"{peak_memory / 1024**2:.2f} MiB for "
+            f"{output_memory / 1024**2:.2f} MiB of outputs"
+        )
+        del out, lse, t
+
+
 def main():
     dtype = torch.bfloat16
     device = torch.device("cuda:0")
@@ -328,6 +384,8 @@ def main():
     torch.cuda.set_device(device)
     torch.set_float32_matmul_precision('high')
     torch.set_num_threads(32)
+
+    test_no_split_workspace_allocation()
 
     raw_testcases = gen_testcase()
     testcases = [t.to_test_param() for t in raw_testcases]
