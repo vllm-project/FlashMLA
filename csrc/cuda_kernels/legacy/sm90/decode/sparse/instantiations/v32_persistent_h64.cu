@@ -2,6 +2,6 @@
 
 namespace legacy::sm90::decode::sparse {
 
-template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32, 64>(const SparseAttnDecodeParams &params);
+template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32, 64, false>(const SparseAttnDecodeParams &params);
 
 }
