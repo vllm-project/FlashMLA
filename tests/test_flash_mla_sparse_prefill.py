@@ -213,6 +213,95 @@ def test_small_heads_empty_inputs(heads, shape):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9, reason="SM90 kernel")
+@pytest.mark.parametrize("heads", [8, 16, 32])
+@pytest.mark.parametrize("dim", [512, 576])
+@pytest.mark.parametrize("topk", [64, 192, 640, 2048])
+@torch.inference_mode()
+def test_small_heads_agree_with_padded_heads(heads, dim, topk):
+    """Small heads match the 64-head kernel on zero-padded Q, over more queries than SMs."""
+    from flash_mla import flash_mla_sparse_fwd
+
+    with torch.device("cuda"):
+        # More queries than SMs, so that a CTA of the persistent small-heads kernel
+        # handles several queries of different lengths, including empty ones.
+        p = TestParam(301, 4096, topk, h_q=heads, d_qk=dim, seed=3, num_runs=0,
+                      have_attn_sink=True, have_topk_length=True)
+        t = lib.generate_testcase(p)
+        t.indices[0].fill_(-1)
+        t.indices[1, :, :64] = -1
+        t.topk_length[:4] = torch.tensor([0, 1, 64, topk], dtype=torch.int32)
+        t.topk_length[100:120] = 0
+        t.topk_length[200:220] = torch.arange(20, dtype=torch.int32) % 3 * 64
+        actual = flash_mla_sparse_fwd(t.q, t.kv, t.indices, t.sm_scale,
+                                     attn_sink=t.attn_sink, topk_length=t.topk_length)
+        # Fold the lengths into the indices and pad topk to a multiple of 128 for the 64-head kernel.
+        indices = torch.full((p.s_q, 1, (topk + 127) // 128 * 128), -1, dtype=torch.int32)
+        indices[..., :topk] = t.indices
+        indices[..., :topk][torch.arange(topk).view(1, 1, topk) >= t.topk_length.view(-1, 1, 1)] = -1
+        q_padded = torch.zeros((p.s_q, 64, dim), dtype=torch.bfloat16)
+        q_padded[:, :heads] = t.q
+        sink_padded = torch.full((64,), float("-inf"))
+        sink_padded[:heads] = t.attn_sink
+        expected = flash_mla_sparse_fwd(q_padded, t.kv, indices, t.sm_scale, attn_sink=sink_padded)
+        torch.testing.assert_close(actual[0], expected[0][:, :heads], atol=0.02, rtol=0.03)
+        for a, b in zip(actual[1:], expected[1:]):
+            torch.testing.assert_close(a, b[:, :heads], atol=1e-5, rtol=4e-5)
+        _, out_ref, maximum, lse = ref.ref_sparse_attn_fwd(p, t)
+        assert kk.check_is_allclose("out", actual[0].float(), out_ref, abs_tol=8e-4, rel_tol=3.01/128, cos_diff_tol=7e-6)
+        torch.testing.assert_close(actual[1], maximum, atol=1e-5, rtol=2.01/65536)
+        torch.testing.assert_close(actual[2], lse, atol=1e-5, rtol=2.01/65536)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9, reason="SM90 kernel")
+@pytest.mark.parametrize("heads", [8, 16, 32])
+@pytest.mark.parametrize("dim", [512, 576])
+@torch.inference_mode()
+def test_small_heads_are_deterministic(heads, dim):
+    """Repeated runs are bitwise identical, which catches races between the pipeline stages."""
+    from flash_mla import flash_mla_sparse_fwd
+
+    with torch.device("cuda"):
+        p = TestParam(1024, 8192, 1024, h_q=heads, d_qk=dim, seed=5, num_runs=0, have_attn_sink=True)
+        t = lib.generate_testcase(p)
+        expected = flash_mla_sparse_fwd(t.q, t.kv, t.indices, t.sm_scale, attn_sink=t.attn_sink)
+        for _ in range(20):
+            actual = flash_mla_sparse_fwd(t.q, t.kv, t.indices, t.sm_scale, attn_sink=t.attn_sink)
+            for a, b in zip(actual, expected):
+                assert torch.equal(a, b)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9, reason="SM90 kernel")
+@pytest.mark.parametrize("heads", [8, 16, 32])
+@pytest.mark.parametrize("dim", [512, 576])
+@torch.inference_mode()
+def test_small_heads_mma_switch_agrees(heads, dim, monkeypatch):
+    """USE_MMA_FOR_SMALL_N_HEAD=1 selects the mma.sync kernel, which must agree with the default."""
+    from flash_mla import flash_mla_sparse_fwd
+
+    with torch.device("cuda"):
+        p = TestParam(65, 1000, 192, h_q=heads, d_qk=dim, seed=23, num_runs=0,
+                      have_attn_sink=True, have_topk_length=True)
+        t = lib.generate_testcase(p)
+        t.topk_length[:4] = torch.tensor([0, 1, 33, 192], dtype=torch.int32)
+        monkeypatch.delenv("USE_MMA_FOR_SMALL_N_HEAD", raising=False)
+        expected = flash_mla_sparse_fwd(t.q, t.kv, t.indices, t.sm_scale,
+                                       attn_sink=t.attn_sink, topk_length=t.topk_length)
+        for value in ("1", "true"):
+            monkeypatch.setenv("USE_MMA_FOR_SMALL_N_HEAD", value)
+            actual = flash_mla_sparse_fwd(t.q, t.kv, t.indices, t.sm_scale,
+                                         attn_sink=t.attn_sink, topk_length=t.topk_length)
+            torch.testing.assert_close(actual[0], expected[0], atol=0.02, rtol=0.03)
+            for a, b in zip(actual[1:], expected[1:]):
+                torch.testing.assert_close(a, b, atol=1e-5, rtol=4e-5)
+        # "0" keeps the default kernel
+        monkeypatch.setenv("USE_MMA_FOR_SMALL_N_HEAD", "0")
+        actual = flash_mla_sparse_fwd(t.q, t.kv, t.indices, t.sm_scale,
+                                     attn_sink=t.attn_sink, topk_length=t.topk_length)
+        for a, b in zip(actual, expected):
+            assert torch.equal(a, b)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9, reason="SM90 kernel")
 @pytest.mark.parametrize("heads", [8, 64])
 def test_sparse_prefill_rejects_multiple_kv_heads(heads):
     from flash_mla import flash_mla_sparse_fwd
