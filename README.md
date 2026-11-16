@@ -46,8 +46,10 @@ one term to the final denominator. As in the unsplit API, returned `max_logits`
 and `lse` describe the key scores and exclude the sink. An empty row returns
 zero output, `max_logits = -inf`, and `lse = +inf`.
 
-Automatic splitting is enabled on the tested H20 and H100 SXM devices for
-full-width index rows with `topk >= 1024`. Rows with `640 <= topk < 1024`
+Automatic splitting is enabled during CUDA Graph capture on the tested H20
+and H100 SXM devices for full-width index rows with `topk >= 1024`.
+Eager calls stay unsplit: allocation and merge launch costs can outweigh the
+GPU speedup. Rows with `640 <= topk < 1024`
 also use splitting when at least four partitions fit. The partition count is
 the largest power of two bounded by
 `min(32, num_sms / num_queries, topk / 128)`. With a `topk_length` tensor,

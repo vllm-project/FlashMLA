@@ -160,6 +160,7 @@ def main():
                         dry_run_iters=10,
                         repeat_iters=args.repeats,
                     )
+                    torch.testing.assert_close(out, base[0], atol=0.02, rtol=0.03)
                     timings[splits].extend(ms * 1000 for ms in samples)
             medians = {s: statistics.median(values) for s, values in timings.items()}
             for splits, values in timings.items():

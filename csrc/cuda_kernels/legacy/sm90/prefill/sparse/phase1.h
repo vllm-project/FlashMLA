@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <string>
+#include <cuda_runtime_api.h>
 
 namespace legacy::sm90::prefill::sparse_fwd {
 
@@ -32,6 +34,13 @@ inline int get_etap_splits(const SparseAttnFwdParams& params, bool allow_auto) {
     if (requested == 1 || (requested == 0 && (!allow_auto || params.topk_length != nullptr))) return 1;
     int limit = std::min({32, params.num_sm / params.s_q, params.topk / 128});
     if (requested == 0 && (params.topk < 640 || (params.topk < 1024 && limit < 4))) return 1;
+    if (requested == 0) {
+        cudaStreamCaptureStatus capture;
+        cudaError_t status = cudaStreamIsCapturing(params.stream, &capture);
+        if (status != cudaSuccess)
+            throw std::runtime_error("cudaStreamIsCapturing: " + std::string(cudaGetErrorString(status)));
+        if (capture != cudaStreamCaptureStatusActive) return 1;
+    }
     if (requested > 0 && requested <= limit) return requested;
     int splits = 1;
     while (splits * 2 <= limit && (requested == 0 || splits * 2 <= requested)) splits *= 2;

@@ -243,7 +243,7 @@ std::vector<Tensor> sparse_attn_prefill_interface(
         get_current_cuda_stream(q)
     };
 
-    Tensor partial_out, partial_lse, partial_max;
+    Tensor partial_state;
     legacy::sm90::prefill::sparse_fwd::EtapSplitParams etap_params{params};
     if (is_sm90a) {
         const bool allow_auto = std::strcmp(arch.device_prop->name, "NVIDIA H20") == 0 ||
@@ -251,12 +251,11 @@ std::vector<Tensor> sparse_attn_prefill_interface(
         etap_params.etap_splits = legacy::sm90::prefill::sparse_fwd::get_etap_splits(params, allow_auto);
     }
     if (etap_params.etap_splits > 1) {
-        partial_out = torch::stable::new_empty(q, {s_q, etap_params.etap_splits, h_q, d_v}, ScalarType::Float);
-        partial_lse = torch::stable::new_empty(q, {s_q, etap_params.etap_splits, h_q}, ScalarType::Float);
-        partial_max = torch::stable::new_empty(q, {s_q, etap_params.etap_splits, h_q}, ScalarType::Float);
-        etap_params.etap_out_accum = static_cast<float*>(partial_out.data_ptr());
-        etap_params.etap_lse_accum = static_cast<float*>(partial_lse.data_ptr());
-        etap_params.etap_max_accum = static_cast<float*>(partial_max.data_ptr());
+        const int64_t states = s_q * etap_params.etap_splits * h_q;
+        partial_state = torch::stable::new_empty(q, {states * (d_v + 2)}, ScalarType::Float);
+        etap_params.etap_out_accum = static_cast<float*>(partial_state.data_ptr());
+        etap_params.etap_lse_accum = etap_params.etap_out_accum + states * d_v;
+        etap_params.etap_max_accum = etap_params.etap_lse_accum + states;
     }
 
     std::vector<FwdFeatures> required_features;
