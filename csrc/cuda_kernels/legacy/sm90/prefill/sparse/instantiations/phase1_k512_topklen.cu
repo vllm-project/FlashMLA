@@ -7,4 +7,6 @@ namespace legacy::sm90::prefill::sparse_fwd {
 // = true / false respectively, to compile them in parallel.
 template void run_fwd_phase1_kernel<512, true>(const SparseAttnFwdParams& params);
 
+template void run_etap_split_kernel<512, true>(const EtapSplitParams& params);
+
 }

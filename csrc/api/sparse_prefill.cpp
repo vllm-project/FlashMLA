@@ -243,6 +243,22 @@ std::vector<Tensor> sparse_attn_prefill_interface(
         get_current_cuda_stream(q)
     };
 
+    Tensor partial_out, partial_lse, partial_max;
+    legacy::sm90::prefill::sparse_fwd::EtapSplitParams etap_params{params};
+    if (is_sm90a) {
+        const bool allow_auto = std::strcmp(arch.device_prop->name, "NVIDIA H20") == 0 ||
+                                std::strcmp(arch.device_prop->name, "NVIDIA H100 80GB HBM3") == 0;
+        etap_params.etap_splits = legacy::sm90::prefill::sparse_fwd::get_etap_splits(params, allow_auto);
+    }
+    if (etap_params.etap_splits > 1) {
+        partial_out = torch::stable::new_empty(q, {s_q, etap_params.etap_splits, h_q, d_v}, ScalarType::Float);
+        partial_lse = torch::stable::new_empty(q, {s_q, etap_params.etap_splits, h_q}, ScalarType::Float);
+        partial_max = torch::stable::new_empty(q, {s_q, etap_params.etap_splits, h_q}, ScalarType::Float);
+        etap_params.etap_out_accum = static_cast<float*>(partial_out.data_ptr());
+        etap_params.etap_lse_accum = static_cast<float*>(partial_lse.data_ptr());
+        etap_params.etap_max_accum = static_cast<float*>(partial_max.data_ptr());
+    }
+
     std::vector<FwdFeatures> required_features;
     if (small_heads) {
         required_features.push_back(FwdFeatures::SMALL_HEADS);
@@ -268,8 +284,16 @@ std::vector<Tensor> sparse_attn_prefill_interface(
     }
 
     if (is_sm90a) {
-        Fwd_Sm90_Impl fwd_impl;
-        fwd_impl.run(params, required_features);
+        if (etap_params.etap_splits > 1) {
+            DISPATCH_HEAD_DIM(d_qk, HEAD_DIM_QK, [&]() {
+                DISPATCH_BOOLEAN_FLAG(have_topk_length, HAVE_TOPK_LENGTH, [&]() {
+                    legacy::sm90::prefill::sparse_fwd::run_etap_split_kernel<HEAD_DIM_QK, HAVE_TOPK_LENGTH>(etap_params);
+                });
+            });
+        } else {
+            Fwd_Sm90_Impl fwd_impl;
+            fwd_impl.run(params, required_features);
+        }
     } else if (is_sm100f) {
         if (h_q == 64) {
             if (d_qk == 576) {

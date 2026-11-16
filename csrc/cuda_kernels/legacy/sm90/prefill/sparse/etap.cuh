@@ -23,7 +23,7 @@ using namespace cute;
 // i.e. per column of S^T: the column max is reduced across the 4 warps of a
 // warpgroup for every block, while the column sums are kept per thread and
 // reduced only in the epilogue.
-template<int D_QK_, int H, bool HAVE_TOPK_LENGTH>
+template<int D_QK_, int H, bool HAVE_TOPK_LENGTH, bool SPLIT = false>
 struct EtapKernel {
 
 static_assert(H == 8 || H == 16 || H == 32);
@@ -150,7 +150,7 @@ static __device__ __forceinline__ void load_q(const SparseAttnFwdParams &params,
     }
 }
 
-static __device__ __forceinline__ void devfunc(const SparseAttnFwdParams &params) {
+static __device__ __forceinline__ void devfunc(const EtapSplitParams &params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
     const int warpgroup_idx = cutlass::canonical_warp_group_idx();
     const int warp_idx = cutlass::canonical_warp_idx_sync();
@@ -192,8 +192,13 @@ static __device__ __forceinline__ void devfunc(const SparseAttnFwdParams &params
 
         int k_phase = 0, q_phase = 0;
         CUTE_NO_UNROLL
-        for (int s_q_idx = blockIdx.x; s_q_idx < params.s_q; s_q_idx += gridDim.x) {
-            const int num_blocks = ku::ceil_div(get_topk_length(params, s_q_idx), (int)B_TOPK);
+        for (int s_q_idx = SPLIT ? blockIdx.x / params.etap_splits : blockIdx.x;
+             s_q_idx < params.s_q; s_q_idx += SPLIT ? params.s_q : gridDim.x) {
+            const int total_blocks = ku::ceil_div(get_topk_length(params, s_q_idx), (int)B_TOPK);
+            const int split = SPLIT ? blockIdx.x % params.etap_splits : 0;
+            const int first_block = SPLIT ? int((int64_t)total_blocks * split / params.etap_splits) : 0;
+            const int end_block = SPLIT ? int((int64_t)total_blocks * (split + 1) / params.etap_splits) : total_blocks;
+            const int num_blocks = end_block - first_block;
             float rM[NUM_COLS], rL[NUM_COLS];
             CUTE_UNROLL
             for (int s = 0; s < NUM_COLS; ++s) {
@@ -323,13 +328,15 @@ static __device__ __forceinline__ void devfunc(const SparseAttnFwdParams &params
                 }
                 const float scale0 = exp2f(m0 - m), scale1 = exp2f(m1 - m);
                 const float l = l0*scale0 + l1*scale1;
-                float attn_sink = params.attn_sink == nullptr ? -CUDART_INF_F : params.attn_sink[head]*CUDART_L2E_F;
+                float attn_sink = SPLIT || params.attn_sink == nullptr ? -CUDART_INF_F : params.attn_sink[head]*CUDART_L2E_F;
                 float scale_factor = l == 0.0f ? 0.0f : 1.0f / (l + exp2f(attn_sink - m));    // The output should be 0 whatever attn_sink is
                 own_factors[s] = (warpgroup_idx == 0 ? scale0 : scale1)*scale_factor;
                 if (threadIdx.x < 4) {
-                    int64_t g_offset = (int64_t)s_q_idx*params.h_q + head;
-                    params.max_logits[g_offset] = l == 0.0f ? -CUDART_INF_F : m*CUDART_LN2_F;
-                    params.lse[g_offset] = l == 0.0f ? CUDART_INF_F : logf(l) + m*CUDART_LN2_F;
+                    int64_t g_offset = SPLIT ? ((int64_t)s_q_idx*params.etap_splits + split)*H + head : (int64_t)s_q_idx*H + head;
+                    float* maxima = SPLIT ? params.etap_max_accum : params.max_logits;
+                    float* lses = SPLIT ? params.etap_lse_accum : params.lse;
+                    maxima[g_offset] = l == 0.0f ? -CUDART_INF_F : m*CUDART_LN2_F;
+                    lses[g_offset] = l == 0.0f ? (SPLIT ? -CUDART_INF_F : CUDART_INF_F) : logf(l) + m*CUDART_LN2_F;
                 }
             }
 
@@ -338,7 +345,8 @@ static __device__ __forceinline__ void devfunc(const SparseAttnFwdParams &params
             // accumulator order so that the thread with the same index reads it: WG1
             // writes first, then each WG0 thread reads its slots and refills them.
             float* exchange = plan.epilogue.exchange;
-            auto rOb = make_fragment_like<bf16>(partition_fragment_C(TiledMMA_PV{}, Shape<Int<D_V/2>, Int<H>>{}));
+            using OutType = std::conditional_t<SPLIT, float, bf16>;
+            auto rOb = make_fragment_like<OutType>(partition_fragment_C(TiledMMA_PV{}, Shape<Int<D_V/2>, Int<H>>{}));
             auto put_peer_half = [&](auto wg) {
                 constexpr int WG = decltype(wg)::value;
                 CUTE_UNROLL
@@ -352,8 +360,8 @@ static __device__ __forceinline__ void devfunc(const SparseAttnFwdParams &params
                 CUTE_UNROLL
                 for (int i = 0; i < HALF_O; i += 2) {
                     float2 peer = *reinterpret_cast<const float2*>(&exchange[(i/2*128 + idx_in_warpgroup)*2]);
-                    rOb(i) = (bf16)(rO(WG*HALF_O + i)*own_factors[get_col_slot(i)] + peer.x);
-                    rOb(i+1) = (bf16)(rO(WG*HALF_O + i + 1)*own_factors[get_col_slot(i+1)] + peer.y);
+                    rOb(i) = (OutType)(rO(WG*HALF_O + i)*own_factors[get_col_slot(i)] + peer.x);
+                    rOb(i+1) = (OutType)(rO(WG*HALF_O + i + 1)*own_factors[get_col_slot(i+1)] + peer.y);
                 }
             };
             if (warpgroup_idx == 1)
@@ -368,31 +376,38 @@ static __device__ __forceinline__ void devfunc(const SparseAttnFwdParams &params
                 merge_own_half(Int<1>{});
             NamedBarrier::arrive_and_wait(256, NamedBarriers::epilogue_sync);
 
-            // O^T -> sO [head][dim], reusing the exchange buffer
-            {
-                Tensor sOt = make_tensor(make_smem_ptr(plan.epilogue.o + warpgroup_idx*(D_V/2)), SmemLayoutOTransposed{});
-                auto r2s_copy = make_tiled_copy_C(Copy_Atom<STSM_T, bf16>{}, TiledMMA_PV{});
-                ThrCopy thr_copy = r2s_copy.get_slice(idx_in_warpgroup);
-                cute::copy(r2s_copy, thr_copy.retile_S(rOb), thr_copy.partition_D(sOt));
-            }
-            NamedBarrier::arrive_and_wait(256, NamedBarriers::epilogue_sync);
-
-            // `out` may be a head slice of a padded buffer, so index through the
-            // output strides; the vector path additionally needs 16B-aligned rows.
-            // The next query's epilogue only rewrites the buffer after its first
-            // epilogue barrier, which both warpgroups reach after this store.
-            const bf16* sO = plan.epilogue.o;
-            const int64_t out_row = (int64_t)s_q_idx*params.stride_out_s_q;
-            if ((reinterpret_cast<uintptr_t>(params.out) & 15) == 0 && params.stride_out_s_q % 8 == 0 && params.stride_out_h_q % 8 == 0) {
-                for (int i = threadIdx.x; i < H*(D_V/8); i += 256) {
-                    int head = i / (D_V/8), col = (i % (D_V/8))*8;
-                    *reinterpret_cast<uint4*>(params.out + out_row + (int64_t)head*params.stride_out_h_q + col) =
-                        *reinterpret_cast<const uint4*>(sO + head*O_LD + col);
-                }
+            if constexpr (SPLIT) {
+                float* partial = params.etap_out_accum + ((int64_t)s_q_idx*params.etap_splits + split)*H*D_V + warpgroup_idx*(D_V/2);
+                Tensor gOt = make_tensor(make_gmem_ptr(partial), Shape<Int<D_V/2>, Int<H>>{}, Stride<_1, Int<D_V>>{});
+                auto thread_out = TiledMMA_PV{}.get_slice(idx_in_warpgroup).partition_C(gOt);
+                cute::copy(rOb, thread_out);
             } else {
-                for (int i = threadIdx.x; i < H*D_V; i += 256) {
-                    int head = i / D_V, col = i % D_V;
-                    params.out[out_row + (int64_t)head*params.stride_out_h_q + col] = sO[head*O_LD + col];
+                // O^T -> sO [head][dim], reusing the exchange buffer
+                {
+                    Tensor sOt = make_tensor(make_smem_ptr(plan.epilogue.o + warpgroup_idx*(D_V/2)), SmemLayoutOTransposed{});
+                    auto r2s_copy = make_tiled_copy_C(Copy_Atom<STSM_T, bf16>{}, TiledMMA_PV{});
+                    ThrCopy thr_copy = r2s_copy.get_slice(idx_in_warpgroup);
+                    cute::copy(r2s_copy, thr_copy.retile_S(rOb), thr_copy.partition_D(sOt));
+                }
+                NamedBarrier::arrive_and_wait(256, NamedBarriers::epilogue_sync);
+
+                // `out` may be a head slice of a padded buffer, so index through the
+                // output strides; the vector path additionally needs 16B-aligned rows.
+                // The next query's epilogue only rewrites the buffer after its first
+                // epilogue barrier, which both warpgroups reach after this store.
+                const bf16* sO = plan.epilogue.o;
+                const int64_t out_row = (int64_t)s_q_idx*params.stride_out_s_q;
+                if ((reinterpret_cast<uintptr_t>(params.out) & 15) == 0 && params.stride_out_s_q % 8 == 0 && params.stride_out_h_q % 8 == 0) {
+                    for (int i = threadIdx.x; i < H*(D_V/8); i += 256) {
+                        int head = i / (D_V/8), col = (i % (D_V/8))*8;
+                        *reinterpret_cast<uint4*>(params.out + out_row + (int64_t)head*params.stride_out_h_q + col) =
+                            *reinterpret_cast<const uint4*>(sO + head*O_LD + col);
+                    }
+                } else {
+                    for (int i = threadIdx.x; i < H*D_V; i += 256) {
+                        int head = i / D_V, col = i % D_V;
+                        params.out[out_row + (int64_t)head*params.stride_out_h_q + col] = sO[head*O_LD + col];
+                    }
                 }
             }
         }
@@ -416,9 +431,14 @@ static __device__ __forceinline__ void devfunc(const SparseAttnFwdParams &params
         bool is_first_query = true;
 
         CUTE_NO_UNROLL
-        for (int s_q_idx = blockIdx.x; s_q_idx < params.s_q; s_q_idx += gridDim.x) {
+        for (int s_q_idx = SPLIT ? blockIdx.x / params.etap_splits : blockIdx.x;
+             s_q_idx < params.s_q; s_q_idx += SPLIT ? params.s_q : gridDim.x) {
             const int topk_length = get_topk_length(params, s_q_idx);
-            const int num_blocks = ku::ceil_div(topk_length, (int)B_TOPK);
+            const int total_blocks = ku::ceil_div(topk_length, (int)B_TOPK);
+            const int split = SPLIT ? blockIdx.x % params.etap_splits : 0;
+            const int first_block = SPLIT ? int((int64_t)total_blocks * split / params.etap_splits) : 0;
+            const int end_block = SPLIT ? int((int64_t)total_blocks * (split + 1) / params.etap_splits) : total_blocks;
+            const int num_blocks = end_block - first_block;
             const int* gIndices = params.indices + (int64_t)s_q_idx*params.stride_indices_s_q;
 
             // Q is free once both math warpgroups have issued their last QK of the previous query
@@ -436,7 +456,7 @@ static __device__ __forceinline__ void devfunc(const SparseAttnFwdParams &params
                 bool is_token_valid[NUM_ROWS_PER_GROUP];
                 CUTE_UNROLL
                 for (int local_row = 0; local_row < NUM_ROWS_PER_GROUP; ++local_row) {
-                    int offs = block_idx*B_TOPK + local_row*NUM_GROUPS + group_idx;
+                    int offs = (first_block + block_idx)*B_TOPK + local_row*NUM_GROUPS + group_idx;
                     int t = offs < topk_length ? __ldg(gIndices + offs) : -1;
                     is_token_valid[local_row] = t >= 0 && t < params.s_kv;
                     token_offsets[local_row] = is_token_valid[local_row] ? t*(int64_t)params.stride_kv_s_kv : 0;
@@ -500,29 +520,75 @@ static __device__ __forceinline__ void devfunc(const SparseAttnFwdParams &params
 
 template<typename Kernel>
 __global__ void __launch_bounds__(Kernel::NUM_THREADS, 1, 1)
-sparse_attn_fwd_etap_kernel(__grid_constant__ const SparseAttnFwdParams params) {
+sparse_attn_fwd_etap_kernel(__grid_constant__ const EtapSplitParams params) {
     Kernel::devfunc(params);
 }
 
-template<int D_QK, int H, bool HAVE_TOPK_LENGTH>
-void launch_etap(const SparseAttnFwdParams& params) {
-    using Kernel = EtapKernel<D_QK, H, HAVE_TOPK_LENGTH>;
+template<int H>
+__global__ void combine_etap_splits(__grid_constant__ const EtapSplitParams params) {
+    constexpr int D_V = 512;
+    const int query = blockIdx.x / H, head = blockIdx.x % H;
+    const int tid = threadIdx.x;
+    __shared__ float weights[32];
+    if (tid < 32) {
+        const int64_t offset = ((int64_t)query*params.etap_splits + tid)*H + head;
+        float lse = tid < params.etap_splits ? params.etap_lse_accum[offset] : -CUDART_INF_F;
+        float max_lse = lse;
+        float maximum = tid < params.etap_splits ? params.etap_max_accum[offset] : -CUDART_INF_F;
+        for (int delta = 16; delta; delta /= 2) {
+            max_lse = fmaxf(max_lse, __shfl_xor_sync(0xffffffff, max_lse, delta));
+            maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, delta));
+        }
+        const bool empty = maximum == -CUDART_INF_F;
+        float weight = empty ? 0.0f : expf(lse - max_lse);
+        float sum = weight;
+        for (int delta = 16; delta; delta /= 2)
+            sum += __shfl_xor_sync(0xffffffff, sum, delta);
+        if (tid == 0) {
+            params.max_logits[(int64_t)query*H + head] = maximum;
+            params.lse[(int64_t)query*H + head] = empty ? CUDART_INF_F : max_lse + logf(sum);
+        }
+        if (!empty && params.attn_sink != nullptr)
+            sum += expf(params.attn_sink[head] - max_lse);
+        weights[tid] = empty ? 0.0f : weight / sum;
+    }
+    __syncthreads();
+    for (int dim = tid; dim < D_V; dim += blockDim.x) {
+        float result = 0.0f;
+        for (int split = 0; split < params.etap_splits; ++split) {
+            const int64_t offset = (((int64_t)query*params.etap_splits + split)*H + head)*D_V + dim;
+            result += weights[split] * params.etap_out_accum[offset];
+        }
+        params.out[(int64_t)query*params.stride_out_s_q + (int64_t)head*params.stride_out_h_q + dim] = bf16(result);
+    }
+}
+
+template<int D_QK, int H, bool HAVE_TOPK_LENGTH, bool SPLIT = false>
+void launch_etap(const EtapSplitParams& params) {
+    using Kernel = EtapKernel<D_QK, H, HAVE_TOPK_LENGTH, SPLIT>;
     auto kernel = &sparse_attn_fwd_etap_kernel<Kernel>;
     constexpr size_t smem_size = sizeof(typename Kernel::SharedMemoryPlan);
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    // Persistent: one CTA per SM walks over the queries
-    kernel<<<std::min(params.s_q, params.num_sm), Kernel::NUM_THREADS, smem_size, params.stream>>>(params);
+    // Unsplit CTAs walk over queries; split CTAs own one (query, partition).
+    const int blocks = SPLIT ? params.s_q*params.etap_splits : std::min(params.s_q, params.num_sm);
+    kernel<<<blocks, Kernel::NUM_THREADS, smem_size, params.stream>>>(params);
     KU_CHECK_KERNEL_LAUNCH();
+    if constexpr (SPLIT) {
+        combine_etap_splits<H><<<params.s_q*H, 128, 0, params.stream>>>(params);
+        KU_CHECK_KERNEL_LAUNCH();
+    }
 }
 
 template<int D_QK, bool HAVE_TOPK_LENGTH>
-void run_etap(const SparseAttnFwdParams& params) {
+void run_etap(const EtapSplitParams& params) {
     KU_ASSERT(params.d_qk == D_QK && params.d_v == 512 && params.h_kv == 1);
     if (params.s_q == 0) return;
     if (params.h_q == 8) {
-        launch_etap<D_QK, 8, HAVE_TOPK_LENGTH>(params);
+        if (params.etap_splits > 1) launch_etap<D_QK, 8, HAVE_TOPK_LENGTH, true>(params);
+        else launch_etap<D_QK, 8, HAVE_TOPK_LENGTH>(params);
     } else if (params.h_q == 16) {
-        launch_etap<D_QK, 16, HAVE_TOPK_LENGTH>(params);
+        if (params.etap_splits > 1) launch_etap<D_QK, 16, HAVE_TOPK_LENGTH, true>(params);
+        else launch_etap<D_QK, 16, HAVE_TOPK_LENGTH>(params);
     } else {
         KU_ASSERT(params.h_q == 32);
         launch_etap<D_QK, 32, HAVE_TOPK_LENGTH>(params);

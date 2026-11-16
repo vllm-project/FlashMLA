@@ -658,10 +658,15 @@ void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
             run_small_heads<D_QK, HAVE_TOPK_LENGTH>(params);
             return;
         }
-        run_etap<D_QK, HAVE_TOPK_LENGTH>(params);
+        run_etap<D_QK, HAVE_TOPK_LENGTH>(EtapSplitParams{params});
     } else {
         KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::run(params);
     }
+}
+
+template<int D_QK, bool HAVE_TOPK_LENGTH>
+void run_etap_split_kernel(const EtapSplitParams& params) {
+    run_etap<D_QK, HAVE_TOPK_LENGTH>(params);
 }
 
 }
