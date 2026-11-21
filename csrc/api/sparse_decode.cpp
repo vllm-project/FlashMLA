@@ -8,6 +8,9 @@
 #include "cuda_kernels/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
 #include "cuda_kernels/smxx/decode/combine/combine.h"
 
+// SM120 native kernels (register-file mma.sync)
+#include "cuda_kernels/sm120/decode/sparse/splitkv_mla.h"
+
 // Kernels for the KV cache formats and the architecture that upstream dropped in 2026.09.30
 #include "cuda_kernels/legacy/sm90/decode/sparse/splitkv_mla.h"
 #include "cuda_kernels/legacy/sm100/decode/sparse/head64/kernel.h"
@@ -139,6 +142,42 @@ protected:
             DISPATCH_BOOLEAN_FLAG(params.enable_split_kv, ENABLE_SPLIT_KV, ([&]() {
                 sm100::prefill::sparse_fwd_for_small_topk::head128::run_sparse_fwd_for_small_topk_phase1_kernel<get_decode_fwd_mode<ENABLE_SPLIT_KV>(), MODEL_TYPE, EXTRA_MODEL_TYPE>(hotfixed_params);
             }));
+        });
+    }
+};
+
+// register mma.sync sparse decode (no tcgen05/wgmma on sm_120a).
+class Decode_Sm120_Impl : public DecodeImplBase {
+    DECLARE_SUPPORTED_FEATURES(
+        DecodeFeatures::HEAD_64,
+        DecodeFeatures::HEAD_128,
+        DecodeFeatures::HEAD_DIM_512,
+        DecodeFeatures::HEAD_DIM_576,
+        DecodeFeatures::V32_KVCACHE_FORMAT,
+        DecodeFeatures::V4_KVCACHE_FORMAT,
+        DecodeFeatures::ATTN_SINK,
+        DecodeFeatures::TOPK_LENGTH,
+        DecodeFeatures::EXTRA_KVCACHE,
+        DecodeFeatures::EXTRA_TOPK_LENGTH
+        // No BATCH_INVARIANT: not exercised on SM120
+    )
+
+public:
+    DecodeImplMeta get_meta(int h_q, int s_q) override {
+        Arch arch = Arch();
+        return {
+            std::max(arch.num_sms / s_q / (h_q/64), 1),
+            5,
+            64
+        };
+    }
+
+protected:
+    void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
+        DISPATCH_MODEL_TYPE(params.model_type, MODEL_TYPE, [&]() {
+            DISPATCH_NUM_HEADS(params.h_q, NUM_HEADS, [&]() {
+                sm120::decode::sparse::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE, NUM_HEADS>(params);
+            });
         });
     }
 };
@@ -585,6 +624,8 @@ sparse_attn_decode_interface(
         } else {
             STD_TORCH_CHECK(false, "Unsupported h_q: ", h_q);
         }
+    } else if (arch.is_sm120()) {
+        impl = new Decode_Sm120_Impl();
     } else if (arch.is_sm90a()) {
         impl = new Decode_Sm90_Impl();
     } else {

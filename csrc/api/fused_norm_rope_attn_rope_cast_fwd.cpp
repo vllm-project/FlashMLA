@@ -9,6 +9,11 @@
 // The V4 decode kernel, which upstream dropped in the 2026.09.30 release
 #include "cuda_kernels/legacy/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.h"
 
+// SM120 native kernels (register-file mma.sync)
+#include "cuda_kernels/sm120/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_q_b_proj/kernel.h"
+#include "cuda_kernels/sm120/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_wv_proj/kernel.h"
+#include "cuda_kernels/sm120/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.h"
+
 using bf16 = cutlass::bfloat16_t;
 
 using Params = sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::ParamT<SparseAttnFwdMode::Prefill>;
@@ -128,7 +133,8 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
 ) {
     Arch arch = Arch();
     bool is_sm100f = arch.is_sm100f();
-    STD_TORCH_CHECK(is_sm100f, "Fused Norm + RoPE + Core Attn + RoPE + Cast (fused_norm_rope_attn_rope_cast_fwd) is only supported on SM100f architectures.");
+    bool is_sm120 = arch.is_sm120();
+    STD_TORCH_CHECK(is_sm100f || is_sm120, "Fused Norm + RoPE + Core Attn + RoPE + Cast (fused_norm_rope_attn_rope_cast_fwd) is only supported on SM100f / SM120a architectures.");
 
     KU_CHECK_NDIM(q, 3);
     KU_CHECK_NDIM(kv, 3);
@@ -246,8 +252,13 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     STD_TORCH_CHECK(h_q == 64 || h_q == 128, "Only h_q == 64 or 128 is supported for fused_norm_rope_attn_rope_cast_fwd, got ", h_q);
     DISPATCH_NUM_HEADS(h_q, H_Q, ([&]() {
         DISPATCH_BOOLEAN_FLAG(enable_q_norm, ENABLE_Q_NORM, ([&]() {
-            // The KV of a prefill is bf16, so the KV cache format is inert and V4 uses this kernel too
-            sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Prefill, ModelType::V41, ModelType::V41, H_Q, ENABLE_Q_NORM}>(params);
+            // The KV of a prefill is bf16, so the KV cache format is inert. The SM120 kernels are
+            // instantiated with V4 (the format they were verified with); the SM100 ones take V41.
+            if (is_sm120) {
+                sm120::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel_sm120<Config{SparseAttnFwdMode::Prefill, ModelType::V4, ModelType::V4, H_Q, ENABLE_Q_NORM}>(params);
+            } else {
+                sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Prefill, ModelType::V41, ModelType::V41, H_Q, ENABLE_Q_NORM}>(params);
+            }
         }));
     }));
 
@@ -282,7 +293,9 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
     const std::optional<Tensor> &out_sf_
 ) {
     Arch arch = Arch();
-    STD_TORCH_CHECK(arch.is_sm100f(), "Fused Norm + RoPE + Core Attn + RoPE + Cast (fused_norm_rope_attn_rope_cast_decode) is only supported on SM100f architectures.");
+    bool is_sm100f = arch.is_sm100f();
+    bool is_sm120 = arch.is_sm120();
+    STD_TORCH_CHECK(is_sm100f || is_sm120, "Fused Norm + RoPE + Core Attn + RoPE + Cast (fused_norm_rope_attn_rope_cast_decode) is only supported on SM100f / SM120a architectures.");
 
     KU_CHECK_NDIM(q, 3);
     KU_CHECK_NDIM(kv, 4);
@@ -470,15 +483,33 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
 
     DISPATCH_NUM_HEADS(h_q, H_Q, ([&]() {
         DISPATCH_BOOLEAN_FLAG(enable_q_norm, ENABLE_Q_NORM, ([&]() {
-            if (extra_model_type == ModelType::V41_FP4) {
-                sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Decode, ModelType::V41, ModelType::V41_FP4, H_Q, ENABLE_Q_NORM}>(params);
-            } else if (model_type == ModelType::V4) {
-                legacy::sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<LegacyConfig{SparseAttnFwdMode::Decode, ModelType::V4, ModelType::V4, H_Q, ENABLE_Q_NORM}>(params);
-            } else if (model_type == ModelType::V41) {
-                sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Decode, ModelType::V41, ModelType::V41, H_Q, ENABLE_Q_NORM}>(params);
-            } else {
-                STD_TORCH_CHECK(false, "Unsupported model_type: ", get_dynamic_enum_name(model_type));
-            }
+            // The Config template args must be compile-time constants, so the
+            // (kv, extra_kv) format combination is dispatched with explicit
+            // branches; the arch only selects the sm100/sm120 implementation.
+            auto run = [&](bool use_sm120, ModelType mt, ModelType xt) {
+                if (mt == ModelType::V41 && xt == ModelType::V41_FP4) {
+                    if (use_sm120) {
+                        sm120::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel_sm120<Config{SparseAttnFwdMode::Decode, ModelType::V41, ModelType::V41_FP4, H_Q, ENABLE_Q_NORM}>(params);
+                    } else {
+                        sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Decode, ModelType::V41, ModelType::V41_FP4, H_Q, ENABLE_Q_NORM}>(params);
+                    }
+                } else if (mt == ModelType::V4) {
+                    if (use_sm120) {
+                        sm120::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel_sm120<Config{SparseAttnFwdMode::Decode, ModelType::V4, ModelType::V4, H_Q, ENABLE_Q_NORM}>(params);
+                    } else {
+                        legacy::sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<LegacyConfig{SparseAttnFwdMode::Decode, ModelType::V4, ModelType::V4, H_Q, ENABLE_Q_NORM}>(params);
+                    }
+                } else if (mt == ModelType::V41) {
+                    if (use_sm120) {
+                        sm120::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel_sm120<Config{SparseAttnFwdMode::Decode, ModelType::V41, ModelType::V41, H_Q, ENABLE_Q_NORM}>(params);
+                    } else {
+                        sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Decode, ModelType::V41, ModelType::V41, H_Q, ENABLE_Q_NORM}>(params);
+                    }
+                } else {
+                    STD_TORCH_CHECK(false, "Unsupported model_type: ", get_dynamic_enum_name(mt));
+                }
+            };
+            run(is_sm120, model_type, extra_model_type);
         }));
     }));
 
@@ -539,7 +570,30 @@ std::vector<Tensor> permute_q_b_proj(
         get_current_cuda_stream(q_b_proj),
     };
 
-    sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::permute_q_b_proj::run_permute_q_b_proj_kernel(params);
+    Arch arch = Arch();
+    if (arch.is_sm120()) {
+        sm120::prefill::fused_norm_rope_attn_rope_cast_fwd::permute_q_b_proj::Params params = {
+            (uint32_t)h_q,
+            (uint32_t)d_q,
+            (uint32_t)q_lora_rank,
+            (uint32_t)gran,
+
+            (fp8_e4m3*)q_b_proj.data_ptr(),
+            (uint64_t)q_b_proj.stride(0),
+            (int32_t*)scale_factors.data_ptr(),
+            (uint64_t)scale_factors.stride(1),
+
+            (fp8_e4m3*)q_b_proj_permuted.data_ptr(),
+            (uint64_t)q_b_proj_permuted.stride(0),
+            (int32_t*)scale_factors_permuted.data_ptr(),
+            (uint64_t)scale_factors_permuted.stride(1),
+
+            get_current_cuda_stream(q_b_proj),
+        };
+        sm120::prefill::fused_norm_rope_attn_rope_cast_fwd::permute_q_b_proj::run_permute_q_b_proj_kernel(params);
+    } else {
+        sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::permute_q_b_proj::run_permute_q_b_proj_kernel(params);
+    }
 
     return {q_b_proj_permuted, scale_factors_permuted};
 }
@@ -603,7 +657,35 @@ std::vector<Tensor> permute_wv_proj(
         get_current_cuda_stream(wv_proj),
     };
 
-    sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::permute_wv_proj::run_permute_wv_proj_kernel(params);
+    Arch arch = Arch();
+    if (arch.is_sm120()) {
+        sm120::prefill::fused_norm_rope_attn_rope_cast_fwd::permute_wv_proj::Params params = {
+            (uint32_t)d_o,
+            (uint32_t)input_gran,
+            (uint32_t)wv_group_size,
+            (uint32_t)n_wv_group,
+            (uint32_t)d_proj_out,
+
+            (fp8_e4m3*)wv_proj.data_ptr(),
+            (uint64_t)wv_proj.stride(0),
+            (uint64_t)wv_proj.stride(1),
+            (int32_t*)scale_factors.data_ptr(),
+            (uint64_t)scale_factors.stride(0),
+            (uint64_t)scale_factors.stride(2),
+
+            (fp8_e4m3*)wv_proj_permuted.data_ptr(),
+            (uint64_t)wv_proj_permuted.stride(0),
+            (uint64_t)wv_proj_permuted.stride(1),
+            (int32_t*)scale_factors_permuted.data_ptr(),
+            (uint64_t)scale_factors_permuted.stride(0),
+            (uint64_t)scale_factors_permuted.stride(2),
+
+            get_current_cuda_stream(wv_proj),
+        };
+        sm120::prefill::fused_norm_rope_attn_rope_cast_fwd::permute_wv_proj::run_permute_wv_proj_kernel(params);
+    } else {
+        sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::permute_wv_proj::run_permute_wv_proj_kernel(params);
+    }
 
     return {wv_proj_permuted, scale_factors_permuted};
 }

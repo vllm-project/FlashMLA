@@ -11,3 +11,6 @@ compile_commands.json
 /dev
 /.clangd
 /.venv/
+
+# SM120 probe build products
+docs/20261027-sm120-perf-probes/results/

@@ -7,6 +7,8 @@
 #include "common/mask.cuh"
 #include "common/utils.hpp"
 
+#include <kerutils/supplemental/device_prop.h>
+
 #include "fmha_cutlass_bwd_sm100.cuh"
 
 template<class Mask, class Varlen, class Element, class ElementOut, class Mla>
@@ -34,6 +36,16 @@ void FMHACutlassSM100BwdRun(torch::stable::Tensor workspace_buffer, torch::stabl
                             int64_t mask_mode_code, double softmax_scale, int64_t max_seqlen_q, int64_t max_seqlen_kv, bool is_varlen) {
 
   const torch::stable::accelerator::DeviceGuard device_guard(q.get_device_index());
+  // Dense prefill bwd (CUTLASS SM100 FMHA) is only implemented for SM100
+  // (compute capability 10.x); the SM120 dense prefill is forward-only.
+  {
+    const cudaDeviceProp& prop = kerutils::get_cached_device_prop();
+    if (prop.major == 12) {
+      STD_TORCH_CHECK(false, "Dense prefill bwd (FMHA) is not supported on SM120");
+    }
+    STD_TORCH_CHECK(prop.major == 10, "Dense prefill bwd (FMHA) is only supported on SM100 (compute capability 10.x); found ",
+                    prop.major, ".", prop.minor);
+  }
 
   int head_dim_qk = q.size(-1);
   int head_dim_vo = v.size(-1);

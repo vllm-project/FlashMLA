@@ -1,3 +1,4 @@
+import os
 from typing import List
 
 import torch
@@ -35,6 +36,17 @@ def check_is_allclose(name: str, ans: torch.Tensor, ref: torch.Tensor, abs_tol: 
     """
     assert ans.shape == ref.shape, f"`{name}` Shape mismatch: {ans.shape} vs {ref.shape}"
     assert ans.dtype == ref.dtype, f"`{name}` Dtype mismatch: {ans.dtype} vs {ref.dtype}"
+
+    # FLASH_MLA_FP8_TOL=1 widens to the fp8 gate documented in
+    # docs/20261027-sm120-perf-plan.md (out: abs 3e-2 / cos 1e-2; lse: abs 2e-1,
+    # because log(sum exp) multiplies S's error by the row's max). Only ever widens.
+    if os.environ.get("FLASH_MLA_FP8_TOL"):
+        if name == "lse":
+            abs_tol = max(abs_tol, 2e-1)
+            cos_diff_tol = max(cos_diff_tol, 1e-4)
+        else:
+            abs_tol = max(abs_tol, 3e-2)
+            cos_diff_tol = max(cos_diff_tol, 1e-2)
     
     ans = ans.clone().to(torch.float)
     ref = ref.clone().to(torch.float)
