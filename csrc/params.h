@@ -59,6 +59,11 @@ enum class SparseAttnFwdMode {
 template<SparseAttnFwdMode FWD_MODE>
 inline constexpr bool is_decode_v = FWD_MODE == SparseAttnFwdMode::Decode || FWD_MODE == SparseAttnFwdMode::DecodeWithSplitKV;
 
+// Head counts handled by the SM90 small-heads prefill kernel.
+inline constexpr bool is_sm90_small_heads_h_q(int h_q) {
+    return h_q == 8 || h_q == 16 || h_q == 32;
+}
+
 // Parameters for the sparse attention forward pass kernel (prefill).
 struct SparseAttnFwdParams {
     int s_q, s_kv, h_q, h_kv, d_qk, d_v, topk;
@@ -81,6 +86,10 @@ struct SparseAttnFwdParams {
     FLASH_MLA_GM bf16* __restrict__ out;   // [s_q, h_q, d_v], attention output
     FLASH_MLA_GM float* __restrict__ max_logits; // [s_q, h_q], per-head max attention logit (for numerical stability)
     FLASH_MLA_GM float* __restrict__ lse; // [s_q, h_q], log-sum-exp of attention scores
+
+    // Used by SM90 small-heads prefill to write into padded head slices.
+    // Other prefill kernels still require contiguous output.
+    int stride_out_s_q, stride_out_h_q;
 
     SparseAttnFwdMode mode;     // Which forward mode to use (Prefill / Decode / DecodeWithSplitKV)
     int num_sm;                 // Number of SMs available for this kernel launch

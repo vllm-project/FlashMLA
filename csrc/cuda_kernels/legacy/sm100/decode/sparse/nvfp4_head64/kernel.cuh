@@ -312,6 +312,7 @@ KernelTemplate<MODEL_TYPE>
             }
 
             // Exchange li
+            NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
             plan.rowwise_max_buf[idx_in_warpgroup] = li;
             NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
             li += plan.rowwise_max_buf[idx_in_warpgroup^64];

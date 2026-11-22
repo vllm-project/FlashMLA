@@ -165,7 +165,7 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     KU_CHECK_DTYPE(indices, ScalarType::Int);
     KU_CHECK_DTYPE(attn_sink, ScalarType::Float);
     KU_CHECK_DTYPE(topk_length, ScalarType::Int);
-    KU_CHECK_DTYPE(token_positions, ScalarType::Int);
+    KU_CHECK_DTYPE(token_positions, ScalarType::Long);
     KU_CHECK_DTYPE(cos_sin_cache, ScalarType::Float);
     
     KU_CHECK_SHAPE(q, s_q, h_q, d_qk);
@@ -216,13 +216,16 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
         (float*)max_logits.data_ptr(),
         (float*)lse.data_ptr(),
 
+        // BF16 out is unused; the fused path has its own FP8 output strides.
+        0, 0,
+
         SparseAttnFwdMode::Prefill,
         arch.num_sms,
         get_current_cuda_stream(q),
 
         enable_q_norm,
         rms_norm_eps,
-        (uint32_t*)token_positions.data_ptr(),
+        (int64_t*)token_positions.data_ptr(),
         is_rope_neox_style,
         rope_dim,
         (float*)cos_sin_cache.data_ptr(),
@@ -356,7 +359,7 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
     KU_CHECK_DTYPE(topk_length, ScalarType::Int);
     KU_CHECK_DTYPE(extra_indices, ScalarType::Int);
     KU_CHECK_DTYPE(extra_topk_length, ScalarType::Int);
-    KU_CHECK_DTYPE(token_positions, ScalarType::Int);
+    KU_CHECK_DTYPE(token_positions, ScalarType::Long);
     KU_CHECK_DTYPE(cos_sin_cache, ScalarType::Float);
 
     // Check layout
@@ -447,7 +450,7 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
 
         enable_q_norm,
         rms_norm_eps,
-        (uint32_t*)token_positions.data_ptr(),
+        (int64_t*)token_positions.data_ptr(),
         is_rope_neox_style,
         rope_dim,
         (float*)cos_sin_cache.data_ptr(),

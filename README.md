@@ -459,7 +459,7 @@ And finally, to use the fused kernel:
 out_fp8, out_sf, max_logits, lse = fused_norm_rope_attn_rope_cast.prefill(
     enable_q_norm,              # False for DeepSeek-V4.1
     rms_norm_eps,               # e.g. 1e-4
-    token_positions,            # [s_q], int32
+    token_positions,            # [s_q], int64
     False, 64, cos_sin_cache,   # non-neox RoPE with rope_dim = 64
     n_wv_group,                 # h_q // wv_group_size
     32,                         # num_per_channels
