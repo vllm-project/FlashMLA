@@ -75,10 +75,14 @@ void FMHACutlassSM100BwdRun(torch::stable::Tensor workspace_buffer, torch::stabl
                           softmax_scale, max_seqlen_q, max_seqlen_kv);      }
       else {
         std::cout << "No kernel instantiated for head_dim_qk=" << head_dim_qk << " head_dim_vo=" << head_dim_vo << std::endl;
+        STD_TORCH_CHECK(false, "No kernel instantiated for head_dim_qk=", head_dim_qk,
+                    " head_dim_vo=", head_dim_vo,
+                    "; the dense MHA backward kernels are only instantiated for (192, 128) and (128, 128)");
       }
     });
 
   } else {
-    FLASH_MLA_ASSERT(false);
+    STD_TORCH_CHECK(false, "The dense MHA backward kernels only support bfloat16 inputs and outputs, got q.dtype()=",
+                q.scalar_type(), " and o.dtype()=", o.scalar_type());
   }
 }

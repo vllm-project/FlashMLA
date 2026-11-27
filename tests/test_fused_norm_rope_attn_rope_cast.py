@@ -18,48 +18,10 @@ import ref
 
 import flash_mla
 
-# FMA with double precision is necessary for numerical consistency of fused ref
-_GET_FMA_KERNEL = None
+# Explicit FMA is necessary for numerical consistency of fused ref
 def _fma(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-    global _GET_FMA_KERNEL
     assert a.numel() == b.numel() == c.numel()
-    if _GET_FMA_KERNEL is None:
-        import tilelang
-        from tilelang import language as T
-        @tilelang.jit(
-            pass_configs={
-                tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-                tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
-            },
-        )
-        def _get_fma_kernel():
-            num_threads = 256
-            numel_per_cta = 1024
-            numel = T.symbolic("numel")
-            @T.prim_func
-            def fma_kernel(
-                out: T.Tensor[(numel,), torch.float32],
-                a: T.Tensor[(numel,), torch.float32],
-                b: T.Tensor[(numel,), torch.float32],
-                c: T.Tensor[(numel,), torch.float32]
-            ):
-                with T.Kernel(numel // numel_per_cta, threads=num_threads) as (tid_x, ):
-                    a_fragment = T.alloc_fragment((numel_per_cta, ), torch.float32)
-                    b_fragment = T.alloc_fragment((numel_per_cta, ), torch.float32)
-                    c_fragment = T.alloc_fragment((numel_per_cta, ), torch.float32)
-                    out_fragment = T.alloc_fragment((numel_per_cta, ), torch.float32)
-
-                    T.copy(a[tid_x * numel_per_cta], a_fragment)
-                    T.copy(b[tid_x * numel_per_cta], b_fragment)
-                    T.copy(c[tid_x * numel_per_cta], c_fragment)
-                    for i in T.Parallel(numel_per_cta):
-                        out_fragment[i] = a_fragment[i] * b_fragment[i] + c_fragment[i]
-                    T.copy(out_fragment, out[tid_x * numel_per_cta])
-            return fma_kernel
-        _GET_FMA_KERNEL = _get_fma_kernel
-    out = torch.empty_like(a).flatten()
-    _GET_FMA_KERNEL()(out, a.flatten(), b.flatten(), c.flatten())
-    return out.view_as(a)
+    return torch.addcmul(c, a, b, value=1.0)    # CUDA's `addcmul` with `value=1.0` follows IEEE's rounding rule
 
 
 def _rope_inplace(q_or_o: torch.Tensor, conjugate: bool, cos_sin_table: torch.Tensor, token_positions: torch.Tensor, rope_dim: int = 64):
@@ -206,7 +168,7 @@ def run_test(p: TestParam) -> bool:
     # TODO Make q weight non-contiguous
 
     o_scale_gran = 32
-    enable_q_norm = random.choice([False, True])
+    enable_q_norm = p.enable_q_norm
     token_positions = torch.randint(0, max_token_position, (p.s_q, ), device='cuda', dtype=torch.int64)
 
     wv_group_size = 8
@@ -318,7 +280,7 @@ def run_decode_test(p: TestParam) -> bool:
     q_b_proj, q_b_proj_permuted = get_q_b_weight(p.h_q, p.d_qk, q_lora_rank, q_b_proj_scale_gran)
 
     o_scale_gran = 32
-    enable_q_norm = random.choice([False, True])
+    enable_q_norm = p.enable_q_norm
     wv_group_size = 8
     n_wv_group = p.h_q // 8
 
@@ -412,21 +374,25 @@ if __name__ == '__main__':
     for h_q in [128, 64]:
         for s_kv, topk in [
             # Regular shapes
-            (64, 64),
-            (128, 128),
-            (256, 256),
-            (512, 512),
+            (123, 64),
+            (234, 128),
+            (345, 256),
+            (567, 512),
+            (678, 640),
+            (2930, 2048),
 
             # Irregular shapes
             (592, 120),
             (1840, 240),
-            (1521, 600),
+            (1521, 640),
             (3412, 2896),
 
             # Irregular shapes with OOB TopK
             (95, 152),
+            (95, 256),
             (153, 264),
-            (2345, 5136),
+            (153, 512),
+            (2345, 5120),
 
             (32, 2048), # Some block may be fully invalid
         ]:
@@ -445,12 +411,14 @@ if __name__ == '__main__':
                         have_topk_length=have_topk_length,
                         k_amplifier_portion=k_amplifier_portion,
                         k_amplifier_ratio=k_amplifier_ratio,
+                        enable_q_norm=enable_q_norm,
                         num_runs=0
                     )
                         for (k_amplifier_portion, k_amplifier_ratio) in [
                             (0.0, 1.0),
                             (0.02, 2**8)
                         ]
+                        for enable_q_norm in [False, True]
                     ])
                 for (b, s_q) in [(1, 1), (69, 3), (19, 80)]:
                     for extra_s_kv, extra_topk, kvcache_layout, extra_kvcache_layout in [
@@ -473,6 +441,7 @@ if __name__ == '__main__':
                         for have_extra_topk_length in [False, True]:
                             if have_extra_topk_length and extra_s_kv is None:
                                 continue
+                            enable_q_norm = ((s_kv + topk + s_q) & 0x8) > 0
                             correctness_cases_decode.append(RawTestParamForDecode(
                                 b, h_q, s_q, 1, s_kv, False, topk,
                                 is_all_indices_invalid=is_all_indices_invalid,
@@ -487,6 +456,7 @@ if __name__ == '__main__':
                                 d_qk=512,
                                 kvcache_layout=kvcache_layout,
                                 extra_kvcache_layout=extra_kvcache_layout,
+                                enable_q_norm=enable_q_norm,
                                 num_runs=0)
                             )
 
@@ -504,16 +474,23 @@ if __name__ == '__main__':
     for (d_qk, h_q, extra_topk, topk, s_kv_list, kvcache_layouts, decoding_bsz_and_s_q) in performance_case_templates:
         for s_kv in s_kv_list:
             for prefill_s_q in [4096]:
-                performance_cases_prefill.append(TestParam(prefill_s_q, s_kv, topk+extra_topk, h_q, d_qk=d_qk, have_attn_sink=True, check_correctness=True))
+                for enable_q_norm in [False, True]:
+                    performance_cases_prefill.append(TestParam(prefill_s_q, s_kv, topk+extra_topk, h_q, d_qk=d_qk, have_attn_sink=True, enable_q_norm=enable_q_norm, check_correctness=True))
             for (decoding_bsz, decoding_s_q) in decoding_bsz_and_s_q:
                 for kvcache_layout, extra_kvcache_layout in kvcache_layouts:
-                    performance_cases_decode.append(RawTestParamForDecode(
-                        decoding_bsz, h_q, decoding_s_q, 1, topk, False, topk, have_topk_length=False,
-                        extra_s_k=s_kv, extra_topk=extra_topk, extra_block_size=128,
-                        d_qk=d_qk, kvcache_layout=kvcache_layout, extra_kvcache_layout=extra_kvcache_layout))
+                    for enable_q_norm in [False, True]:
+                        performance_cases_decode.append(RawTestParamForDecode(
+                            decoding_bsz, h_q, decoding_s_q, 1, topk, False, topk, have_topk_length=False,
+                            extra_s_k=s_kv, extra_topk=extra_topk, extra_block_size=128,
+                            d_qk=d_qk, kvcache_layout=kvcache_layout, extra_kvcache_layout=extra_kvcache_layout,
+                            enable_q_norm=enable_q_norm
+                        ))
 
     # Prefill testcases
-    testcases = correctness_cases_prefill + correctness_cases_decode + performance_cases_prefill + performance_cases_decode
+    if args.perf_only:
+        testcases = performance_cases_prefill + performance_cases_decode
+    else:
+        testcases = correctness_cases_prefill + correctness_cases_decode + performance_cases_prefill + performance_cases_decode
     testcases = [
         (t.to_test_param() if isinstance(t, RawTestParamForDecode) else t)
         for t in testcases

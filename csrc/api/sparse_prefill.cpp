@@ -2,7 +2,6 @@
 
 #include "params.h"
 
-#include "cuda_kernels/sm100/prefill/sparse/fwd/head128/phase1.h"
 #include "cuda_kernels/sm100/prefill/sparse/fwd/head64/phase1.h"
 #include "cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
 
@@ -68,20 +67,8 @@ protected:
     }
 };
 
-class Fwd_Sm100_Head128_Impl : public FwdImplBase {
-    DECLARE_SUPPORTED_FEATURES(
-        FwdFeatures::HEAD_128,
-        FwdFeatures::HEAD_DIM_512,
-        FwdFeatures::ATTN_SINK,
-        FwdFeatures::TOPK_LENGTH
-    )
-
-protected:
-    void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
-        sm100::prefill::sparse_fwd::head128::run_sparse_fwd_phase1_kernel(params);
-    }
-};
-
+// The only head-128 kernel for d_qk = 512, whatever the topk: upstream removed the regular
+// head-128 prefill kernel, which used to take topk > 1280, in favour of this one.
 class Fwd_Sm100_Head128_Small_TopK_Impl : public FwdImplBase {
     DECLARE_SUPPORTED_FEATURES(
         FwdFeatures::HEAD_128,
@@ -168,6 +155,11 @@ std::vector<Tensor> sparse_attn_prefill_interface(
 
     STD_TORCH_CHECK(d_qk == 576 || d_qk == 512, "Invalid d_qk: ", d_qk);
     STD_TORCH_CHECK(d_v == 512, "Invalid d_v", d_v);
+    if (is_sm100f && d_qk == 512) {
+        // The current (non-legacy) SM100 kernels walk the topk axis in B_TOPK-sized blocks and skip
+        // the bound check on `indices`
+        STD_TORCH_CHECK(topk % 64 == 0, "topk must be a multiple of 64, got ", topk);
+    }
 
     KU_CHECK_DEVICE(q);
     KU_CHECK_DEVICE(kv);
@@ -285,20 +277,8 @@ std::vector<Tensor> sparse_attn_prefill_interface(
                 Fwd_Sm100_Head128_HeadDim576_Impl fwd_impl;
                 fwd_impl.run(params, required_features);
             } else {
-                Fwd_Sm100_Head128_Small_TopK_Impl small_topk_impl;
-                Fwd_Sm100_Head128_Impl regular_impl;
-                bool use_small_topk_impl = false;
-                if (
-                    (topk <= 1280 && small_topk_impl.check_if_all_features_are_supported(required_features)) ||
-                    !regular_impl.check_if_all_features_are_supported(required_features)
-                ) {
-                    use_small_topk_impl = true;
-                }
-                if (use_small_topk_impl) {
-                    small_topk_impl.run(params, required_features);
-                } else {
-                    regular_impl.run(params, required_features);
-                }
+                Fwd_Sm100_Head128_Small_TopK_Impl fwd_impl;
+                fwd_impl.run(params, required_features);
             }
         } else {
             STD_TORCH_CHECK(false, "Unsupported h_q: ", h_q);

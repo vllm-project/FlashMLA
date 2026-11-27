@@ -54,7 +54,7 @@
 #include <torch/headeronly/util/Exception.h>
 #include <cuda_runtime.h>
 
-#include <kerutils/supplemental/cuda_stream.h>
+#include "device_stream.h"
 
 using namespace cute;
 using namespace cutlass::fmha::kernel;
@@ -106,7 +106,7 @@ struct BwdRunner {
     const int device_id = q.get_device_index();
 
     cutlass::KernelHardwareInfo hw_info;
-    hw_info.device_id = device_id;
+    hw_info.device_id =device_id;
     hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
     ProblemShape problem_shape;
     cute::tuple<int, int, int, int, cute::tuple<int, int>> tensor_shape;
@@ -188,7 +188,7 @@ struct BwdRunner {
 
     CUTLASS_CHECK(op.can_implement(arguments));
     CUTLASS_CHECK(op.initialize(arguments, workspace_ptr));
-    CUTLASS_CHECK(op.run(kerutils::get_current_cuda_stream(q)));
+    CUTLASS_CHECK(op.run(get_current_stream()));
   }
 
 };

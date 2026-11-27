@@ -46,6 +46,7 @@ class TestParam:
     decode: Optional[ExtraTestParamForDecode] = None
     k_amplifier_portion: float = 0.0        # Amplify a portion of the KV tokens to create a more skewed attention distribution
     k_amplifier_ratio: float = 1.0          # Amplification ratio for the amplified KV tokens
+    enable_q_norm: bool = False             # Only used by the fused norm+RoPE+attn+RoPE+cast kernel
 
 @dataclasses.dataclass
 class RawTestParamForDecode:
@@ -77,6 +78,7 @@ class RawTestParamForDecode:
     check_correctness: bool = True
     num_runs: int = 10
     seed: int = -1
+    enable_q_norm: bool = False    # Only used by the fused norm+RoPE+attn+RoPE+cast kernel
 
     def to_test_param(self) -> TestParam:
         return TestParam(
@@ -91,7 +93,8 @@ class RawTestParamForDecode:
                 self.extra_s_k, self.extra_topk,
                 self.block_size, self.extra_block_size, self.have_extra_topk_length,
                 self.kvcache_layout, self.extra_kvcache_layout
-            )
+            ),
+            enable_q_norm = self.enable_q_norm,
         )
     
 @dataclasses.dataclass
@@ -430,3 +433,4 @@ def is_no_cooldown() -> bool:
 def stick_unit_test_args(parser: argparse.ArgumentParser):
     parser.add_argument("-nc", "--no-cooldown", action="store_true", help="Don't call time.sleep() before performance testcases")
     parser.add_argument("-rf", "--run-to-finish", action="store_true", help="Don't exit when a testcase is failed")
+    parser.add_argument("-pf", "--perf-only", action="store_true", help="Only run performance testcases")
