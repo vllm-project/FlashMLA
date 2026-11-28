@@ -30,6 +30,58 @@ This repository is [vLLM](https://github.com/vllm-project/vllm)'s fork of [deeps
 - **Robustness fixes.** Thread-safe cached device properties and a stable-ABI stream helper in `csrc/3rdparty/kerutils/include/kerutils/supplemental/` (shared with `csrc/extension/`), plus fixes to the dense FP8 decoding metadata (for example `num_sm_parts` is clamped to at least 1). The split-KV combine kernel keeps the 192 / 224 / 256 bucket ladder from upstream's #199, which the 2026.09.30 release dropped.
 - **Tests.** `tests/test_api_registration.py`, `tests/test_output_buffer_api.py`, `tests/test_nvfp4_quant.py` and `tests/test_fused_optional_out.py`, plus NVFP4 cases in `tests/test_flash_mla_sparse_decoding.py`. The upstream test files that were renamed in the 2026.09.30 release keep their previous names here.
 
+### BF16 ETAP split-KV on Hopper
+
+For `flash_mla_sparse_fwd` with 8 or 16 query heads, ETAP can distribute one
+query's selected KV rows across multiple CUDA blocks. Each block processes a
+disjoint interval of 64-key tiles, then a second kernel combines the partial
+results. This targets long KV rows with too few queries to fill the GPU.
+Batches with more than 32 queries keep the unsplit path. The 32/64/128-head
+paths and the FP8 sparse decoding operator are unchanged.
+
+The partial output is normalized in FP32. If partition `p` returns `O_p` and
+`L_p = log(sum(exp(scores_p)))`, the merge uses
+`O = sum(exp(L_p - L) * O_p)` with `L = logsumexp(L_p)`. An attention sink adds
+one term to the final denominator. As in the unsplit API, returned `max_logits`
+and `lse` describe the key scores and exclude the sink. An empty row returns
+zero output, `max_logits = -inf`, and `lse = +inf`.
+
+Automatic splitting is enabled during CUDA Graph capture on the tested H20
+and H100 SXM devices for full-width index rows with `topk >= 1024`.
+Eager calls stay unsplit: allocation and merge launch costs can outweigh the
+GPU speedup. Rows with `640 <= topk < 1024`
+also use splitting when at least four partitions fit. The partition count is
+the largest power of two bounded by
+`min(32, num_sms / num_queries, topk / 128)`. With a `topk_length` tensor,
+automatic selection keeps the unsplit path: a wide index row may have very few
+valid keys, and reading lengths on the CPU would synchronize the GPU.
+
+`FLASH_MLA_ETAP_SPLITS=1` disables splitting. An integer from 2 to 32 opts into
+splitting on SM90, including calls with `topk_length`, and limits the partition
+count; the occupancy and tile-count bounds still apply. This is useful for
+callers that know their rows are long, and for baseline comparisons. The
+existing `USE_MMA_FOR_SMALL_N_HEAD` override takes precedence. Set these
+variables before CUDA Graph capture; changing them does not change an already
+captured graph. There are no host reads of the length tensor.
+
+Run the total attention-plus-merge benchmark with FlashInfer installed:
+
+```bash
+.venv/bin/python benchmark/benchmark_etap_split_kv.py \
+  --tokens 1 8 32 64 --heads 8 16 --dims 512 576 \
+  --topk 128 640 2176 8192 --split-limits 1 0 16 \
+  --rounds 3 --repeats 30 --output etap.csv
+```
+
+`0` in the benchmark selects automatic dispatch. Use `--lengths full_tensor`
+to compare the explicit length-tensor path, or `ramp`, `one`, and `empty` for
+short-row cases. `--kv-layout disjoint` gives each query independent KV rows,
+matching independent decode requests; `shared` uses a common KV pool, as for
+queries from one context. Each query selects unique slots. The benchmark uses
+CUPTI, CUDA Graph replay and cold L2;
+reports include the GPU, software versions and library hash. GPU operation
+latency is not an end-to-end serving throughput measurement.
+
 ### Kernel layout
 
 | Directory | Namespace | Contents |

@@ -5,4 +5,6 @@ namespace legacy::sm90::prefill::sparse_fwd {
 
 template void run_fwd_phase1_kernel<576, true>(const SparseAttnFwdParams& params);
 
+template void run_etap_split_kernel<576, true>(const EtapSplitParams& params);
+
 }

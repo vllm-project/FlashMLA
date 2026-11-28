@@ -11,6 +11,170 @@ import ref
 
 _counter = kk.Counter()
 
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9, reason="SM90 kernel")
+@torch.inference_mode()
+def test_etap_auto_split_avoids_eager_allocation_cost(monkeypatch):
+    """Automatic splitting changes the captured grid without adding eager work."""
+    from flash_mla import flash_mla_sparse_fwd
+
+    if torch.cuda.get_device_name() not in ("NVIDIA H20", "NVIDIA H100 80GB HBM3"):
+        pytest.skip("automatic dispatch is restricted to measured devices")
+    monkeypatch.delenv("FLASH_MLA_ETAP_SPLITS", raising=False)
+    monkeypatch.setenv("USE_MMA_FOR_SMALL_N_HEAD", "0")
+    q = torch.ones((1, 8, 512), device="cuda", dtype=torch.bfloat16)
+    kv = torch.ones((2176, 1, 512), device="cuda", dtype=torch.bfloat16)
+    indices = torch.arange(2176, device="cuda", dtype=torch.int32).view(1, 1, -1)
+    flash_mla_sparse_fwd(q, kv, indices, 512**-0.5)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as profile:
+        eager, _, _ = flash_mla_sparse_fwd(q, kv, indices, 512**-0.5)
+        torch.cuda.synchronize()
+    assert not any("combine_etap_splits" in event.name for event in profile.events())
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured, _, _ = flash_mla_sparse_fwd(q, kv, indices, 512**-0.5)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as profile:
+        graph.replay()
+        torch.cuda.synchronize()
+    assert any("combine_etap_splits" in event.name for event in profile.events())
+    torch.testing.assert_close(eager, torch.ones_like(eager))
+    torch.testing.assert_close(captured, eager)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9, reason="SM90 kernel")
+@pytest.mark.parametrize("heads", [8, 16])
+@pytest.mark.parametrize("dim", [512, 576])
+@pytest.mark.parametrize("splits", [2, 3, 8, 32])
+@pytest.mark.parametrize("have_length", [False, True])
+@torch.inference_mode()
+def test_etap_split_kv_preserves_global_softmax(heads, dim, splits, have_length, monkeypatch):
+    """Unequal and empty partitions merge once, including sink and strided output."""
+    from flash_mla import flash_mla_sparse_fwd
+
+    monkeypatch.setenv("USE_MMA_FOR_SMALL_N_HEAD", "0")
+    monkeypatch.setenv("FLASH_MLA_ETAP_SPLITS", str(splits))
+    with torch.device("cuda"):
+        p = TestParam(3, 8192, 2176, h_q=heads, d_qk=dim, seed=42, num_runs=0,
+                      have_attn_sink=True, have_topk_length=have_length,
+                      k_amplifier_portion=0.05, k_amplifier_ratio=4.0)
+        t = lib.generate_testcase(p)
+        t.sm_scale = 192**-0.5
+        q_storage = torch.empty((p.s_q, 64, dim), dtype=torch.bfloat16)
+        q_storage[:, 8:8 + heads].copy_(t.q)
+        t.q = q_storage[:, 8:8 + heads]
+        kv_storage = torch.empty((p.s_kv * 2, 1, dim), dtype=torch.bfloat16)
+        kv_storage[::2].copy_(t.kv)
+        t.kv = kv_storage[::2]
+        indices_storage = torch.empty((p.s_q * 2, 1, p.topk), dtype=torch.int32)
+        indices_storage[::2].copy_(t.indices)
+        t.indices = indices_storage[::2]
+        t.indices[0].fill_(-1)
+        t.indices[1, :, 65:] = -1
+        t.indices[2, :, ::7] = p.s_kv
+        if t.topk_length is not None:
+            t.topk_length[:] = torch.tensor([-1, 65, p.topk + 128], dtype=torch.int32)
+        t.attn_sink[:3] = torch.tensor([float("inf"), -float("inf"), 9.0])
+        storage = torch.full((p.s_q, 64, 512), float("nan"), dtype=torch.bfloat16)
+        out = storage[:, 8:8 + heads]
+        actual = flash_mla_sparse_fwd(t.q, t.kv, t.indices, t.sm_scale,
+                                     attn_sink=t.attn_sink, topk_length=t.topk_length, out=out)
+        _, expected, maximum, lse = ref.ref_sparse_attn_fwd(p, t)
+        assert kk.check_is_allclose("split out", actual[0].float(), expected, abs_tol=8e-4, rel_tol=3.01/128, cos_diff_tol=7e-6)
+        torch.testing.assert_close(actual[1], maximum, atol=1e-5, rtol=2.01/65536)
+        torch.testing.assert_close(actual[2], lse, atol=1e-5, rtol=2.01/65536)
+        assert torch.isnan(storage[:, :8]).all()
+        assert torch.isnan(storage[:, 8 + heads:]).all()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            replay = flash_mla_sparse_fwd(t.q, t.kv, t.indices, t.sm_scale,
+                                         attn_sink=t.attn_sink, topk_length=t.topk_length, out=out)
+        t.kv.mul_(0.5)
+        if t.topk_length is not None:
+            t.topk_length[:] = torch.tensor([100, 0, 128], dtype=torch.int32)
+        graph.replay()
+        _, changed, changed_max, changed_lse = ref.ref_sparse_attn_fwd(p, t)
+        assert kk.check_is_allclose("split replay", replay[0].float(), changed, abs_tol=8e-4, rel_tol=3.01/128, cos_diff_tol=7e-6)
+        torch.testing.assert_close(replay[1], changed_max, atol=1e-5, rtol=2.01/65536)
+        torch.testing.assert_close(replay[2], changed_lse, atol=1e-5, rtol=2.01/65536)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9, reason="SM90 kernel")
+@pytest.mark.parametrize("value", ["0", "33", "abc", "2x"])
+def test_etap_rejects_invalid_partition_limit(value, monkeypatch):
+    from flash_mla import flash_mla_sparse_fwd
+
+    monkeypatch.setenv("USE_MMA_FOR_SMALL_N_HEAD", "0")
+    monkeypatch.setenv("FLASH_MLA_ETAP_SPLITS", value)
+    q = torch.zeros((1, 8, 512), device="cuda", dtype=torch.bfloat16)
+    kv = torch.zeros((1, 1, 512), device="cuda", dtype=torch.bfloat16)
+    indices = torch.zeros((1, 1, 128), device="cuda", dtype=torch.int32)
+    with pytest.raises((ValueError, RuntimeError), match="FLASH_MLA_ETAP_SPLITS"):
+        flash_mla_sparse_fwd(q, kv, indices, 512**-0.5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9, reason="SM90 kernel")
+@pytest.mark.parametrize("heads", [8, 16])
+@pytest.mark.parametrize("dim", [512, 576])
+@torch.inference_mode()
+def test_etap_maximum_partition_count_without_sink(heads, dim, monkeypatch):
+    from flash_mla import flash_mla_sparse_fwd
+
+    monkeypatch.setenv("USE_MMA_FOR_SMALL_N_HEAD", "0")
+    monkeypatch.setenv("FLASH_MLA_ETAP_SPLITS", "32")
+    with torch.device("cuda"):
+        p = TestParam(1, 8192, 8192, h_q=heads, d_qk=dim, seed=5, num_runs=0,
+                      have_topk_length=True, k_amplifier_portion=0.05, k_amplifier_ratio=4.0)
+        t = lib.generate_testcase(p)
+        t.sm_scale = 192**-0.5
+        t.topk_length.fill_(10000)
+        actual = flash_mla_sparse_fwd(t.q, t.kv, t.indices, t.sm_scale, topk_length=t.topk_length)
+        _, expected, maximum, lse = ref.ref_sparse_attn_fwd(p, t)
+        assert kk.check_is_allclose("maximum split", actual[0].float(), expected, abs_tol=8e-4, rel_tol=3.01/128, cos_diff_tol=7e-6)
+        torch.testing.assert_close(actual[1], maximum, atol=1e-5, rtol=2.01/65536)
+        torch.testing.assert_close(actual[2], lse, atol=1e-5, rtol=2.01/65536)
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9, reason="SM90 kernel")
+@torch.inference_mode()
+def test_etap_split_keeps_nan_statistics(monkeypatch):
+    """An all-NaN row keeps NaN LSE rather than the empty-row sentinel."""
+    from flash_mla import flash_mla_sparse_fwd
+
+    monkeypatch.setenv("USE_MMA_FOR_SMALL_N_HEAD", "0")
+    q = torch.ones((1, 8, 512), device="cuda", dtype=torch.bfloat16)
+    q[:, 0].fill_(float("nan"))
+    kv = torch.ones((2176, 1, 512), device="cuda", dtype=torch.bfloat16)
+    indices = torch.arange(2176, device="cuda", dtype=torch.int32).view(1, 1, -1)
+    monkeypatch.setenv("FLASH_MLA_ETAP_SPLITS", "1")
+    expected = flash_mla_sparse_fwd(q, kv, indices, 512**-0.5)
+    monkeypatch.setenv("FLASH_MLA_ETAP_SPLITS", "8")
+    actual = flash_mla_sparse_fwd(q, kv, indices, 512**-0.5)
+    for result, reference in zip(actual, expected):
+        torch.testing.assert_close(result, reference, atol=1e-5, rtol=4e-5, equal_nan=True)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9, reason="SM90 kernel")
+@torch.inference_mode()
+def test_etap_large_query_batch_avoids_split_reduction(monkeypatch):
+    """An explicit partition cap must not add a merge to large decode batches."""
+    from flash_mla import flash_mla_sparse_fwd
+
+    monkeypatch.setenv("USE_MMA_FOR_SMALL_N_HEAD", "0")
+    monkeypatch.setenv("FLASH_MLA_ETAP_SPLITS", "16")
+    q = torch.ones((64, 8, 512), device="cuda", dtype=torch.bfloat16)
+    kv = torch.ones((1024, 1, 512), device="cuda", dtype=torch.bfloat16)
+    indices = torch.arange(1024, device="cuda", dtype=torch.int32).view(1, 1, -1).expand(64, 1, -1)
+    flash_mla_sparse_fwd(q, kv, indices, 512**-0.5)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as profile:
+        out, _, _ = flash_mla_sparse_fwd(q, kv, indices, 512**-0.5)
+        torch.cuda.synchronize()
+    kernels = [event.name for event in profile.events()]
+    assert any("sparse_attn_fwd_etap_kernel" in name for name in kernels)
+    assert not any("combine_etap_splits" in name for name in kernels)
+    torch.testing.assert_close(out, torch.ones_like(out))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9, reason="SM90 kernel")
 @pytest.mark.parametrize("heads", [8, 16, 32, 64, 128])
 @pytest.mark.parametrize("dim", [512, 576])
