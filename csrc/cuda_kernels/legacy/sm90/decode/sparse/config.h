@@ -12,11 +12,14 @@ using namespace cute;
 
 namespace legacy::sm90::decode::sparse {
 
-template<ModelType MODEL_TYPE, int NUM_HEADS>
+template<ModelType MODEL_TYPE, int NUM_HEADS, bool HAVE_TOPK_LENGTH>
 class KernelTemplate {
 public:
 
 static_assert(NUM_HEADS == 64 || NUM_HEADS == 128);
+// DeepSeek-V4 always bounds the index reads by topk_length. For V3.2 it is
+// compiled in only when topk_length is given, so the plain path is unchanged.
+static constexpr bool CHECK_TOPK_LENGTH = MODEL_TYPE != ModelType::V32 || HAVE_TOPK_LENGTH;
 static constexpr int NUM_M_BLOCKS = NUM_HEADS / 64;
 static constexpr int CLUSTER_SIZE = NUM_M_BLOCKS;
 
