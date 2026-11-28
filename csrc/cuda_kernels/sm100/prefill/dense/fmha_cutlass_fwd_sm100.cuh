@@ -17,7 +17,7 @@
 #include <torch/headeronly/util/Exception.h>
 #include <cuda_runtime.h>
 
-#include <kerutils/supplemental/cuda_stream.h>
+#include "device_stream.h"
 
 using namespace cute;
 using namespace cutlass::fmha::collective;
@@ -282,7 +282,7 @@ struct FwdRunner {
 
     CUTLASS_CHECK(op.can_implement(arguments));
     CUTLASS_CHECK(op.initialize(arguments, nullptr));
-    CUTLASS_CHECK(op.run(kerutils::get_current_cuda_stream(q)));
+    CUTLASS_CHECK(op.run(get_current_stream()));
   }
 };
 

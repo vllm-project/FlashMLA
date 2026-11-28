@@ -680,7 +680,11 @@ KernelTemplate<FWD_MODE, D_QK, MODEL_TYPE, EXTRA_MODEL_TYPE>::sparse_attn_fwd_ke
                         if constexpr (!IS_EXTRA_BLOCK) {
                             return __ldg((int2*)(indices + block_idx*B_TOPK + lane_idx*2));
                         } else {
-                            return __ldg((int2*)(extra_indices + (block_idx-args.num_orig_kv_blocks)*B_TOPK + lane_idx*2));
+                            // `extra_topk` need not be a multiple of B_TOPK, so the last extra block can run past the
+                            // end of `extra_indices`; treat those slots as invalid tokens (cur_idx == -1 below).
+                            int extra_abs_pos = (block_idx-args.num_orig_kv_blocks)*B_TOPK + lane_idx*2;
+                            if (extra_abs_pos >= params.extra_topk) return make_int2(-1, -1);
+                            return __ldg((int2*)(extra_indices + extra_abs_pos));
                         }
                     };
                     auto process_one_block = [&](int block_idx, int2 my_indices, auto is_extra_block_t) {

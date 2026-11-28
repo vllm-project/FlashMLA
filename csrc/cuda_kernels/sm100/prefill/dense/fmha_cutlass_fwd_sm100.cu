@@ -75,10 +75,14 @@ void FMHACutlassSM100FwdRun(torch::stable::Tensor workspace_buffer, torch::stabl
       } else {
         std::cout << "No kernel instantiated for head_dim_qk=" << head_dim_qk
                   << " head_dim_vo=" << head_dim_vo << std::endl;
+        STD_TORCH_CHECK(false, "No kernel instantiated for head_dim_qk=", head_dim_qk,
+                    " head_dim_vo=", head_dim_vo,
+                    "; the dense MHA forward kernels are only instantiated for (192, 128) and (128, 128)");
       }
     });
 
   } else {
-    FLASH_MLA_ASSERT(false);
+    STD_TORCH_CHECK(false, "The dense MHA forward kernels only support bfloat16 inputs and outputs, got q.dtype()=",
+                q.scalar_type(), " and o.dtype()=", o.scalar_type());
   }
 }
